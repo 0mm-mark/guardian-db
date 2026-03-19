@@ -1,0 +1,26 @@
+name: Upstream Synchronize
+
+on:
+  schedule:
+  - cron:  "0 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  
+jobs:
+  repo-sync:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: true
+        token: ${{ secrets.SYNC_TOKEN }}
+    - name: repo-sync
+      uses: repo-sync/github-sync@v2
+      with:
+        source_repo: "wmaslonek/guardian-db"
+        source_branch: "main"
+        destination_branch: "main"
+        sync_tags: "true"
+        github_token: ${{ secrets.SYNC_TOKEN }}
