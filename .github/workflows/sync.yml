@@ -5,6 +5,10 @@ on:
   - cron:  "0 */3 * * *"
   workflow_dispatch:
 
+# Opt into Node.js 24 now to avoid the June 2026 force-migration
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  
 permissions:
   contents: write
   
