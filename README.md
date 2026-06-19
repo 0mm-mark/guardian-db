@@ -163,6 +163,12 @@ GuardianDB v0.16.0
 │   ├── ReactiveSynchronizer (reactive_synchronizer.rs)   # State sync
 │   └── Events (events.rs)                                # Event emission system
 │
+├── Optional ODM Layer (feature = "odm")
+│   ├── Model Derive (guardian-db-derive)                 # #[derive(Model)] macros
+│   ├── Collection API (odm/collection.rs)                # Typed/dynamic CRUD facade
+│   ├── Query & Update Engine (odm/query.rs)              # MongoDB-style filters/operators
+│   └── Schema & Index Metadata (odm/schema.rs)           # PK, unique, secondary indexes
+│
 └── Core Traits & Types
     └── Traits (traits.rs)    # Common traits & types
 ```
@@ -184,9 +190,102 @@ GuardianDB v0.16.0
 <ul> ✔️ EventLogStore (immutable append-only logs) </ul>
 <ul> ✔️ KeyValueStore (distributed key-value pairs) </ul>
 <ul> ✔️ DocumentStore (JSON documents with queries) </ul>
+<ul> ✔️ Optional ODM collections with schema validation, indexes, and Mongoose-style CRUD (`odm` feature) </ul>
 <ul> ✔️ BaseStore (common functionality and CRDT operations) </ul>
 <ul> ✔️ Multi-level caching with Sled backend </ul>
 <ul> ✔️ Cryptographic access control with Ed25519 signatures </ul>
+
+## Optional ODM and Collection API
+
+GuardianDB now includes an optional TypeORM/Mongoose-inspired ODM layer for applications that want higher-level modeling primitives without giving up local-first replication. The ODM sits above `DocumentStore`, so documents still synchronize through Iroh Docs/Willow while application code can use schemas, collections, indexes, and CRUD helpers.
+
+Enable the Rust ODM explicitly:
+
+```toml
+[dependencies]
+guardian-db = { version = "0.16", features = ["odm"] }
+```
+
+### Rust model definitions
+
+```rust
+use guardian_db::odm::Model;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Model)]
+#[model(collection = "employees", timestamps)]
+struct Employee {
+    #[primary_key]
+    ssn: String,
+    #[unique]
+    email: String,
+    #[index]
+    department: String,
+    name: String,
+    hourly_pay: String,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+let employees = db.model_collection::<Employee>().await?;
+employees.insert_one(Employee {
+    ssn: "562-48-5384".into(),
+    email: "elon@example.com".into(),
+    department: "engineering".into(),
+    name: "Elon".into(),
+    hourly_pay: "$15".into(),
+    created_at: None,
+    updated_at: None,
+}).await?;
+```
+
+Supported derive attributes include `#[primary_key]`, `#[unique]`, `#[index]`, `#[model(collection = "...")]`, `#[model(timestamps)]`, `#[model(flexible)]`, and schema versions. Runtime schemas are available through `ModelSchema`, `FieldDefinition`, and `Collection::new` for dynamic collections.
+
+### JavaScript/TypeScript SDK shape
+
+The TypeScript SDK in `sdk/typescript` exposes the collection API requested in the ODM RFC. The included process-local transport is for SDK development and tests; production Node/WASM/mobile bindings should implement `GuardianTransport` against the Rust/Iroh backend.
+
+```javascript
+import GuardianDB from "guardiandb";
+import Iroh from "iroh";
+
+const iroh = await Iroh.create();
+const guardiandb = await GuardianDB.init("DatabaseName", iroh, {
+  path: "./.guardiandb",
+});
+
+console.log(await GuardianDB.listDatabases());
+
+const collection = await guardiandb.initCollection("employees", {
+  primaryKey: "ssn",
+  unique: ["ssn"],
+  indexes: ["department"],
+  timestamps: true,
+});
+
+await collection.insertOne({
+  name: "Elon",
+  ssn: "562-48-5384",
+  department: "engineering",
+  hourly_pay: "$15",
+});
+
+const employee = await collection.findOne({ ssn: "562-48-5384" });
+const updatedEmployee = await collection.update(
+  { ssn: "562-48-5384" },
+  { $set: { hourly_pay: "$100" } }
+);
+```
+
+Collections support `insertOne`, batch `insert`, `findOne`, `find`, `findById`, and first-match `update` with MongoDB-style operators such as `$set`, `$unset`, and `$inc`.
+
+### Consistency boundary
+
+ODM writes validate field types, primary keys, uniqueness, required/nullability rules, immutable primary keys, and strict schemas before persistence. Primary, unique, and secondary indexes are rebuilt from the current local document view and used for equality-query narrowing.
+
+The implemented guarantees are intentionally local to a collection instance. GuardianDB remains decentralized and eventually convergent; disconnected peers can still create conflicting unique values that must be reconciled after replication. `TransactionContext` and `ConsistencyLevel` reserve the API shape for future replicated transaction coordination, while unsupported replicated transactions are rejected explicitly instead of implying global ACID semantics.
+
+See [`docs/odm.md`](docs/odm.md) for the full design notes and caveats.
 
 ## Store Types
 
@@ -643,6 +742,16 @@ cargo build
 
 # Build optimized release version
 cargo build --release
+
+# Build and test the optional ODM layer
+cargo check --tests --features odm
+cargo test --features odm odm
+
+# Check the TypeScript ODM SDK
+cd sdk/typescript
+npm test
+cd ../..
+
 
 # Check code quality and formatting
 cargo clippy                   # Comprehensive linting

@@ -1,3 +1,6 @@
+#[cfg(feature = "odm")]
+extern crate self as guardian_db;
+
 pub mod access_control;
 pub mod address;
 pub mod cache;
@@ -8,6 +11,8 @@ pub mod guardian;
 pub mod keystore;
 pub mod log;
 pub mod message_marshaler;
+#[cfg(feature = "odm")]
+pub mod odm;
 pub mod p2p;
 pub mod reactive_synchronizer;
 pub mod stores;

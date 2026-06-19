@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Optional ODM layer (`odm` feature)** for TypeORM/Mongoose-style document modeling on top of `DocumentStore`, without replacing GuardianDB's decentralized Iroh Docs/Willow storage model.
+  - Added `guardian-db-derive` with `#[derive(Model)]`, `#[primary_key]`, `#[unique]`, `#[index]`, `#[model(collection = "...")]`, `#[model(timestamps)]`, flexible schemas, and schema version metadata.
+  - Added typed and dynamic collection APIs with `insert_one`, batch `insert`, `find_one`, `find`, `find_by_id`, and first-match `update`.
+  - Added MongoDB-style query/update support including equality filters, comparison/logical operators, dot paths, `$set`, `$unset`, and `$inc`.
+  - Added local validation for required fields, nullability, field types, strict schemas, immutable primary keys, primary-key uniqueness, unique constraints, and secondary indexes.
+  - Added `GuardianDB::init_collection`, `GuardianDB::list_collections`, and `GuardianDB::model_collection::<T>()` helpers under the ODM feature.
+  - Added local transaction/consistency API scaffolding (`TransactionContext`, `ConsistencyLevel`) that explicitly rejects unsupported replicated transaction semantics until a distributed coordinator exists.
+- **TypeScript ODM SDK scaffold** in `sdk/typescript` exposing `GuardianDB.init`, `GuardianDB.listDatabases`, `initCollection`, `listCollections`, and Mongoose-style collection CRUD through a `GuardianTransport` boundary.
+  - Includes a process-local reference transport for deterministic SDK tests and future native Node/WASM/mobile bridge development.
+- **ODM documentation and tests**, including `docs/odm.md`, Rust ODM integration tests, and TypeScript SDK tests covering the issue #17 usage flow, uniqueness rollback, update operators, collection listing, and version-conflict behavior.
+
+### Changed
+- `DocumentStore` opening is now idempotent for ODM collection initialization so repeated collection setup can reuse the underlying replicated document store safely.
+- Root README now documents the optional ODM layer, Rust model derive usage, TypeScript collection API shape, build/test commands, and the local-vs-replicated consistency boundary.
+
 ## [0.16.0] - 2026-03-01
 
 ## [0.15.0] - 2026-02-17
