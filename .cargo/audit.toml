@@ -1,0 +1,10 @@
+# cargo-audit policy for currently unavoidable transitive Hickory advisories.
+#
+# These exceptions are intentionally narrow and temporary. Keep the security
+# workflow blocking for every advisory not listed here. Remove these entries
+# when the Iroh dependency family can move to Hickory 0.26.1 or newer.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+]

@@ -1,6 +1,8 @@
 #![cfg(feature = "odm")]
 
-use guardian_db::odm::{Collection, FieldDefinition, FieldType, MemoryStorage, ModelSchema, OdmError};
+use guardian_db::odm::{
+    Collection, FieldDefinition, FieldType, MemoryStorage, ModelSchema, OdmError,
+};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -88,8 +90,21 @@ async fn bulk_query_update_and_constraint_reliability_workload() {
             .unwrap()["id"],
         "stress-0000001024",
     );
-    assert_eq!(collection.find(json!({ "group": "group-7" })).await.unwrap().len(), 32);
-    assert!(collection.find_by_id("stress-0000001999").await.unwrap().is_some());
+    assert_eq!(
+        collection
+            .find(json!({ "group": "group-7" }))
+            .await
+            .unwrap()
+            .len(),
+        32
+    );
+    assert!(
+        collection
+            .find_by_id("stress-0000001999")
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     let updated = collection
         .update(
@@ -126,8 +141,20 @@ async fn bulk_query_update_and_constraint_reliability_workload() {
         .await
         .unwrap_err();
     assert!(matches!(duplicate, OdmError::DuplicateKey { .. }));
-    assert!(collection.find_by_id("duplicate-a").await.unwrap().is_none());
-    assert!(collection.find_by_id("duplicate-b").await.unwrap().is_none());
+    assert!(
+        collection
+            .find_by_id("duplicate-a")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        collection
+            .find_by_id("duplicate-b")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -168,5 +195,11 @@ async fn explicit_large_document_limit_probe() {
 
     let inserted = collection.insert_one(doc(42, payload_bytes)).await.unwrap();
     assert_eq!(inserted["payload"].as_str().unwrap().len(), payload_bytes);
-    assert!(collection.find_by_id("stress-0000000042").await.unwrap().is_some());
+    assert!(
+        collection
+            .find_by_id("stress-0000000042")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }

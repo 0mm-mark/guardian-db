@@ -14,6 +14,13 @@ import type {
 
 type Index = Map<string, Set<string>>;
 
+interface IndexedValue {
+  value: unknown;
+  tokens: ReadonlySet<string>;
+}
+
+type DocumentIndexEntries = Map<string, IndexedValue>;
+
 interface IndexCatalog {
   byField: Map<string, Index>;
 }
@@ -85,22 +92,8 @@ export class MemoryTransport implements GuardianTransport {
     input: T,
     options?: WriteOptions,
   ): Promise<T> {
-    assertLocalWrite(options);
-    const collection = this.collection(database, collectionName);
-    return collection.mutex.runExclusive(async () => {
-      const document = prepareInsert(collection.schema, input);
-      const id = canonicalId(document[collection.schema.primaryKey]);
-      if (collection.documents.has(id)) {
-        throw new DuplicateKeyError(collection.schema.primaryKey, document[collection.schema.primaryKey]);
-      }
-
-      const candidate = cloneDocumentMap(collection.documents);
-      candidate.set(id, document);
-      const indexes = buildIndexes(collection.schema, candidate);
-      collection.documents = candidate;
-      collection.indexes = indexes;
-      return clone(document) as T;
-    });
+    const inserted = await this.insert(database, collectionName, [input], options);
+    return inserted[0]!;
   }
 
   public async insert<T extends Document>(
@@ -112,22 +105,47 @@ export class MemoryTransport implements GuardianTransport {
     assertLocalWrite(options);
     const collection = this.collection(database, collectionName);
     return collection.mutex.runExclusive(async () => {
-      const candidate = cloneDocumentMap(collection.documents);
-      const prepared: T[] = [];
+      const prepared: Array<{
+        id: string;
+        document: Document;
+        indexEntries: DocumentIndexEntries;
+        result: T;
+      }> = [];
+      const reservedIds = new Set<string>();
+      const uniqueReservations = new Map<string, Map<string, string>>();
+
       for (const input of inputs) {
         const document = prepareInsert(collection.schema, input);
         const id = canonicalId(document[collection.schema.primaryKey]);
-        if (candidate.has(id)) {
+        if (collection.documents.has(id) || reservedIds.has(id)) {
           throw new DuplicateKeyError(collection.schema.primaryKey, document[collection.schema.primaryKey]);
         }
-        candidate.set(id, document);
-        prepared.push(clone(document) as T);
+
+        const indexEntries = collectIndexEntries(collection.indexes, document);
+        assertUniqueIndexEntries(
+          collection.schema,
+          collection.indexes,
+          indexEntries,
+          id,
+          uniqueReservations,
+        );
+        reservedIds.add(id);
+        prepared.push({
+          id,
+          document,
+          indexEntries,
+          result: clone(document) as T,
+        });
       }
 
-      const indexes = buildIndexes(collection.schema, candidate);
-      collection.documents = candidate;
-      collection.indexes = indexes;
-      return prepared;
+      // Everything that can fail is completed before mutating collection state.
+      // The commit itself consists only of in-memory Map/Set writes, preserving
+      // the batch's all-or-nothing behavior without cloning the entire dataset.
+      for (const item of prepared) {
+        collection.documents.set(item.id, item.document);
+        addIndexEntries(collection.indexes, item.id, item.indexEntries);
+      }
+      return prepared.map((item) => item.result);
     });
   }
 
@@ -136,8 +154,18 @@ export class MemoryTransport implements GuardianTransport {
     collectionName: string,
     query: Query<T>,
   ): Promise<T | null> {
-    const matches = await this.find(database, collectionName, query);
-    return matches[0] ?? null;
+    const collection = this.collection(database, collectionName);
+    return collection.mutex.runExclusive(async () => {
+      const candidates = candidateIds(collection.indexes, query);
+      const ids: Iterable<string> = candidates ?? collection.documents.keys();
+      for (const id of ids) {
+        const document = collection.documents.get(id);
+        if (document !== undefined && matchesQuery(document, query as Query<Document>)) {
+          return clone(document) as T;
+        }
+      }
+      return null;
+    });
   }
 
   public async find<T extends Document>(
@@ -148,15 +176,12 @@ export class MemoryTransport implements GuardianTransport {
     const collection = this.collection(database, collectionName);
     return collection.mutex.runExclusive(async () => {
       const candidates = candidateIds(collection.indexes, query);
-      const documents = candidates === undefined
-        ? collection.documents.values()
-        : [...candidates]
-            .map((id) => collection.documents.get(id))
-            .filter((document): document is Document => document !== undefined);
+      const ids: Iterable<string> = candidates ?? collection.documents.keys();
 
       const results: T[] = [];
-      for (const document of documents) {
-        if (matchesQuery(document, query as Query<Document>)) {
+      for (const id of ids) {
+        const document = collection.documents.get(id);
+        if (document !== undefined && matchesQuery(document, query as Query<Document>)) {
           results.push(clone(document) as T);
         }
       }
@@ -187,7 +212,7 @@ export class MemoryTransport implements GuardianTransport {
     const collection = this.collection(database, collectionName);
     return collection.mutex.runExclusive(async () => {
       const candidates = candidateIds(collection.indexes, query);
-      const ids = candidates ?? new Set(collection.documents.keys());
+      const ids: Iterable<string> = candidates ?? collection.documents.keys();
       let matchedId: string | undefined;
       for (const id of ids) {
         const document = collection.documents.get(id);
@@ -215,11 +240,22 @@ export class MemoryTransport implements GuardianTransport {
         );
       }
 
-      const candidate = cloneDocumentMap(collection.documents);
-      candidate.set(matchedId, updated);
-      const indexes = buildIndexes(collection.schema, candidate);
-      collection.documents = candidate;
-      collection.indexes = indexes;
+      const previous = collection.documents.get(matchedId)!;
+      const previousIndexEntries = collectIndexEntries(collection.indexes, previous);
+      const updatedIndexEntries = collectIndexEntries(collection.indexes, updated);
+      assertUniqueIndexEntries(
+        collection.schema,
+        collection.indexes,
+        updatedIndexEntries,
+        matchedId,
+      );
+
+      // Validation and unique checks happen before this commit. Updating just
+      // the affected document and index entries avoids O(collection size) work
+      // for every single-document update.
+      removeIndexEntries(collection.indexes, matchedId, previousIndexEntries);
+      collection.documents.set(matchedId, updated);
+      addIndexEntries(collection.indexes, matchedId, updatedIndexEntries);
       return clone(updated) as T;
     });
   }
@@ -265,32 +301,6 @@ class AsyncMutex {
   }
 }
 
-function buildIndexes(schema: NormalizedSchema, documents: ReadonlyMap<string, Document>): IndexCatalog {
-  const catalog = emptyIndexes(schema);
-  const uniqueValues = new Map<string, Map<string, string>>();
-  for (const [field, definition] of Object.entries(schema.fields)) {
-    if (definition.unique || definition.primaryKey) uniqueValues.set(field, new Map());
-  }
-
-  for (const [id, document] of documents) {
-    for (const [field, index] of catalog.byField) {
-      const value = getPath(document, field);
-      if (value === undefined || value === null) continue;
-      for (const token of indexTokens(value)) {
-        index.set(token, new Set([...(index.get(token) ?? []), id]));
-
-        const uniqueIndex = uniqueValues.get(field);
-        const existing = uniqueIndex?.get(token);
-        if (existing !== undefined && existing !== id) {
-          throw new DuplicateKeyError(field, value);
-        }
-        uniqueIndex?.set(token, id);
-      }
-    }
-  }
-  return catalog;
-}
-
 function emptyIndexes(schema: NormalizedSchema): IndexCatalog {
   const byField = new Map<string, Index>();
   for (const [field, definition] of Object.entries(schema.fields)) {
@@ -299,6 +309,78 @@ function emptyIndexes(schema: NormalizedSchema): IndexCatalog {
     }
   }
   return { byField };
+}
+
+function collectIndexEntries(catalog: IndexCatalog, document: Document): DocumentIndexEntries {
+  const entries: DocumentIndexEntries = new Map();
+  for (const field of catalog.byField.keys()) {
+    const value = getPath(document, field);
+    if (value === undefined || value === null) continue;
+    entries.set(field, { value, tokens: indexTokens(value) });
+  }
+  return entries;
+}
+
+function assertUniqueIndexEntries(
+  schema: NormalizedSchema,
+  catalog: IndexCatalog,
+  entries: DocumentIndexEntries,
+  documentId: string,
+  reservations?: Map<string, Map<string, string>>,
+): void {
+  for (const [field, indexedValue] of entries) {
+    const definition = schema.fields[field];
+    if (definition === undefined || (!definition.unique && !definition.primaryKey)) continue;
+
+    let fieldReservations: Map<string, string> | undefined;
+    if (reservations !== undefined) {
+      fieldReservations = reservations.get(field);
+      if (fieldReservations === undefined) {
+        fieldReservations = new Map();
+        reservations.set(field, fieldReservations);
+      }
+    }
+
+    const index = catalog.byField.get(field)!;
+    for (const token of indexedValue.tokens) {
+      const indexedIds = index.get(token);
+      if (indexedIds !== undefined && [...indexedIds].some((id) => id !== documentId)) {
+        throw new DuplicateKeyError(field, indexedValue.value);
+      }
+
+      const reservedId = fieldReservations?.get(token);
+      if (reservedId !== undefined && reservedId !== documentId) {
+        throw new DuplicateKeyError(field, indexedValue.value);
+      }
+      fieldReservations?.set(token, documentId);
+    }
+  }
+}
+
+function addIndexEntries(catalog: IndexCatalog, documentId: string, entries: DocumentIndexEntries): void {
+  for (const [field, indexedValue] of entries) {
+    const index = catalog.byField.get(field)!;
+    for (const token of indexedValue.tokens) {
+      let ids = index.get(token);
+      if (ids === undefined) {
+        ids = new Set();
+        index.set(token, ids);
+      }
+      ids.add(documentId);
+    }
+  }
+}
+
+function removeIndexEntries(catalog: IndexCatalog, documentId: string, entries: DocumentIndexEntries): void {
+  for (const [field, indexedValue] of entries) {
+    const index = catalog.byField.get(field)!;
+    for (const token of indexedValue.tokens) {
+      const ids = index.get(token);
+      if (ids === undefined) continue;
+      ids.delete(documentId);
+      if (ids.size === 0) index.delete(token);
+    }
+  }
 }
 
 function candidateIds<T extends Document>(catalog: IndexCatalog, query: Query<T>): Set<string> | undefined {
@@ -335,10 +417,6 @@ function indexTokens(value: unknown): Set<string> {
     for (const item of value) tokens.add(indexToken(item));
   }
   return tokens;
-}
-
-function cloneDocumentMap(source: ReadonlyMap<string, Document>): Map<string, Document> {
-  return new Map([...source].map(([id, document]) => [id, clone(document)]));
 }
 
 function databaseKey(database: DatabaseReference): string {

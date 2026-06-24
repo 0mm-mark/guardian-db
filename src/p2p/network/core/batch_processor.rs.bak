@@ -433,7 +433,7 @@ impl BatchProcessor {
 
         // Ordena por prioridade
         let mut temp_vec: Vec<_> = queue.drain(..).collect();
-        temp_vec.sort_by_key(|operation| std::cmp::Reverse(operation.priority));
+        temp_vec.sort_by(|a, b| b.priority.cmp(&a.priority));
 
         // Pega os primeiros max_size
         for operation in temp_vec.into_iter().take(max_size) {
@@ -1227,7 +1227,7 @@ impl BatchProcessor {
 
         // Ordena por prioridade
         let mut temp_vec: Vec<_> = queue.drain(..).collect();
-        temp_vec.sort_by_key(|operation| std::cmp::Reverse(operation.priority));
+        temp_vec.sort_by(|a, b| b.priority.cmp(&a.priority));
 
         // Pega os primeiros max_size
         for operation in temp_vec.into_iter().take(max_size) {

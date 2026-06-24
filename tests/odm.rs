@@ -64,7 +64,14 @@ async fn mongoose_style_crud_and_constraints_work() {
         .unwrap()
         .unwrap();
     assert_eq!(found["name"], "Elon");
-    assert_eq!(collection.find(json!({ "skills": "space" })).await.unwrap().len(), 1);
+    assert_eq!(
+        collection
+            .find(json!({ "skills": "space" }))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
     collection
         .insert_one(json!({
@@ -75,7 +82,14 @@ async fn mongoose_style_crud_and_constraints_work() {
         }))
         .await
         .unwrap();
-    assert_eq!(collection.find(json!({ "email": null })).await.unwrap().len(), 1);
+    assert_eq!(
+        collection
+            .find(json!({ "email": null }))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
     let updated = collection
         .update(
@@ -86,7 +100,13 @@ async fn mongoose_style_crud_and_constraints_work() {
         .unwrap()
         .unwrap();
     assert_eq!(updated["hourly_pay"], "$100");
-    assert!(collection.find_by_id("562-48-5384").await.unwrap().is_some());
+    assert!(
+        collection
+            .find_by_id("562-48-5384")
+            .await
+            .unwrap()
+            .is_some()
+    );
 
     let duplicate = collection
         .insert_one(json!({
