@@ -11,9 +11,9 @@ pub(crate) fn value_at_path<'a>(document: &'a Value, path: &str) -> Option<&'a V
 }
 
 pub(crate) fn matches_query(document: &Value, query: &Value) -> Result<bool> {
-    let query = query.as_object().ok_or_else(|| {
-        OdmError::InvalidQuery("query must be a JSON object".to_string())
-    })?;
+    let query = query
+        .as_object()
+        .ok_or_else(|| OdmError::InvalidQuery("query must be a JSON object".to_string()))?;
     matches_object(document, query)
 }
 
@@ -21,9 +21,9 @@ fn matches_object(document: &Value, query: &Map<String, Value>) -> Result<bool> 
     for (field, condition) in query {
         match field.as_str() {
             "$and" => {
-                let clauses = condition.as_array().ok_or_else(|| {
-                    OdmError::InvalidQuery("$and expects an array".to_string())
-                })?;
+                let clauses = condition
+                    .as_array()
+                    .ok_or_else(|| OdmError::InvalidQuery("$and expects an array".to_string()))?;
                 for clause in clauses {
                     if !matches_query(document, clause)? {
                         return Ok(false);
@@ -31,9 +31,9 @@ fn matches_object(document: &Value, query: &Map<String, Value>) -> Result<bool> 
                 }
             }
             "$or" => {
-                let clauses = condition.as_array().ok_or_else(|| {
-                    OdmError::InvalidQuery("$or expects an array".to_string())
-                })?;
+                let clauses = condition
+                    .as_array()
+                    .ok_or_else(|| OdmError::InvalidQuery("$or expects an array".to_string()))?;
                 let mut matched = false;
                 for clause in clauses {
                     if matches_query(document, clause)? {
@@ -46,9 +46,9 @@ fn matches_object(document: &Value, query: &Map<String, Value>) -> Result<bool> 
                 }
             }
             "$nor" => {
-                let clauses = condition.as_array().ok_or_else(|| {
-                    OdmError::InvalidQuery("$nor expects an array".to_string())
-                })?;
+                let clauses = condition
+                    .as_array()
+                    .ok_or_else(|| OdmError::InvalidQuery("$nor expects an array".to_string()))?;
                 for clause in clauses {
                     if matches_query(document, clause)? {
                         return Ok(false);
@@ -88,7 +88,9 @@ fn matches_condition(actual: Option<&Value>, condition: &Value) -> Result<bool> 
                         OdmError::InvalidQuery("$in expects an array".to_string())
                     })?;
                     actual.is_some_and(|value| {
-                        values.iter().any(|candidate| values_equal(value, candidate))
+                        values
+                            .iter()
+                            .any(|candidate| values_equal(value, candidate))
                     })
                 }
                 "$nin" => {
@@ -96,7 +98,9 @@ fn matches_condition(actual: Option<&Value>, condition: &Value) -> Result<bool> 
                         OdmError::InvalidQuery("$nin expects an array".to_string())
                     })?;
                     actual.is_none_or(|value| {
-                        values.iter().all(|candidate| !values_equal(value, candidate))
+                        values
+                            .iter()
+                            .all(|candidate| !values_equal(value, candidate))
                     })
                 }
                 "$exists" => {

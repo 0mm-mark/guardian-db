@@ -747,10 +747,22 @@ cargo build --release
 cargo check --tests --features odm
 cargo test --features odm odm
 
+# Benchmark features like queries, read operations, concurrency
+cargo test --features odm --test odm_benchmark_reliability
+cargo bench --features odm --bench odm_benchmark
+
 # Check the TypeScript ODM SDK
 cd sdk/typescript
 npm test
 cd ../..
+
+# To test above MongoDB's 16 MiB BSON document limit
+set GUARDIANDB_ODM_LARGE_DOC_MB 
+
+# Benchmark features with Typescript SSDK
+cd sdk/typescript
+npm run bench -- --mode=runAll --docs=10000 --batch-size=1000 --queries=2500 --updates=2500
+npm run bench -- --mode=large --large-mb=17
 
 
 # Check code quality and formatting

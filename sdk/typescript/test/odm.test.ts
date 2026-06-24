@@ -167,6 +167,91 @@ test("$inc, $unset, dot paths, and secondary indexes work", async () => {
   assert.deepEqual(updated?.stats, { count: 3 });
 });
 
+test("failed unique updates leave documents and indexes unchanged", async () => {
+  const db = await GuardianDB.init("update-rollback", {});
+  const employees = await db.initCollection<Employee>("employees", { schema: employeeSchema });
+
+  await employees.insert([
+    {
+      employeeId: "employee-a",
+      name: "Ada",
+      ssn: "ssn-a",
+      skills: ["math"],
+      hourly_pay: "$50",
+    },
+    {
+      employeeId: "employee-b",
+      name: "Grace",
+      ssn: "ssn-b",
+      skills: ["compilers"],
+      hourly_pay: "$60",
+    },
+  ]);
+
+  await assert.rejects(
+    employees.update(
+      { employeeId: "employee-a" },
+      { $set: { ssn: "ssn-b", skills: ["distributed"] } },
+    ),
+    DuplicateKeyError,
+  );
+
+  assert.equal((await employees.findOne({ ssn: "ssn-a" }))?.employeeId, "employee-a");
+  assert.equal(await employees.findOne({ ssn: "ssn-b" }).then((employee) => employee?.employeeId), "employee-b");
+  assert.equal((await employees.find({ skills: "math" })).length, 1);
+  assert.equal((await employees.find({ skills: "distributed" })).length, 0);
+
+  const updated = await employees.update(
+    { employeeId: "employee-a" },
+    { $set: { ssn: "ssn-c", skills: ["distributed"] } },
+  );
+  assert.equal(updated?.ssn, "ssn-c");
+  assert.equal(await employees.findOne({ ssn: "ssn-a" }), null);
+  assert.equal((await employees.findOne({ ssn: "ssn-c" }))?.employeeId, "employee-a");
+  assert.equal((await employees.find({ skills: "math" })).length, 0);
+  assert.equal((await employees.find({ skills: "distributed" })).length, 1);
+});
+
+test("repeated indexed updates do not rebuild the entire collection", { timeout: 5_000 }, async () => {
+  interface IndexedCounter extends Document {
+    id: string;
+    email: string;
+    group: string;
+    counter: number;
+  }
+
+  const db = await GuardianDB.init("incremental-indexes", {});
+  const counters = await db.initCollection<IndexedCounter>("counters", {
+    schema: {
+      fields: {
+        id: { type: String, primaryKey: true },
+        email: { type: String, required: true, unique: true },
+        group: { type: String, required: true, index: true },
+        counter: { type: Number, required: true },
+      },
+    },
+  });
+
+  const documents = Array.from({ length: 5_000 }, (_, index) => ({
+    id: `counter-${index}`,
+    email: `counter-${index}@example.test`,
+    group: `group-${index % 32}`,
+    counter: index,
+  }));
+  await counters.insert(documents);
+
+  for (let index = 0; index < 500; index += 1) {
+    const updated = await counters.update(
+      { email: `counter-${index}@example.test` },
+      { $set: { group: "hot" }, $inc: { counter: 1 } },
+    );
+    assert.equal(updated?.group, "hot");
+  }
+
+  assert.equal((await counters.find({ group: "hot" })).length, 500);
+  assert.equal((await counters.find({ group: "group-0" })).length, 141);
+});
+
 test("replicated transaction contexts are reserved instead of overpromising ACID", async () => {
   const db = await GuardianDB.init("transactions", {});
   const employees = await db.initCollection<Employee>("employees", { schema: employeeSchema });

@@ -55,9 +55,9 @@ pub(crate) fn apply_update(
 }
 
 fn object_operand<'a>(operator: &str, value: &'a Value) -> Result<&'a Map<String, Value>> {
-    value.as_object().ok_or_else(|| {
-        OdmError::InvalidUpdate(format!("{operator} expects an object"))
-    })
+    value
+        .as_object()
+        .ok_or_else(|| OdmError::InvalidUpdate(format!("{operator} expects an object")))
 }
 
 fn ensure_mutable(path: &str, immutable_fields: &BTreeSet<String>) -> Result<()> {
@@ -88,10 +88,13 @@ fn set_path(document: &mut Value, path: &str, value: Value) -> Result<bool> {
             .or_insert_with(|| Value::Object(Map::new()));
     }
 
-    let object = current.as_object_mut().ok_or_else(|| {
-        OdmError::InvalidUpdate(format!("cannot set `{path}` on a non-object"))
-    })?;
-    let key = segments.last().expect("path has at least one segment").to_string();
+    let object = current
+        .as_object_mut()
+        .ok_or_else(|| OdmError::InvalidUpdate(format!("cannot set `{path}` on a non-object")))?;
+    let key = segments
+        .last()
+        .expect("path has at least one segment")
+        .to_string();
     let changed = object.get(&key) != Some(&value);
     object.insert(key, value);
     Ok(changed)
@@ -107,30 +110,120 @@ fn unset_path(document: &mut Value, path: &str) -> Result<bool> {
 
     let mut current = document;
     for segment in &segments[..segments.len() - 1] {
-        let Some(next) = current.as_object_mut().and_then(|object| object.get_mut(*segment)) else {
+        let Some(next) = current
+            .as_object_mut()
+            .and_then(|object| object.get_mut(*segment))
+        else {
             return Ok(false);
         };
         current = next;
     }
-    Ok(current
-        .as_object_mut()
-        .is_some_and(|object| object.remove(*segments.last().expect("path is non-empty")).is_some()))
+    Ok(current.as_object_mut().is_some_and(|object| {
+        object
+            .remove(*segments.last().expect("path is non-empty"))
+            .is_some()
+    }))
 }
 
 fn increment_path(document: &mut Value, path: &str, increment: &Value) -> Result<bool> {
-    let increment = increment.as_f64().ok_or_else(|| {
+    let increment = increment.as_number().ok_or_else(|| {
         OdmError::InvalidUpdate(format!("$inc value for `{path}` must be numeric"))
     })?;
 
+    let zero = Number::from(0);
     let current = match crate::odm::query::value_at_path(document, path) {
-        None => 0.0,
-        Some(value) => value.as_f64().ok_or_else(|| {
+        None => &zero,
+        Some(value) => value.as_number().ok_or_else(|| {
             OdmError::InvalidUpdate(format!("$inc target `{path}` must be numeric"))
         })?,
     };
-    let next = current + increment;
-    let number = Number::from_f64(next).ok_or_else(|| {
-        OdmError::InvalidUpdate(format!("$inc for `{path}` produced a non-finite number"))
-    })?;
+    let number = add_numbers(current, increment, path)?;
     set_path(document, path, Value::Number(number))
+}
+
+fn add_numbers(left: &Number, right: &Number, path: &str) -> Result<Number> {
+    // serde_json distinguishes integer and floating-point JSON numbers. Keep
+    // integer arithmetic integer whenever both operands are integers instead
+    // of routing every $inc through f64 (which turned 1024 + 1 into 1025.0).
+    if let (Some(left), Some(right)) = (integer_value(left), integer_value(right)) {
+        let next = left.checked_add(right).ok_or_else(|| {
+            OdmError::InvalidUpdate(format!(
+                "$inc for `{path}` overflowed the JSON integer range"
+            ))
+        })?;
+
+        if let Ok(value) = i64::try_from(next) {
+            return Ok(Number::from(value));
+        }
+        if let Ok(value) = u64::try_from(next) {
+            return Ok(Number::from(value));
+        }
+        return Err(OdmError::InvalidUpdate(format!(
+            "$inc for `{path}` overflowed the JSON integer range"
+        )));
+    }
+
+    let next = left.as_f64().unwrap_or(f64::NAN) + right.as_f64().unwrap_or(f64::NAN);
+    Number::from_f64(next).ok_or_else(|| {
+        OdmError::InvalidUpdate(format!("$inc for `{path}` produced a non-finite number"))
+    })
+}
+
+fn integer_value(number: &Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_update;
+    use crate::odm::error::OdmError;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn inc_preserves_integer_representation() {
+        let mut document = json!({ "counter": 1024 });
+        let changed = apply_update(
+            &mut document,
+            &json!({ "$inc": { "counter": 1, "created": 2 } }),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(document["counter"], json!(1025));
+        assert_eq!(document["created"], json!(2));
+        assert!(document["counter"].as_i64().is_some());
+    }
+
+    #[test]
+    fn inc_keeps_fractional_arithmetic_fractional() {
+        let mut document = json!({ "counter": 1.25 });
+        apply_update(
+            &mut document,
+            &json!({ "$inc": { "counter": 0.5 } }),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(document["counter"], json!(1.75));
+    }
+
+    #[test]
+    fn inc_reports_integer_overflow() {
+        let mut document = json!({ "counter": u64::MAX });
+        let error = apply_update(
+            &mut document,
+            &json!({ "$inc": { "counter": 1 } }),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, OdmError::InvalidUpdate(message) if message.contains("overflowed"))
+        );
+    }
 }

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { performance } from "node:perf_hooks";
 
 import GuardianDB, {
+  type Collection,
   DuplicateKeyError,
   MemoryTransport,
   defineSchema,
@@ -31,6 +32,8 @@ interface Options {
   payloadBytes: number;
   largeMb: number;
   includeLarge: boolean;
+  progress: boolean;
+  heartbeatMs: number;
 }
 
 interface Metric {
@@ -62,19 +65,19 @@ async function main(): Promise<void> {
   const metrics: Metric[] = [];
 
   if (options.mode === "insert" || options.mode === "runAll") {
-    metrics.push(await benchmarkInsert(options));
+    metrics.push(await runPhase("insert", options, () => benchmarkInsert(options)));
   }
   if (options.mode === "query" || options.mode === "runAll") {
-    metrics.push(...await benchmarkQueries(options));
+    metrics.push(...await runPhase("query", options, () => benchmarkQueries(options)));
   }
   if (options.mode === "update" || options.mode === "runAll") {
-    metrics.push(await benchmarkUpdates(options));
+    metrics.push(await runPhase("update", options, () => benchmarkUpdates(options)));
   }
   if (options.mode === "reliability" || options.mode === "runAll") {
-    metrics.push(await benchmarkReliability(options));
+    metrics.push(await runPhase("reliability", options, () => benchmarkReliability(options)));
   }
   if (options.mode === "large" || (options.mode === "runAll" && options.includeLarge)) {
-    metrics.push(await benchmarkLargeDocument(options));
+    metrics.push(await runPhase("large document", options, () => benchmarkLargeDocument(options)));
   }
 
   printSummary(metrics, options);
@@ -82,21 +85,24 @@ async function main(): Promise<void> {
 
 async function benchmarkInsert(options: Options): Promise<Metric> {
   const employees = await freshCollection("bench_insert");
-  const batches = chunkedDocuments(options.docs, options.payloadBytes, options.batchSize);
 
   return time("insert.batch", options.docs, async () => {
-    for (const batch of batches) {
-      await employees.insert(batch);
+    let insertedCount = 0;
+    for (const batch of documentBatches(options.docs, options.payloadBytes, options.batchSize)) {
+      const inserted = await employees.insert(batch);
+      assert.equal(inserted.length, batch.length);
+      insertedCount += inserted.length;
+      reportCompletedWork("insert", insertedCount, options.docs, options);
     }
-    assert.equal((await employees.find({})).length, options.docs);
+    assert.equal(insertedCount, options.docs);
+    assert.equal((await employees.findById(id(0)))?.email, email(0));
+    assert.equal((await employees.findById(id(options.docs - 1)))?.email, email(options.docs - 1));
   }, { batchSize: options.batchSize, payloadBytes: options.payloadBytes });
 }
 
 async function benchmarkQueries(options: Options): Promise<Metric[]> {
   const employees = await freshCollection("bench_query");
-  for (const batch of chunkedDocuments(options.docs, options.payloadBytes, options.batchSize)) {
-    await employees.insert(batch);
-  }
+  await seedCollection(employees, options, "query seed");
 
   const byId = await time("query.findById", options.queries, async () => {
     for (let i = 0; i < options.queries; i += 1) {
@@ -127,9 +133,7 @@ async function benchmarkQueries(options: Options): Promise<Metric[]> {
 
 async function benchmarkUpdates(options: Options): Promise<Metric> {
   const employees = await freshCollection("bench_update");
-  for (const batch of chunkedDocuments(options.docs, options.payloadBytes, options.batchSize)) {
-    await employees.insert(batch);
-  }
+  await seedCollection(employees, options, "update seed");
 
   return time("update.$set.$inc.uniqueIndex", options.updates, async () => {
     for (let i = 0; i < options.updates; i += 1) {
@@ -145,9 +149,7 @@ async function benchmarkUpdates(options: Options): Promise<Metric> {
 
 async function benchmarkReliability(options: Options): Promise<Metric> {
   const employees = await freshCollection("bench_reliability");
-  for (const batch of chunkedDocuments(options.docs, options.payloadBytes, options.batchSize)) {
-    await employees.insert(batch);
-  }
+  await seedCollection(employees, options, "reliability seed");
 
   return time("reliability.unique.rollback", 3, async () => {
     await assert.rejects(
@@ -195,13 +197,30 @@ async function freshCollection(name: string) {
   return db.initCollection<BenchmarkDocument>("benchmark_documents", { schema });
 }
 
-function chunkedDocuments(count: number, payloadBytes: number, batchSize: number): BenchmarkDocument[][] {
-  const batches: BenchmarkDocument[][] = [];
+async function seedCollection(
+  collection: Collection<BenchmarkDocument>,
+  options: Options,
+  label: string,
+): Promise<void> {
+  let insertedCount = 0;
+  for (const batch of documentBatches(options.docs, options.payloadBytes, options.batchSize)) {
+    const inserted = await collection.insert(batch);
+    assert.equal(inserted.length, batch.length);
+    insertedCount += inserted.length;
+    reportCompletedWork(label, insertedCount, options.docs, options);
+  }
+  assert.equal(insertedCount, options.docs);
+}
+
+function* documentBatches(
+  count: number,
+  payloadBytes: number,
+  batchSize: number,
+): Generator<BenchmarkDocument[]> {
   for (let start = 0; start < count; start += batchSize) {
     const length = Math.min(batchSize, count - start);
-    batches.push(Array.from({ length }, (_, offset) => document(start + offset, payloadBytes)));
+    yield Array.from({ length }, (_, offset) => document(start + offset, payloadBytes));
   }
-  return batches;
 }
 
 function document(
@@ -234,9 +253,49 @@ function email(index: number): string {
 
 function payload(size: number, seed: number): string {
   const pattern = `guardian-db-odm-benchmark-${seed.toString(16).padStart(16, "0")}-`;
-  let value = "";
-  while (value.length < size) value += pattern;
-  return value.slice(0, size);
+  return pattern.repeat(Math.ceil(size / pattern.length)).slice(0, size);
+}
+
+async function runPhase<T>(
+  label: string,
+  options: Options,
+  run: () => Promise<T>,
+): Promise<T> {
+  const startedAt = performance.now();
+  logProgress(options, `${label}: started`);
+  const heartbeat = options.progress
+    ? setInterval(() => {
+        const elapsedSeconds = (performance.now() - startedAt) / 1_000;
+        const heapMiB = process.memoryUsage().heapUsed / (1024 * 1024);
+        console.error(
+          `[GuardianDB ODM benchmark] ${label}: still running after ${elapsedSeconds.toFixed(1)}s ` +
+          `(heap ${heapMiB.toFixed(1)} MiB)`,
+        );
+      }, options.heartbeatMs)
+    : undefined;
+  heartbeat?.unref();
+
+  try {
+    const result = await run();
+    logProgress(options, `${label}: completed in ${(performance.now() - startedAt).toFixed(1)}ms`);
+    return result;
+  } finally {
+    if (heartbeat !== undefined) clearInterval(heartbeat);
+  }
+}
+
+function reportCompletedWork(label: string, completed: number, total: number, options: Options): void {
+  if (!options.progress) return;
+  const reportEvery = Math.max(options.batchSize, Math.ceil(total / 10));
+  if (completed !== total && completed % reportEvery !== 0) return;
+  const percent = ((completed / total) * 100).toFixed(1);
+  console.error(`[GuardianDB ODM benchmark] ${label}: ${completed}/${total} documents (${percent}%)`);
+}
+
+function logProgress(options: Options, message: string): void {
+  if (options.progress) {
+    console.error(`[GuardianDB ODM benchmark] ${message}`);
+  }
 }
 
 async function time(
@@ -284,6 +343,8 @@ function parseOptions(args: string[]): Options {
     payloadBytes: numberValue(values, "payload-bytes", 512),
     largeMb: numberValue(values, "large-mb", 17),
     includeLarge: booleanValue(values, "include-large", false),
+    progress: booleanValue(values, "progress", true),
+    heartbeatMs: numberValue(values, "heartbeat-ms", 5_000),
   };
 }
 
