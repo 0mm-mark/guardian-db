@@ -439,7 +439,7 @@ async fn test_resolve_skip_manifest_without_type() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
-        GuardianError::Store(msg) => assert!(msg.contains("obrigatório")),
+        GuardianError::Store(msg) => assert!(msg.contains("required")),
         _ => panic!("Expected Store error"),
     }
 }
