@@ -57,7 +57,8 @@ pub struct TicketProtocolHandler {
 
 impl std::fmt::Debug for TicketProtocolHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TicketProtocolHandler").finish_non_exhaustive()
+        f.debug_struct("TicketProtocolHandler")
+            .finish_non_exhaustive()
     }
 }
 
@@ -107,7 +108,9 @@ impl ProtocolHandler for TicketProtocolHandler {
 
         let response = self.resolve(&address, requester).await;
 
-        send.write_all(&response).await.map_err(AcceptError::from_err)?;
+        send.write_all(&response)
+            .await
+            .map_err(AcceptError::from_err)?;
         send.finish().map_err(AcceptError::from_err)?;
 
         // Ensure the data is delivered before closing.
@@ -184,7 +187,10 @@ mod tests {
 
     fn acl_with(role: &str, keys: Vec<&str>) -> Arc<dyn AccessController> {
         let mut map = HashMap::new();
-        map.insert(role.to_string(), keys.into_iter().map(String::from).collect());
+        map.insert(
+            role.to_string(),
+            keys.into_iter().map(String::from).collect(),
+        );
         Arc::new(SimpleAccessController::new(Some(map))) as Arc<dyn AccessController>
     }
 

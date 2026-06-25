@@ -179,10 +179,7 @@ impl KeySynchronizer {
         let node_id = NodeId::from_bytes(node_signing_key.verifying_key().as_bytes())
             .map_err(|e| GuardianError::Other(format!("Invalid public key: {}", e)))?;
 
-        info!(
-            "Initializing key synchronizer for NodeID: {}",
-            node_id
-        );
+        info!("Initializing key synchronizer for NodeID: {}", node_id);
 
         Ok(Self {
             client_config: client_config.clone(),
@@ -389,9 +386,9 @@ impl KeySynchronizer {
     async fn verify_message_signature(&self, message: &SyncMessage) -> Result<()> {
         // Get the sender's public key.
         let trusted_peers = self.trusted_peers.read().await;
-        let verifying_key = trusted_peers.get(&message.sender).ok_or_else(|| {
-            GuardianError::Other(format!("Untrusted peer: {}", message.sender))
-        })?;
+        let verifying_key = trusted_peers
+            .get(&message.sender)
+            .ok_or_else(|| GuardianError::Other(format!("Untrusted peer: {}", message.sender)))?;
 
         // Reconstruct the message without the signature.
         let mut message_copy = message.clone();
@@ -406,9 +403,7 @@ impl KeySynchronizer {
 
         verifying_key
             .verify(&message_bytes, &signature)
-            .map_err(|e| {
-                GuardianError::Other(format!("Signature verification failed: {}", e))
-            })?;
+            .map_err(|e| GuardianError::Other(format!("Signature verification failed: {}", e)))?;
 
         Ok(())
     }
@@ -462,7 +457,10 @@ impl KeySynchronizer {
             // Check the versions to detect conflicts.
             let local_metadata = self.get_key_metadata(key_id).await?;
             if local_metadata.version >= message.metadata.version {
-                debug!("Key already exists with an equal or higher version: {}", key_id);
+                debug!(
+                    "Key already exists with an equal or higher version: {}",
+                    key_id
+                );
                 return Ok(());
             }
         }
@@ -490,10 +488,7 @@ impl KeySynchronizer {
         // Check whether the key exists.
         if !self.local_keystore.has(key_id).await? {
             warn!("Attempt to update a non-existent key: {}", key_id);
-            return Err(GuardianError::Other(format!(
-                "Key not found: {}",
-                key_id
-            )));
+            return Err(GuardianError::Other(format!("Key not found: {}", key_id)));
         }
 
         // Check the version to detect conflicts.

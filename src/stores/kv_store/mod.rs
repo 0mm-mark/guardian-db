@@ -127,7 +127,10 @@ async fn refresh_kv_index(
         }
     }
 
-    debug!("KeyValue index synchronized from iroh-docs: {} entries", count);
+    debug!(
+        "KeyValue index synchronized from iroh-docs: {} entries",
+        count
+    );
     Ok(count)
 }
 
@@ -529,9 +532,7 @@ impl GuardianDBKeyValue {
                         | Ok(LiveEvent::PendingContentReady)
                         | Ok(LiveEvent::SyncFinished(_))
                 );
-                if is_remote
-                    && let Err(e) = refresh_kv_index(&docs, &doc, &client, &index).await
-                {
+                if is_remote && let Err(e) = refresh_kv_index(&docs, &doc, &client, &index).await {
                     warn!("Failed to update KV index via live sync: {:?}", e);
                 }
             }
@@ -547,9 +548,7 @@ impl GuardianDBKeyValue {
     #[instrument(level = "debug", skip(self, value))]
     pub async fn put_impl(&self, key: &str, value: Vec<u8>) -> Result<Operation> {
         if key.is_empty() {
-            return Err(GuardianError::Store(
-                "The key cannot be empty".to_string(),
-            ));
+            return Err(GuardianError::Store("The key cannot be empty".to_string()));
         }
 
         if value.is_empty() {
@@ -568,10 +567,7 @@ impl GuardianDBKeyValue {
             )
             .await
             .map_err(|e| {
-                GuardianError::Store(format!(
-                    "Error writing key '{}' to iroh-docs: {}",
-                    key, e
-                ))
+                GuardianError::Store(format!("Error writing key '{}' to iroh-docs: {}", key, e))
             })?;
 
         // Update the local index immediately.
@@ -593,17 +589,12 @@ impl GuardianDBKeyValue {
     #[instrument(level = "debug", skip(self))]
     pub async fn delete_impl(&self, key: &str) -> Result<Operation> {
         if key.is_empty() {
-            return Err(GuardianError::Store(
-                "The key cannot be empty".to_string(),
-            ));
+            return Err(GuardianError::Store("The key cannot be empty".to_string()));
         }
 
         // Check whether the key exists in the local index.
         if !self.contains_key(key) {
-            return Err(GuardianError::Store(format!(
-                "Key '{}' not found",
-                key
-            )));
+            return Err(GuardianError::Store(format!("Key '{}' not found", key)));
         }
 
         // Remove from the iroh-docs document.
@@ -616,10 +607,7 @@ impl GuardianDBKeyValue {
             )
             .await
             .map_err(|e| {
-                GuardianError::Store(format!(
-                    "Error deleting key '{}' in iroh-docs: {}",
-                    key, e
-                ))
+                GuardianError::Store(format!("Error deleting key '{}' in iroh-docs: {}", key, e))
             })?;
 
         // Update the local index immediately.
@@ -644,9 +632,7 @@ impl GuardianDBKeyValue {
     #[instrument(level = "debug", skip(self))]
     pub async fn get_impl(&self, key: &str) -> Result<Option<Vec<u8>>> {
         if key.is_empty() {
-            return Err(GuardianError::Store(
-                "The key cannot be empty".to_string(),
-            ));
+            return Err(GuardianError::Store("The key cannot be empty".to_string()));
         }
 
         // Query the local index (mirrors the iroh-docs state).
@@ -758,12 +744,9 @@ impl GuardianDBKeyValue {
         // This is the secure replication path via capability: both nodes start using
         // the same namespace and sync (range-based + live) starts with the ticket's peers.
         let doc_handle = if let Some(ticket_str) = resolved_ticket.as_ref() {
-            let ticket =
-                ticket_str
-                    .parse::<iroh_docs::DocTicket>()
-                    .map_err(|e| {
-                        GuardianError::Store(format!("Invalid DocTicket: {}", e))
-                    })?;
+            let ticket = ticket_str
+                .parse::<iroh_docs::DocTicket>()
+                .map_err(|e| GuardianError::Store(format!("Invalid DocTicket: {}", e)))?;
             let doc = docs.import_doc(ticket).await?;
             let ns_id = doc.id();
             // Persist the imported NamespaceId for future reopenings.
@@ -778,52 +761,52 @@ impl GuardianDBKeyValue {
         } else {
             // Try to retrieve the NamespaceId from the cache to reopen an existing document.
             match cache.get(NAMESPACE_CACHE_KEY).await {
-            Ok(Some(namespace_bytes)) if namespace_bytes.len() == 32 => {
-                // Existing NamespaceId — try to reopen the document.
-                let mut ns_bytes = [0u8; 32];
-                ns_bytes.copy_from_slice(&namespace_bytes);
-                let namespace_id = iroh_docs::NamespaceId::from(ns_bytes);
+                Ok(Some(namespace_bytes)) if namespace_bytes.len() == 32 => {
+                    // Existing NamespaceId — try to reopen the document.
+                    let mut ns_bytes = [0u8; 32];
+                    ns_bytes.copy_from_slice(&namespace_bytes);
+                    let namespace_id = iroh_docs::NamespaceId::from(ns_bytes);
 
-                match docs.open_doc(namespace_id).await? {
-                    Some(doc) => {
-                        info!("Reopened existing iroh-docs document: {:?}", namespace_id);
-                        doc
-                    }
-                    None => {
-                        // Document not found — create a new one.
-                        warn!(
-                            "Cached namespace {:?} not found, creating new document",
-                            namespace_id
-                        );
-                        let doc = docs.create_doc().await?;
-                        let ns_id = doc.id();
-                        cache
-                            .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
-                            .await
-                            .map_err(|e| {
-                                GuardianError::Store(format!(
-                                    "Failed to persist NamespaceId: {}",
-                                    e
-                                ))
-                            })?;
-                        info!("Created new iroh-docs document: {:?}", ns_id);
-                        doc
+                    match docs.open_doc(namespace_id).await? {
+                        Some(doc) => {
+                            info!("Reopened existing iroh-docs document: {:?}", namespace_id);
+                            doc
+                        }
+                        None => {
+                            // Document not found — create a new one.
+                            warn!(
+                                "Cached namespace {:?} not found, creating new document",
+                                namespace_id
+                            );
+                            let doc = docs.create_doc().await?;
+                            let ns_id = doc.id();
+                            cache
+                                .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
+                                .await
+                                .map_err(|e| {
+                                    GuardianError::Store(format!(
+                                        "Failed to persist NamespaceId: {}",
+                                        e
+                                    ))
+                                })?;
+                            info!("Created new iroh-docs document: {:?}", ns_id);
+                            doc
+                        }
                     }
                 }
-            }
-            _ => {
-                // No NamespaceId in the cache — create a new document.
-                let doc = docs.create_doc().await?;
-                let ns_id = doc.id();
-                cache
-                    .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
-                    .await
-                    .map_err(|e| {
-                        GuardianError::Store(format!("Failed to persist NamespaceId: {}", e))
-                    })?;
-                info!("Created new iroh-docs document: {:?}", ns_id);
-                doc
-            }
+                _ => {
+                    // No NamespaceId in the cache — create a new document.
+                    let doc = docs.create_doc().await?;
+                    let ns_id = doc.id();
+                    cache
+                        .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
+                        .await
+                        .map_err(|e| {
+                            GuardianError::Store(format!("Failed to persist NamespaceId: {}", e))
+                        })?;
+                    info!("Created new iroh-docs document: {:?}", ns_id);
+                    doc
+                }
             }
         };
 

@@ -21,7 +21,7 @@ pub struct DocumentId(Value);
 
 impl DocumentId {
     /// Consumes the id and returns the underlying JSON value.
-    /// 
+    ///
     pub fn into_value(self) -> Value {
         self.0
     }
@@ -329,10 +329,7 @@ impl Collection {
             .cloned()
             .expect("matched document must exist");
 
-        let immutable = BTreeSet::from([
-            self.schema.primary_key().to_string(),
-            "_id".to_string(),
-        ]);
+        let immutable = BTreeSet::from([self.schema.primary_key().to_string(), "_id".to_string()]);
         let changed = crate::odm::update::apply_update(&mut document, &operations, &immutable)?;
         if !changed {
             return Ok(Some(self.external_document(document)));
@@ -391,9 +388,7 @@ impl Collection {
 
         {
             let object = self.schema.object_mut(&mut document)?;
-            let missing_primary = object
-                .get(&primary_key)
-                .is_none_or(|value| value.is_null());
+            let missing_primary = object.get(&primary_key).is_none_or(|value| value.is_null());
             if missing_primary {
                 if self.schema.auto_generates_primary_key() {
                     object.insert(
@@ -413,10 +408,7 @@ impl Collection {
                     .get(&timestamps.created_at)
                     .is_none_or(Value::is_null)
                 {
-                    object.insert(
-                        timestamps.created_at.clone(),
-                        Value::String(now.clone()),
-                    );
+                    object.insert(timestamps.created_at.clone(), Value::String(now.clone()));
                 }
                 object.insert(timestamps.updated_at.clone(), Value::String(now));
             }
@@ -552,7 +544,8 @@ impl<M: Model> TypedCollection<M> {
 
     /// Inserts a batch of typed models with default write options.
     pub async fn insert(&self, models: Vec<M>) -> Result<Vec<M>> {
-        self.insert_with_options(models, WriteOptions::default()).await
+        self.insert_with_options(models, WriteOptions::default())
+            .await
     }
 
     /// Inserts a batch of typed models with explicit write options.

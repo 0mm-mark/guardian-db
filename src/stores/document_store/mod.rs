@@ -120,7 +120,10 @@ async fn refresh_doc_index(
         }
     }
 
-    debug!("DocumentStore index synchronized from iroh-docs: {} entries", count);
+    debug!(
+        "DocumentStore index synchronized from iroh-docs: {} entries",
+        count
+    );
     Ok(count)
 }
 
@@ -432,7 +435,10 @@ impl GuardianDBDocumentStore {
             let mut stream = match doc.subscribe().await {
                 Ok(s) => s,
                 Err(e) => {
-                    warn!("Failed to subscribe to iroh-docs doc events (Document): {:?}", e);
+                    warn!(
+                        "Failed to subscribe to iroh-docs doc events (Document): {:?}",
+                        e
+                    );
                     return;
                 }
             };
@@ -449,9 +455,7 @@ impl GuardianDBDocumentStore {
                         | Ok(LiveEvent::PendingContentReady)
                         | Ok(LiveEvent::SyncFinished(_))
                 );
-                if is_remote
-                    && let Err(e) = refresh_doc_index(&docs, &doc, &client, &index).await
-                {
+                if is_remote && let Err(e) = refresh_doc_index(&docs, &doc, &client, &index).await {
                     warn!("Failed to update Document index via live sync: {:?}", e);
                 }
             }
@@ -573,49 +577,49 @@ impl GuardianDBDocumentStore {
             doc
         } else {
             match cache.get(NAMESPACE_CACHE_KEY).await {
-            Ok(Some(namespace_bytes)) if namespace_bytes.len() == 32 => {
-                let mut ns_bytes = [0u8; 32];
-                ns_bytes.copy_from_slice(&namespace_bytes);
-                let namespace_id = iroh_docs::NamespaceId::from(ns_bytes);
+                Ok(Some(namespace_bytes)) if namespace_bytes.len() == 32 => {
+                    let mut ns_bytes = [0u8; 32];
+                    ns_bytes.copy_from_slice(&namespace_bytes);
+                    let namespace_id = iroh_docs::NamespaceId::from(ns_bytes);
 
-                match docs.open_doc(namespace_id).await? {
-                    Some(doc) => {
-                        info!("Reopened existing iroh-docs document: {:?}", namespace_id);
-                        doc
-                    }
-                    None => {
-                        warn!(
-                            "Cached namespace {:?} not found, creating new document",
-                            namespace_id
-                        );
-                        let doc = docs.create_doc().await?;
-                        let ns_id = doc.id();
-                        cache
-                            .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
-                            .await
-                            .map_err(|e| {
-                                GuardianError::Store(format!(
-                                    "Failed to persist NamespaceId: {}",
-                                    e
-                                ))
-                            })?;
-                        info!("Created new iroh-docs document: {:?}", ns_id);
-                        doc
+                    match docs.open_doc(namespace_id).await? {
+                        Some(doc) => {
+                            info!("Reopened existing iroh-docs document: {:?}", namespace_id);
+                            doc
+                        }
+                        None => {
+                            warn!(
+                                "Cached namespace {:?} not found, creating new document",
+                                namespace_id
+                            );
+                            let doc = docs.create_doc().await?;
+                            let ns_id = doc.id();
+                            cache
+                                .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
+                                .await
+                                .map_err(|e| {
+                                    GuardianError::Store(format!(
+                                        "Failed to persist NamespaceId: {}",
+                                        e
+                                    ))
+                                })?;
+                            info!("Created new iroh-docs document: {:?}", ns_id);
+                            doc
+                        }
                     }
                 }
-            }
-            _ => {
-                let doc = docs.create_doc().await?;
-                let ns_id = doc.id();
-                cache
-                    .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
-                    .await
-                    .map_err(|e| {
-                        GuardianError::Store(format!("Failed to persist NamespaceId: {}", e))
-                    })?;
-                info!("Created new iroh-docs document: {:?}", ns_id);
-                doc
-            }
+                _ => {
+                    let doc = docs.create_doc().await?;
+                    let ns_id = doc.id();
+                    cache
+                        .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
+                        .await
+                        .map_err(|e| {
+                            GuardianError::Store(format!("Failed to persist NamespaceId: {}", e))
+                        })?;
+                    info!("Created new iroh-docs document: {:?}", ns_id);
+                    doc
+                }
             }
         };
 
@@ -780,10 +784,7 @@ impl GuardianDBDocumentStore {
             )
             .await
             .map_err(|e| {
-                GuardianError::Store(format!(
-                    "Error writing key '{}' to iroh-docs: {}",
-                    key, e
-                ))
+                GuardianError::Store(format!("Error writing key '{}' to iroh-docs: {}", key, e))
             })?;
 
         // Update the local index immediately.
@@ -892,10 +893,7 @@ impl GuardianDBDocumentStore {
                 )
                 .await
                 .map_err(|e| {
-                    GuardianError::Store(format!(
-                        "Error writing key '{}' to iroh-docs: {}",
-                        key, e
-                    ))
+                    GuardianError::Store(format!("Error writing key '{}' to iroh-docs: {}", key, e))
                 })?;
 
             // Update the local index immediately.

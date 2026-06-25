@@ -74,10 +74,12 @@ impl CollectionStorage for DocumentStoreStorage {
 /// storage layer always has a stable key. Errors if the document is not a JSON object.
 fn storage_document(id: &str, document: &Value) -> Result<Value> {
     let mut document = document.clone();
-    let object = document.as_object_mut().ok_or_else(|| OdmError::Validation {
-        field: "$document".to_string(),
-        message: "document must be a JSON object".to_string(),
-    })?;
+    let object = document
+        .as_object_mut()
+        .ok_or_else(|| OdmError::Validation {
+            field: "$document".to_string(),
+            message: "document must be a JSON object".to_string(),
+        })?;
     object
         .entry("_id".to_string())
         .or_insert_with(|| Value::String(id.to_string()));

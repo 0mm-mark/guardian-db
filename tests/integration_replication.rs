@@ -50,10 +50,8 @@ async fn test_two_nodes_basic_replication() {
         .filter_map(|addr| addr.parse().ok())
         .collect();
 
-    let node1_addr =
-        NodeAddr::from_parts(peer1_id, node1_addrs.into_iter().map(TransportAddr::Ip));
-    let node2_addr =
-        NodeAddr::from_parts(peer2_id, node2_addrs.into_iter().map(TransportAddr::Ip));
+    let node1_addr = NodeAddr::from_parts(peer1_id, node1_addrs.into_iter().map(TransportAddr::Ip));
+    let node2_addr = NodeAddr::from_parts(peer2_id, node2_addrs.into_iter().map(TransportAddr::Ip));
 
     // Adicionar NodeAddr aos endpoints
     node1

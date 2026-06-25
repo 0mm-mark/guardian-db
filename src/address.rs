@@ -187,10 +187,7 @@ pub fn parse(addr: &str) -> Result<GuardianDBAddress> {
 
     // Decode hex into bytes.
     let hash_bytes = hex::decode(hash_part).map_err(|e| {
-        GuardianError::InvalidArgument(format!(
-            "Invalid address: could not decode the hash: {}",
-            e
-        ))
+        GuardianError::InvalidArgument(format!("Invalid address: could not decode the hash: {}", e))
     })?;
 
     // Convert into a 32-byte array.

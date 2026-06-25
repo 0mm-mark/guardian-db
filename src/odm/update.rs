@@ -61,9 +61,9 @@ pub(crate) fn apply_update(
 }
 
 fn object_operand<'a>(operator: &str, value: &'a Value) -> Result<&'a Map<String, Value>> {
-    value.as_object().ok_or_else(|| {
-        OdmError::InvalidUpdate(format!("{operator} expects an object"))
-    })
+    value
+        .as_object()
+        .ok_or_else(|| OdmError::InvalidUpdate(format!("{operator} expects an object")))
 }
 
 fn ensure_mutable(path: &str, immutable_fields: &BTreeSet<String>) -> Result<()> {
@@ -94,10 +94,13 @@ fn set_path(document: &mut Value, path: &str, value: Value) -> Result<bool> {
             .or_insert_with(|| Value::Object(Map::new()));
     }
 
-    let object = current.as_object_mut().ok_or_else(|| {
-        OdmError::InvalidUpdate(format!("cannot set `{path}` on a non-object"))
-    })?;
-    let key = segments.last().expect("path has at least one segment").to_string();
+    let object = current
+        .as_object_mut()
+        .ok_or_else(|| OdmError::InvalidUpdate(format!("cannot set `{path}` on a non-object")))?;
+    let key = segments
+        .last()
+        .expect("path has at least one segment")
+        .to_string();
     let changed = object.get(&key) != Some(&value);
     object.insert(key, value);
     Ok(changed)
@@ -113,14 +116,19 @@ fn unset_path(document: &mut Value, path: &str) -> Result<bool> {
 
     let mut current = document;
     for segment in &segments[..segments.len() - 1] {
-        let Some(next) = current.as_object_mut().and_then(|object| object.get_mut(*segment)) else {
+        let Some(next) = current
+            .as_object_mut()
+            .and_then(|object| object.get_mut(*segment))
+        else {
             return Ok(false);
         };
         current = next;
     }
-    Ok(current
-        .as_object_mut()
-        .is_some_and(|object| object.remove(*segments.last().expect("path is non-empty")).is_some()))
+    Ok(current.as_object_mut().is_some_and(|object| {
+        object
+            .remove(*segments.last().expect("path is non-empty"))
+            .is_some()
+    }))
 }
 
 fn increment_path(document: &mut Value, path: &str, increment: &Value) -> Result<bool> {
@@ -184,12 +192,20 @@ mod tests {
     #[test]
     fn inc_preserves_integer_type() {
         let mut doc = json!({ "counter": 1024 });
-        let changed = apply_update(&mut doc, &json!({ "$inc": { "counter": 1 } }), &no_immutable())
-            .unwrap();
+        let changed = apply_update(
+            &mut doc,
+            &json!({ "$inc": { "counter": 1 } }),
+            &no_immutable(),
+        )
+        .unwrap();
         assert!(changed);
         // Must be the integer 1025, NOT the float 1025.0.
         assert_eq!(doc["counter"], json!(1025));
-        assert!(doc["counter"].is_i64(), "expected integer, got {:?}", doc["counter"]);
+        assert!(
+            doc["counter"].is_i64(),
+            "expected integer, got {:?}",
+            doc["counter"]
+        );
     }
 
     #[test]
@@ -241,23 +257,28 @@ mod tests {
     #[test]
     fn set_nested_path_creates_intermediate_objects() {
         let mut doc = json!({});
-        apply_update(&mut doc, &json!({ "$set": { "a.b.c": 7 } }), &no_immutable()).unwrap();
+        apply_update(
+            &mut doc,
+            &json!({ "$set": { "a.b.c": 7 } }),
+            &no_immutable(),
+        )
+        .unwrap();
         assert_eq!(doc["a"]["b"]["c"], json!(7));
     }
 
     #[test]
     fn set_same_value_reports_no_change() {
         let mut doc = json!({ "x": 1 });
-        let changed = apply_update(&mut doc, &json!({ "$set": { "x": 1 } }), &no_immutable())
-            .unwrap();
+        let changed =
+            apply_update(&mut doc, &json!({ "$set": { "x": 1 } }), &no_immutable()).unwrap();
         assert!(!changed);
     }
 
     #[test]
     fn unset_removes_field() {
         let mut doc = json!({ "x": 1, "y": 2 });
-        let changed = apply_update(&mut doc, &json!({ "$unset": { "x": "" } }), &no_immutable())
-            .unwrap();
+        let changed =
+            apply_update(&mut doc, &json!({ "$unset": { "x": "" } }), &no_immutable()).unwrap();
         assert!(changed);
         assert!(doc.get("x").is_none());
         assert_eq!(doc["y"], json!(2));
@@ -266,8 +287,8 @@ mod tests {
     #[test]
     fn unset_missing_field_is_noop() {
         let mut doc = json!({ "y": 2 });
-        let changed = apply_update(&mut doc, &json!({ "$unset": { "x": "" } }), &no_immutable())
-            .unwrap();
+        let changed =
+            apply_update(&mut doc, &json!({ "$unset": { "x": "" } }), &no_immutable()).unwrap();
         assert!(!changed);
     }
 

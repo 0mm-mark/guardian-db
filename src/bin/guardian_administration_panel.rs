@@ -346,9 +346,10 @@ impl App {
     /// Limpa notificações expiradas
     fn tick_notifications(&mut self) {
         if let Some(ref n) = self.notification
-            && n.is_expired() {
-                self.notification = None;
-            }
+            && n.is_expired()
+        {
+            self.notification = None;
+        }
     }
 
     /// Retorna o uptime formatado
@@ -414,9 +415,11 @@ impl App {
         if self.filtered_indices.is_empty() {
             self.store_list_state.select(None);
         } else if let Some(sel) = self.store_list_state.selected()
-            && sel >= self.filtered_indices.len() {
-                self.store_list_state.select(Some(self.filtered_indices.len() - 1));
-            }
+            && sel >= self.filtered_indices.len()
+        {
+            self.store_list_state
+                .select(Some(self.filtered_indices.len() - 1));
+        }
     }
 
     /// Retorna os stores filtrados pela seleção atual
@@ -448,7 +451,7 @@ fn ui(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
-            Constraint::Min(5),   // body
+            Constraint::Min(5),    // body
             Constraint::Length(3), // footer
         ])
         .split(area);
@@ -545,17 +548,37 @@ fn render_dashboard(frame: &mut Frame, area: Rect, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(5), // métricas
-            Constraint::Min(3),   // stores
+            Constraint::Min(3),    // stores
         ])
         .split(area);
 
     // Contadores por tipo
-    let eventlog_count = app.stores.iter().filter(|s| s.store_type == "eventlog").count();
-    let kv_count = app.stores.iter().filter(|s| s.store_type == "keyvalue").count();
-    let doc_count = app.stores.iter().filter(|s| s.store_type == "document").count();
+    let eventlog_count = app
+        .stores
+        .iter()
+        .filter(|s| s.store_type == "eventlog")
+        .count();
+    let kv_count = app
+        .stores
+        .iter()
+        .filter(|s| s.store_type == "keyvalue")
+        .count();
+    let doc_count = app
+        .stores
+        .iter()
+        .filter(|s| s.store_type == "document")
+        .count();
     let total_entries: usize = app.stores.iter().map(|s| s.entry_count).sum();
-    let syncing_count = app.stores.iter().filter(|s| s.sync_status == SyncStatus::Syncing).count();
-    let error_count_stores = app.stores.iter().filter(|s| s.sync_status == SyncStatus::Error).count();
+    let syncing_count = app
+        .stores
+        .iter()
+        .filter(|s| s.sync_status == SyncStatus::Syncing)
+        .count();
+    let error_count_stores = app
+        .stores
+        .iter()
+        .filter(|s| s.sync_status == SyncStatus::Error)
+        .count();
 
     // Painel de métricas
     let metrics_text = vec![
@@ -568,17 +591,20 @@ fn render_dashboard(frame: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" (", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{eventlog_count} log"), Style::default().fg(Color::Blue)),
+            Span::styled(
+                format!("{eventlog_count} log"),
+                Style::default().fg(Color::Blue),
+            ),
             Span::styled(", ", Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{kv_count} kv"), Style::default().fg(Color::Green)),
             Span::styled(", ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{doc_count} doc"), Style::default().fg(Color::Magenta)),
+            Span::styled(
+                format!("{doc_count} doc"),
+                Style::default().fg(Color::Magenta),
+            ),
             Span::styled(")   │   ", Style::default().fg(Color::DarkGray)),
             Span::styled("Entries: ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                total_entries.to_string(),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(total_entries.to_string(), Style::default().fg(Color::White)),
             Span::styled("   │   ", Style::default().fg(Color::DarkGray)),
             Span::styled("Syncs: ", Style::default().fg(Color::Gray)),
             Span::styled(
@@ -600,13 +626,21 @@ fn render_dashboard(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(" Syncing: ", Style::default().fg(Color::Gray)),
             Span::styled(
                 syncing_count.to_string(),
-                Style::default().fg(if syncing_count > 0 { Color::Yellow } else { Color::DarkGray }),
+                Style::default().fg(if syncing_count > 0 {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
             ),
             Span::styled("   │   ", Style::default().fg(Color::DarkGray)),
             Span::styled("Erros em stores: ", Style::default().fg(Color::Gray)),
             Span::styled(
                 error_count_stores.to_string(),
-                Style::default().fg(if error_count_stores > 0 { Color::Red } else { Color::DarkGray }),
+                Style::default().fg(if error_count_stores > 0 {
+                    Color::Red
+                } else {
+                    Color::DarkGray
+                }),
             ),
             Span::styled("   │   ", Style::default().fg(Color::DarkGray)),
             Span::styled("Dir: ", Style::default().fg(Color::Gray)),
@@ -631,7 +665,12 @@ fn render_dashboard(frame: &mut Frame, area: Rect, app: &App) {
     let store_title = if app.store_filter == StoreFilter::All {
         format!(" Stores ({}) ", app.stores.len())
     } else {
-        format!(" Stores — {} ({}/{}) ", filter_label, filtered.len(), app.stores.len())
+        format!(
+            " Stores — {} ({}/{}) ",
+            filter_label,
+            filtered.len(),
+            app.stores.len()
+        )
     };
 
     // Lista de stores
@@ -657,19 +696,21 @@ fn render_dashboard(frame: &mut Frame, area: Rect, app: &App) {
             vec![
                 Line::from(""),
                 Line::from(vec![Span::styled(
-                    format!(" Nenhuma store do tipo '{}' encontrada. Pressione Tab para alterar filtro.", filter_label),
+                    format!(
+                        " Nenhuma store do tipo '{}' encontrada. Pressione Tab para alterar filtro.",
+                        filter_label
+                    ),
                     Style::default().fg(Color::DarkGray),
                 )]),
             ]
         };
 
-        let empty = Paragraph::new(msg)
-            .block(
-                Block::default()
-                    .title(store_title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            );
+        let empty = Paragraph::new(msg).block(
+            Block::default()
+                .title(store_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
         frame.render_widget(empty, layout[1]);
     } else {
         let items: Vec<ListItem> = filtered
@@ -765,14 +806,12 @@ fn render_placeholder(frame: &mut Frame, area: Rect, screen: &Screen) {
         )]),
     ];
 
-    let paragraph = Paragraph::new(text)
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .title(format!(" {screen_name} "))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        );
+    let paragraph = Paragraph::new(text).alignment(Alignment::Center).block(
+        Block::default()
+            .title(format!(" {screen_name} "))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
 
     frame.render_widget(paragraph, area);
 }
@@ -932,18 +971,16 @@ fn handle_dashboard_key(app: &mut App, key: KeyEvent) {
     let filtered_len = app.filtered_indices.len();
 
     match key.code {
-        KeyCode::Up | KeyCode::Char('k')
-            if filtered_len > 0 => {
-                let i = app.store_list_state.selected().unwrap_or(0);
-                let new_i = if i == 0 { filtered_len - 1 } else { i - 1 };
-                app.store_list_state.select(Some(new_i));
-            }
-        KeyCode::Down | KeyCode::Char('j')
-            if filtered_len > 0 => {
-                let i = app.store_list_state.selected().unwrap_or(0);
-                let new_i = if i >= filtered_len - 1 { 0 } else { i + 1 };
-                app.store_list_state.select(Some(new_i));
-            }
+        KeyCode::Up | KeyCode::Char('k') if filtered_len > 0 => {
+            let i = app.store_list_state.selected().unwrap_or(0);
+            let new_i = if i == 0 { filtered_len - 1 } else { i - 1 };
+            app.store_list_state.select(Some(new_i));
+        }
+        KeyCode::Down | KeyCode::Char('j') if filtered_len > 0 => {
+            let i = app.store_list_state.selected().unwrap_or(0);
+            let new_i = if i >= filtered_len - 1 { 0 } else { i + 1 };
+            app.store_list_state.select(Some(new_i));
+        }
         KeyCode::Enter => {
             if let Some(store) = app.selected_store() {
                 let screen = match store.store_type.as_str() {

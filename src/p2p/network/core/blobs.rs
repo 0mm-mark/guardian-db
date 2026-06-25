@@ -205,7 +205,10 @@ impl BlobStore {
         while let Some(item) = stream.next().await {
             match &item {
                 iroh_blobs::api::downloader::DownloadProgressItem::Error(e) => {
-                    return Err(GuardianError::Other(format!("Error in P2P download: {}", e)));
+                    return Err(GuardianError::Other(format!(
+                        "Error in P2P download: {}",
+                        e
+                    )));
                 }
                 iroh_blobs::api::downloader::DownloadProgressItem::DownloadError => {
                     return Err(GuardianError::Other("P2P download failed".to_string()));
@@ -257,10 +260,7 @@ impl BlobStore {
         // Note: The physical blob will be removed by GC when there are no more
         // references. This avoids accidental deletion of shared blobs.
 
-        debug!(
-            "Document tag removed: {}",
-            hex::encode(hash.as_bytes())
-        );
+        debug!("Document tag removed: {}", hex::encode(hash.as_bytes()));
 
         Ok(())
     }

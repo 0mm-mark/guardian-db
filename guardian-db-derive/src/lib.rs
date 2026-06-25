@@ -1,8 +1,8 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    Attribute, Data, DeriveInput, Expr, Fields, GenericArgument, Lit, LitStr, Meta,
-    PathArguments, Type, parse_macro_input, punctuated::Punctuated, token::Comma,
+    Attribute, Data, DeriveInput, Expr, Fields, GenericArgument, Lit, LitStr, Meta, PathArguments,
+    Type, parse_macro_input, punctuated::Punctuated, token::Comma,
 };
 
 /// Derives `guardian_db::odm::Model` and a runtime `ModelSchema`.
@@ -41,7 +41,11 @@ fn expand_model(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let mut updated_at_name = "updated_at".to_string();
     let mut version = 1_u32;
 
-    for attribute in input.attrs.iter().filter(|attr| attr.path().is_ident("model")) {
+    for attribute in input
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("model"))
+    {
         attribute.parse_nested_meta(|meta| {
             if meta.path.is_ident("collection") {
                 let value: LitStr = meta.value()?.parse()?;
@@ -119,7 +123,10 @@ fn expand_model(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             continue;
         }
         let rust_name = field.ident.expect("named field").to_string();
-        let rust_name = rust_name.strip_prefix("r#").unwrap_or(&rust_name).to_string();
+        let rust_name = rust_name
+            .strip_prefix("r#")
+            .unwrap_or(&rust_name)
+            .to_string();
         let serialized_name = serde.rename.unwrap_or_else(|| {
             rename_all
                 .as_deref()
@@ -173,7 +180,9 @@ fn expand_model(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     if !explicit_primary
         && let Some(position) = inferred_primary_index
-        && let Some(field) = field_tokens.iter_mut().find(|field| field.position == position)
+        && let Some(field) = field_tokens
+            .iter_mut()
+            .find(|field| field.position == position)
     {
         field.primary = true;
     }
@@ -262,7 +271,9 @@ struct FieldExpansion {
 }
 
 fn has_attribute(attributes: &[Attribute], name: &str) -> bool {
-    attributes.iter().any(|attribute| attribute.path().is_ident(name))
+    attributes
+        .iter()
+        .any(|attribute| attribute.path().is_ident(name))
 }
 
 fn option_inner(ty: &Type) -> Option<&Type> {
@@ -297,8 +308,8 @@ fn field_type_tokens(ty: &Type) -> proc_macro2::TokenStream {
                     quote!(::guardian_db::odm::FieldType::String)
                 }
                 "bool" => quote!(::guardian_db::odm::FieldType::Boolean),
-                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16"
-                | "u32" | "u64" | "u128" | "usize" | "f32" | "f64" => {
+                "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
+                | "u128" | "usize" | "f32" | "f64" => {
                     quote!(::guardian_db::odm::FieldType::Number)
                 }
                 "Vec" | "VecDeque" | "HashSet" | "BTreeSet" => {
@@ -326,12 +337,13 @@ struct SerdeFieldAttributes {
 
 fn serde_field_attributes(attributes: &[Attribute]) -> syn::Result<SerdeFieldAttributes> {
     let mut result = SerdeFieldAttributes::default();
-    for attribute in attributes.iter().filter(|attr| attr.path().is_ident("serde")) {
+    for attribute in attributes
+        .iter()
+        .filter(|attr| attr.path().is_ident("serde"))
+    {
         for meta in parse_meta_list(attribute)? {
             match meta {
-                Meta::Path(path)
-                    if path.is_ident("skip") || path.is_ident("skip_serializing") =>
-                {
+                Meta::Path(path) if path.is_ident("skip") || path.is_ident("skip_serializing") => {
                     result.skip = true;
                 }
                 Meta::Path(path) if path.is_ident("flatten") => {
@@ -340,14 +352,12 @@ fn serde_field_attributes(attributes: &[Attribute]) -> syn::Result<SerdeFieldAtt
                 Meta::NameValue(name_value) if name_value.path.is_ident("rename") => {
                     result.rename = lit_string(&name_value.value);
                 }
-                Meta::NameValue(name_value)
-                    if name_value.path.is_ident("skip_serializing_if") =>
-                {
+                Meta::NameValue(name_value) if name_value.path.is_ident("skip_serializing_if") => {
                     result.skip_serializing_if = true;
                 }
                 Meta::List(list) if list.path.is_ident("rename") => {
-                    let nested = list
-                        .parse_args_with(Punctuated::<Meta, Comma>::parse_terminated)?;
+                    let nested =
+                        list.parse_args_with(Punctuated::<Meta, Comma>::parse_terminated)?;
                     for meta in nested {
                         if let Meta::NameValue(name_value) = meta
                             && name_value.path.is_ident("serialize")
@@ -365,7 +375,10 @@ fn serde_field_attributes(attributes: &[Attribute]) -> syn::Result<SerdeFieldAtt
 
 fn serde_rename_all(attributes: &[Attribute]) -> syn::Result<Option<String>> {
     let mut rename_all = None;
-    for attribute in attributes.iter().filter(|attr| attr.path().is_ident("serde")) {
+    for attribute in attributes
+        .iter()
+        .filter(|attr| attr.path().is_ident("serde"))
+    {
         for meta in parse_meta_list(attribute)? {
             if let Meta::NameValue(name_value) = meta
                 && name_value.path.is_ident("rename_all")
@@ -403,7 +416,10 @@ fn apply_rename_all(value: &str, rule: &str) -> String {
             .concat(),
         "camelCase" => {
             let mut iter = words.iter();
-            let first = iter.next().map(|word| word.to_lowercase()).unwrap_or_default();
+            let first = iter
+                .next()
+                .map(|word| word.to_lowercase())
+                .unwrap_or_default();
             first
                 + &iter
                     .map(|word| capitalize(word))
@@ -439,7 +455,10 @@ fn identifier_words(value: &str) -> Vec<String> {
             continue;
         }
 
-        let previous = index.checked_sub(1).and_then(|i| characters.get(i)).copied();
+        let previous = index
+            .checked_sub(1)
+            .and_then(|i| characters.get(i))
+            .copied();
         let next = characters.get(index + 1).copied();
         let starts_word = character.is_uppercase()
             && previous.is_some_and(|previous| {

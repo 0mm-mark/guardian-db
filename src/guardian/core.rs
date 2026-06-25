@@ -316,9 +316,9 @@ impl GuardianDB {
         let client_config = client_config.unwrap_or_default();
 
         // Extract node_id or generate a random one.
-        let node_id = options.node_id.unwrap_or_else(|| {
-            iroh::SecretKey::generate().public()
-        });
+        let node_id = options
+            .node_id
+            .unwrap_or_else(|| iroh::SecretKey::generate().public());
 
         // Create the Iroh backend.
         let backend = Arc::new(IrohBackend::new(&client_config).await?);
@@ -339,10 +339,9 @@ impl GuardianDB {
             };
 
             // Create the keystore using our RedbKeystore implementation.
-            let keystore =
-                Arc::new(RedbKeystore::new(sled_path).map_err(|e| {
-                    GuardianError::Other(format!("Failed to create the keystore: {}", e))
-                })?);
+            let keystore = Arc::new(RedbKeystore::new(sled_path).map_err(|e| {
+                GuardianError::Other(format!("Failed to create the keystore: {}", e))
+            })?);
 
             // Create the close closure.
             let keystore_clone = keystore.clone();
@@ -1144,10 +1143,7 @@ impl GuardianDB {
         self.add_manifest_to_cache(&directory_path, &db_address)
             .await
             .map_err(|e| {
-                GuardianError::Other(format!(
-                    "could not add the manifest to the cache: {}",
-                    e
-                ))
+                GuardianError::Other(format!("could not add the manifest to the cache: {}", e))
             })?;
 
         tracing::debug!(
@@ -1233,9 +1229,7 @@ impl GuardianDB {
             // Read the manifest to determine the database type.
             if self.have_local_data_in(&parsed_address, &directory).await {
                 // If we have local data, first try to read from the local cache.
-                tracing::debug!(
-                    "Data found locally, trying to read from cache before iroh"
-                );
+                tracing::debug!("Data found locally, trying to read from cache before iroh");
 
                 // Read the local cache.
                 let _cache_key = format!("{}/_manifest", parsed_address);
@@ -1392,9 +1386,7 @@ impl GuardianDB {
         let manifest_hash =
             db_manifest::create_db_manifest(self.client(), name, store_type, &ac_address_string)
                 .await
-                .map_err(|e| {
-                    GuardianError::Other(format!("Could not save the manifest: {}", e))
-                })?;
+                .map_err(|e| GuardianError::Other(format!("Could not save the manifest: {}", e)))?;
 
         // Build and return the final GuardianDB address.
         let addr_string = format!("/GuardianDB/{}/{}", manifest_hash, name);
@@ -1953,10 +1945,7 @@ impl GuardianDB {
             .subscribe::<EventPubSubPayload>()
             .await
             .map_err(|e| {
-                GuardianError::Other(format!(
-                    "could not subscribe to pubsub events: {}",
-                    e
-                ))
+                GuardianError::Other(format!("could not subscribe to pubsub events: {}", e))
             })?;
 
         // Clone the Arcs and other data needed for the asynchronous task.
@@ -2914,10 +2903,7 @@ impl GuardianDB {
         }
 
         if valid_heads.is_empty() {
-            tracing::warn!(
-                total_heads = heads.len(),
-                "All received heads are invalid"
-            );
+            tracing::warn!(total_heads = heads.len(), "All received heads are invalid");
             return Ok(());
         }
 
@@ -3200,10 +3186,7 @@ pub async fn make_direct_channel(
     let emitter = crate::p2p::PayloadEmitter::new(event_bus)
         .await
         .map_err(|e| {
-            GuardianError::Other(format!(
-                "could not initialize the pubsub emitter: {}",
-                e
-            ))
+            GuardianError::Other(format!("could not initialize the pubsub emitter: {}", e))
         })?;
 
     // Use the provided factory to create the direct channel.

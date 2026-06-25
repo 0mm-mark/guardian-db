@@ -188,7 +188,10 @@ impl EpidemicPubSub {
                                 .iter()
                                 .map(|p| p.fmt_short().to_string())
                                 .collect::<Vec<_>>(),
-                            connected.iter().map(|p| p.fmt_short().to_string()).collect::<Vec<_>>()
+                            connected
+                                .iter()
+                                .map(|p| p.fmt_short().to_string())
+                                .collect::<Vec<_>>()
                         );
                         break;
                     }

@@ -386,9 +386,9 @@ impl IrohBackend {
         debug!("Initializing Iroh backend in directory: {:?}", data_dir);
 
         // Ensure the directory exists.
-        tokio::fs::create_dir_all(&data_dir).await.map_err(|e| {
-            GuardianError::Other(format!("Error creating data directory: {}", e))
-        })?;
+        tokio::fs::create_dir_all(&data_dir)
+            .await
+            .map_err(|e| GuardianError::Other(format!("Error creating data directory: {}", e)))?;
 
         // Generate or load the node's persistent secret key.
         let secret_key = Self::load_or_generate_node_secret_key(&data_dir).await?;
@@ -500,10 +500,7 @@ impl IrohBackend {
 
         // Save the key for future use.
         if let Err(e) = tokio::fs::write(&key_file, secret_key.to_bytes()).await {
-            warn!(
-                "Error saving secret key: {} - Using a temporary key",
-                e
-            );
+            warn!("Error saving secret key: {} - Using a temporary key", e);
         } else {
             info!("New secret key saved to {:?}", key_file);
         }
@@ -517,9 +514,9 @@ impl IrohBackend {
 
         // Create a specific directory for the store.
         let store_dir = self.data_dir.join("iroh_store");
-        tokio::fs::create_dir_all(&store_dir).await.map_err(|e| {
-            GuardianError::Other(format!("Error creating store directory: {}", e))
-        })?;
+        tokio::fs::create_dir_all(&store_dir)
+            .await
+            .map_err(|e| GuardianError::Other(format!("Error creating store directory: {}", e)))?;
 
         // Initialize the FsStore with persistence.
         let fs_store = FsStore::load(&store_dir)
@@ -581,9 +578,7 @@ impl IrohBackend {
             .ok_or_else(|| GuardianError::Other("Store not initialized".to_string()))?;
 
         let blobs = match store_for_blobs {
-            StoreType::Fs(fs_store) => {
-                BlobsProtocol::new(fs_store.as_ref(), None)
-            }
+            StoreType::Fs(fs_store) => BlobsProtocol::new(fs_store.as_ref(), None),
         };
         drop(store_lock);
 
@@ -725,9 +720,7 @@ impl IrohBackend {
         let endpoint_lock = self.endpoint.read().await;
         if endpoint_lock.is_none() {
             drop(endpoint_lock);
-            return Err(GuardianError::Other(
-                "Endpoint not initialized".to_string(),
-            ));
+            return Err(GuardianError::Other("Endpoint not initialized".to_string()));
         }
         Ok(self.endpoint.clone())
     }
@@ -908,8 +901,10 @@ impl IrohBackend {
         // First try remote_info() for already-known peers (now asynchronous in Iroh 1.0).
         if let Some(remote_info) = endpoint.remote_info(node_id).await {
             // Build EndpointAddr from the RemoteInfo (TransportAddr unifies IP + relay).
-            let node_addr =
-                NodeAddr::from_parts(remote_info.id(), remote_info.into_addrs().map(|a| a.into_addr()));
+            let node_addr = NodeAddr::from_parts(
+                remote_info.id(),
+                remote_info.into_addrs().map(|a| a.into_addr()),
+            );
             if !node_addr.addrs.is_empty() {
                 info!("Peer {} found via remote_info()", node_id);
                 return Ok(vec![node_addr]);
@@ -922,9 +917,9 @@ impl IrohBackend {
         );
 
         // Iroh 1.0 pull-based model: resolve(endpoint_id) via AddressLookupServices.
-        let services = endpoint.address_lookup().map_err(|e| {
-            GuardianError::Other(format!("Address lookup not configured: {}", e))
-        })?;
+        let services = endpoint
+            .address_lookup()
+            .map_err(|e| GuardianError::Other(format!("Address lookup not configured: {}", e)))?;
 
         use futures::StreamExt;
         let mut stream = services.resolve(node_id);
@@ -1072,9 +1067,8 @@ impl IrohBackend {
 
     /// Converts a hexadecimal string into an Iroh BLAKE3 Hash.
     fn parse_hash(hash_str: &str) -> Result<IrohHash> {
-        let hash_bytes = hex::decode(hash_str).map_err(|e| {
-            GuardianError::Other(format!("Invalid hex hash '{}': {}", hash_str, e))
-        })?;
+        let hash_bytes = hex::decode(hash_str)
+            .map_err(|e| GuardianError::Other(format!("Invalid hex hash '{}': {}", hash_str, e)))?;
 
         if hash_bytes.len() != 32 {
             return Err(GuardianError::Other(format!(
@@ -1272,10 +1266,7 @@ impl IrohBackend {
     /// * `hash_str` - BLAKE3 hash in hexadecimal format of the content to pin
     pub async fn pin_add(&self, hash_str: &str) -> Result<()> {
         self.execute_with_metrics(async {
-            debug!(
-                "Pinning object {} via Iroh using persistent Tags",
-                hash_str
-            );
+            debug!("Pinning object {} via Iroh using persistent Tags", hash_str);
 
             // Get a reference to the store.
             let store_arc = self.get_store().await?;
@@ -1449,10 +1440,7 @@ impl IrohBackend {
                                             pin_type: pin_type.clone(),
                                         });
 
-                                        debug!(
-                                            "Pin found: {} (type: {:?})",
-                                            hash_str, pin_type
-                                        );
+                                        debug!("Pin found: {} (type: {:?})", hash_str, pin_type);
                                     }
                                 }
                                 Err(e) => {
@@ -1964,7 +1952,10 @@ impl IrohBackend {
         for node_id in stale_peers {
             pool.remove(&node_id);
             removed_count += 1;
-            debug!("Stale connection removed from the pool: {}", node_id.fmt_short());
+            debug!(
+                "Stale connection removed from the pool: {}",
+                node_id.fmt_short()
+            );
         }
 
         if removed_count > 0 {

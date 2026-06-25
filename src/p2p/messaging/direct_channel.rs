@@ -833,11 +833,7 @@ impl DirectChannel {
                     success: true,
                     error: None,
                 });
-                tracing::debug!(
-                    "Data sent to {}: {} bytes",
-                    peer,
-                    message.payload.len()
-                );
+                tracing::debug!("Data sent to {}: {} bytes", peer, message.payload.len());
                 Ok(())
             }
             Err(e) => {
@@ -910,9 +906,7 @@ impl DirectChannel {
             .iroh_network
             .as_any()
             .downcast_ref::<IrohBridge>()
-            .ok_or_else(|| {
-                GuardianError::Other("Cannot downcast to IrohBridge".to_string())
-            })?;
+            .ok_or_else(|| GuardianError::Other("Cannot downcast to IrohBridge".to_string()))?;
 
         // Get a receiver for messages of this topic.
         let Some(mut receiver): Option<broadcast::Receiver<(NodeId, Vec<u8>)>> =
