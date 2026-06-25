@@ -171,12 +171,11 @@ fn expand_model(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         ));
     }
 
-    if !explicit_primary {
-        if let Some(position) = inferred_primary_index {
-            if let Some(field) = field_tokens.iter_mut().find(|field| field.position == position) {
-                field.primary = true;
-            }
-        }
+    if !explicit_primary
+        && let Some(position) = inferred_primary_index
+        && let Some(field) = field_tokens.iter_mut().find(|field| field.position == position)
+    {
+        field.primary = true;
     }
 
     let has_primary = field_tokens.iter().any(|field| field.primary);

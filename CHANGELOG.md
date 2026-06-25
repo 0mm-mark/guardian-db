@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Secure namespace sharing for iroh-docs-backed stores (KeyValue/Document)** so they replicate across peers (previously each node created an isolated namespace).
+  - Added `DocTicket`-based capability sharing: `KeyValueStore::share_ticket()`/`DocumentStore::share_ticket()` and a new `CreateDBOptions.doc_ticket` to open a store joining a peer's shared namespace.
+  - Added **automatic ticket exchange** over the authenticated QUIC connection (new `/guardian-db/ticket/1` ALPN), gated by the store's `AccessController` (the requester is identified by its authenticated Iroh public key; `*` = public).
+  - Added **deterministic creator resolution** (lowest `EndpointId` wins) to avoid split-brain when peers open the same store concurrently.
+  - Added **reactive live index sync** so remote writes are reflected in `all()`/`get()`/`query()` without a manual reload.
+- **Expanded test coverage (+41 tests)**: ticket-exchange authorization gate, direct-channel wire format (CBOR round-trip + deterministic `TopicId`), store event types, key-synchronizer keypair persistence/trusted-peers, and ODM update operators (`$set`/`$unset`/`$inc`).
 - **Optional ODM layer (`odm` feature)** for TypeORM/Mongoose-style document modeling on top of `DocumentStore`, without replacing GuardianDB's decentralized Iroh Docs/Willow storage model.
   - Added `guardian-db-derive` with `#[derive(Model)]`, `#[primary_key]`, `#[unique]`, `#[index]`, `#[model(collection = "...")]`, `#[model(timestamps)]`, flexible schemas, and schema version metadata.
   - Added typed and dynamic collection APIs with `insert_one`, batch `insert`, `find_one`, `find`, `find_by_id`, and first-match `update`.
@@ -20,8 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ODM documentation and tests**, including `docs/odm.md`, Rust ODM integration tests, and TypeScript SDK tests covering the issue #17 usage flow, uniqueness rollback, update operators, collection listing, and version-conflict behavior.
 
 ### Changed
+- **Upgraded to Iroh 1.0.** Bumped `iroh` 0.92 → **1.0.0**, `iroh-blobs` → **0.103**, `iroh-gossip` → **0.101**, `iroh-docs` → **0.101**, `iroh-io` → 0.6.1, and added **`iroh-mdns-address-lookup` 0.4** for LAN discovery (these crates remain separately versioned in 1.0).
+  - Migrated the API surface: `NodeId`→`EndpointId`, `NodeAddr`→`EndpointAddr` (with unified `TransportAddr`), `discovery()`→`address_lookup()` using the `N0` preset + mDNS, async `remote_info()`, `endpoint.id()`, `connection.remote_id()`, and the new `BlobsProtocol`/`Endpoint::builder(preset)` signatures.
+- **Unified randomness on a single `rand` crate.** Removed the direct `rand_core` 0.6.4 pin (no longer needed now that `SecretKey::generate()` takes no RNG), updated `rand` → **0.10**, and set `ed25519-dalek` → 2.2 with the `serde` feature.
 - `DocumentStore` opening is now idempotent for ODM collection initialization so repeated collection setup can reuse the underlying replicated document store safely.
 - Root README now documents the optional ODM layer, Rust model derive usage, TypeScript collection API shape, build/test commands, and the local-vs-replicated consistency boundary.
+
+### Removed
+- **Legacy `replicator` module and `ReplicationInfo` type** (OrbitDB lineage). Replication is handled natively by Iroh, so the vestigial progress-tracking surface was removed: the `Store::replication_status()` trait method and all implementations, the `BaseStore` replication field, and the dead `update/recalculate_replication_*` and `replication_load_complete` helpers.
+
+### Fixed
+- **ODM `$inc` now preserves integer types** (e.g. `1024 + 1` yields `1025`, not `1025.0`); it only falls back to floating-point arithmetic for fractional operands or i64 overflow. Fixes a failing ODM reliability test.
 
 ## [0.16.0] - 2026-03-01
 
