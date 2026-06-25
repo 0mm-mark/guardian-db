@@ -2110,11 +2110,10 @@ async fn group_chat_mode(state: &mut ChatState, group_idx: usize, _theme: &Color
                 KeyEvent {
                     code: KeyCode::Backspace,
                     ..
+                } if input_buf.pop().is_some() => {
+                    print!("\x08 \x08");
+                    std::io::stdout().flush().ok();
                 }
-                    if input_buf.pop().is_some() => {
-                        print!("\x08 \x08");
-                        std::io::stdout().flush().ok();
-                    }
                 KeyEvent {
                     code: KeyCode::Char('c'),
                     modifiers: KeyModifiers::CONTROL,
@@ -2473,11 +2472,10 @@ async fn chat_mode(state: &mut ChatState, contact_idx: usize, _theme: &ColorfulT
                 KeyEvent {
                     code: KeyCode::Backspace,
                     ..
+                } if input_buf.pop().is_some() => {
+                    print!("\x08 \x08");
+                    std::io::stdout().flush().ok();
                 }
-                    if input_buf.pop().is_some() => {
-                        print!("\x08 \x08");
-                        std::io::stdout().flush().ok();
-                    }
                 KeyEvent {
                     code: KeyCode::Char('c'),
                     modifiers: KeyModifiers::CONTROL,

@@ -73,9 +73,7 @@ impl RedbKeystore {
         match self.get(key).await? {
             Some(bytes) => {
                 if bytes.len() != 32 {
-                    return Err(GuardianError::Other(
-                        "Invalid secret key size".to_string(),
-                    ));
+                    return Err(GuardianError::Other("Invalid secret key size".to_string()));
                 }
                 let secret_key = SecretKey::try_from(&bytes[..32]).map_err(|e| {
                     GuardianError::Other(format!("Error decoding secret key: {}", e))
@@ -144,9 +142,9 @@ impl KeystoreInterface for RedbKeystore {
             let mut table = write_txn
                 .open_table(KEYSTORE_TABLE)
                 .map_err(|e| GuardianError::Other(format!("Error opening table: {}", e)))?;
-            table
-                .insert(key, value)
-                .map_err(|e| GuardianError::Other(format!("Error inserting into keystore: {}", e)))?;
+            table.insert(key, value).map_err(|e| {
+                GuardianError::Other(format!("Error inserting into keystore: {}", e))
+            })?;
         }
         write_txn
             .commit()
@@ -173,9 +171,10 @@ impl KeystoreInterface for RedbKeystore {
     }
 
     async fn has(&self, key: &str) -> Result<bool> {
-        let read_txn = self.db.begin_read().map_err(|e| {
-            GuardianError::Other(format!("Error checking key in keystore: {}", e))
-        })?;
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| GuardianError::Other(format!("Error checking key in keystore: {}", e)))?;
         let table = read_txn
             .open_table(KEYSTORE_TABLE)
             .map_err(|e| GuardianError::Other(format!("Error opening table: {}", e)))?;
@@ -198,9 +197,9 @@ impl KeystoreInterface for RedbKeystore {
             let mut table = write_txn
                 .open_table(KEYSTORE_TABLE)
                 .map_err(|e| GuardianError::Other(format!("Error opening table: {}", e)))?;
-            table
-                .remove(key)
-                .map_err(|e| GuardianError::Other(format!("Error removing from keystore: {}", e)))?;
+            table.remove(key).map_err(|e| {
+                GuardianError::Other(format!("Error removing from keystore: {}", e))
+            })?;
         }
         write_txn
             .commit()
@@ -250,7 +249,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_keypair_storage() {
-
         let keystore = RedbKeystore::temporary().unwrap();
         let key_name = "test_keypair";
 

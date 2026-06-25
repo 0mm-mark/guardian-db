@@ -206,10 +206,7 @@ impl NetworkingMetricsCollector {
     /// Records a Gossipsub message sent.
     pub async fn record_message_sent(&self, topic: &TopicId, size_bytes: usize) {
         self.counters.messages_sent.fetch_add(1, Ordering::Relaxed);
-        debug!(
-            "Message sent on topic {:?}: {} bytes",
-            topic, size_bytes
-        );
+        debug!("Message sent on topic {:?}: {} bytes", topic, size_bytes);
     }
 
     /// Records a Gossipsub message received.

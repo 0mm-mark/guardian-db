@@ -704,7 +704,11 @@ async fn test_add_trusted_peer_for_sync() {
 
     let peer_secret = SecretKey::generate();
     let node_id = peer_secret.public();
-    let public_key = { let mut sk_bytes = [0u8; 32]; rand::rng().fill_bytes(&mut sk_bytes); ed25519_dalek::SigningKey::from_bytes(&sk_bytes).verifying_key() };
+    let public_key = {
+        let mut sk_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut sk_bytes);
+        ed25519_dalek::SigningKey::from_bytes(&sk_bytes).verifying_key()
+    };
 
     let result = backend.add_trusted_peer_for_sync(node_id, public_key).await;
     assert!(result.is_ok());
@@ -720,7 +724,11 @@ async fn test_remove_trusted_peer_from_sync() {
 
     let peer_secret = SecretKey::generate();
     let node_id = peer_secret.public();
-    let public_key = { let mut sk_bytes = [0u8; 32]; rand::rng().fill_bytes(&mut sk_bytes); ed25519_dalek::SigningKey::from_bytes(&sk_bytes).verifying_key() };
+    let public_key = {
+        let mut sk_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut sk_bytes);
+        ed25519_dalek::SigningKey::from_bytes(&sk_bytes).verifying_key()
+    };
 
     // Adiciona peer
     backend

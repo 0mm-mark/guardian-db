@@ -432,9 +432,7 @@ mod tests {
         // Check that events 5 through 9 were received.
         for i in 5..10 {
             let item = sub.recv().await.expect("channel was closed prematurely");
-            let item_str = item
-                .downcast_ref::<String>()
-                .expect("could not convert");
+            let item_str = item.downcast_ref::<String>().expect("could not convert");
             assert_eq!(*item_str, format!("{}", i));
         }
 

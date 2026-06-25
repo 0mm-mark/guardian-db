@@ -134,7 +134,10 @@ fn benchmark_insert_workloads(c: &mut Criterion) {
             let index = counter.fetch_add(1, Ordering::Relaxed) as usize;
             rt.block_on(async {
                 single_collection
-                    .insert_one(std::hint::black_box(benchmark_document(index, payload_bytes)))
+                    .insert_one(std::hint::black_box(benchmark_document(
+                        index,
+                        payload_bytes,
+                    )))
                     .await
                     .unwrap()
             })
@@ -148,15 +151,17 @@ fn benchmark_insert_workloads(c: &mut Criterion) {
             let batch_counter = AtomicU64::new(0);
             b.iter_batched(
                 || {
-                    let start = batch_counter.fetch_add(batch_docs as u64, Ordering::Relaxed)
-                        as usize;
+                    let start =
+                        batch_counter.fetch_add(batch_docs as u64, Ordering::Relaxed) as usize;
                     (
                         rt.block_on(new_collection("batch_insert")),
                         documents(start, batch_docs, payload_bytes),
                     )
                 },
                 |(collection, docs)| {
-                    rt.block_on(async move { collection.insert(std::hint::black_box(docs)).await.unwrap() })
+                    rt.block_on(async move {
+                        collection.insert(std::hint::black_box(docs)).await.unwrap()
+                    })
                 },
                 BatchSize::LargeInput,
             )
@@ -215,7 +220,9 @@ fn benchmark_query_workloads(c: &mut Criterion) {
                 let bucket = (counter.fetch_add(1, Ordering::Relaxed) as usize) % 64;
                 rt.block_on(async {
                     collection
-                        .find(std::hint::black_box(json!({ "group": format!("group-{bucket}") })))
+                        .find(std::hint::black_box(
+                            json!({ "group": format!("group-{bucket}") }),
+                        ))
                         .await
                         .unwrap()
                 })
@@ -230,7 +237,9 @@ fn benchmark_query_workloads(c: &mut Criterion) {
                 let threshold = (counter.fetch_add(1, Ordering::Relaxed) as usize) % doc_count;
                 rt.block_on(async {
                     collection
-                        .find(std::hint::black_box(json!({ "counter": { "$gte": threshold } })))
+                        .find(std::hint::black_box(
+                            json!({ "counter": { "$gte": threshold } }),
+                        ))
                         .await
                         .unwrap()
                 })
@@ -273,24 +282,21 @@ fn benchmark_update_workloads(c: &mut Criterion) {
         },
     );
 
-    group.bench_function(
-        format!("update_inc_by_id_{doc_count}_docs").as_str(),
-        |b| {
-            b.iter(|| {
-                let index = (counter.fetch_add(1, Ordering::Relaxed) as usize) % doc_count;
-                rt.block_on(async {
-                    collection
-                        .update(
-                            std::hint::black_box(json!({ "id": format!("bench-{index:010}") })),
-                            std::hint::black_box(json!({ "$inc": { "counter": 1 } })),
-                        )
-                        .await
-                        .unwrap()
-                        .unwrap()
-                })
+    group.bench_function(format!("update_inc_by_id_{doc_count}_docs").as_str(), |b| {
+        b.iter(|| {
+            let index = (counter.fetch_add(1, Ordering::Relaxed) as usize) % doc_count;
+            rt.block_on(async {
+                collection
+                    .update(
+                        std::hint::black_box(json!({ "id": format!("bench-{index:010}") })),
+                        std::hint::black_box(json!({ "$inc": { "counter": 1 } })),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap()
             })
-        },
-    );
+        })
+    });
 
     group.finish();
 }
@@ -303,35 +309,43 @@ fn benchmark_large_document_workloads(c: &mut Criterion) {
 
     for size in sizes {
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_function(format!("insert_read_update_payload_{size}_bytes").as_str(), |b| {
-            let counter = AtomicU64::new(0);
-            b.iter_batched(
-                || {
-                    let index = counter.fetch_add(1, Ordering::Relaxed) as usize;
-                    (rt.block_on(new_collection("large_doc")), index)
-                },
-                |(collection, index)| {
-                    rt.block_on(async move {
-                        let inserted = collection
-                            .insert_one(std::hint::black_box(benchmark_document(index, size)))
-                            .await
-                            .unwrap();
-                        let id = inserted["id"].as_str().unwrap().to_string();
-                        let found = collection.find_by_id(std::hint::black_box(id.clone())).await.unwrap();
-                        assert!(found.is_some());
-                        collection
-                            .update(
-                                std::hint::black_box(json!({ "id": id })),
-                                std::hint::black_box(json!({ "$set": { "metadata.status": "updated" } })),
-                            )
-                            .await
-                            .unwrap()
-                            .unwrap()
-                    })
-                },
-                BatchSize::LargeInput,
-            )
-        });
+        group.bench_function(
+            format!("insert_read_update_payload_{size}_bytes").as_str(),
+            |b| {
+                let counter = AtomicU64::new(0);
+                b.iter_batched(
+                    || {
+                        let index = counter.fetch_add(1, Ordering::Relaxed) as usize;
+                        (rt.block_on(new_collection("large_doc")), index)
+                    },
+                    |(collection, index)| {
+                        rt.block_on(async move {
+                            let inserted = collection
+                                .insert_one(std::hint::black_box(benchmark_document(index, size)))
+                                .await
+                                .unwrap();
+                            let id = inserted["id"].as_str().unwrap().to_string();
+                            let found = collection
+                                .find_by_id(std::hint::black_box(id.clone()))
+                                .await
+                                .unwrap();
+                            assert!(found.is_some());
+                            collection
+                                .update(
+                                    std::hint::black_box(json!({ "id": id })),
+                                    std::hint::black_box(
+                                        json!({ "$set": { "metadata.status": "updated" } }),
+                                    ),
+                                )
+                                .await
+                                .unwrap()
+                                .unwrap()
+                        })
+                    },
+                    BatchSize::LargeInput,
+                )
+            },
+        );
     }
 
     group.finish();

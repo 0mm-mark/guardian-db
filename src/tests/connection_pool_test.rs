@@ -534,8 +534,10 @@ async fn test_multiple_direct_addresses() {
     let node_id = create_test_node_id(10);
     let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
-    let node_addr =
-        NodeAddr::from_parts(node_id, vec![TransportAddr::Ip(addr1), TransportAddr::Ip(addr2)]);
+    let node_addr = NodeAddr::from_parts(
+        node_id,
+        vec![TransportAddr::Ip(addr1), TransportAddr::Ip(addr2)],
+    );
 
     assert_eq!(node_addr.addrs.len(), 2);
 }

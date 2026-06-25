@@ -432,10 +432,7 @@ impl OptimizedConnectionPool {
             Ok(latency_ms) => {
                 // Check whether the latency is acceptable (< 5000ms).
                 if latency_ms > 5000.0 {
-                    warn!(
-                        "Latency too high for node {}: {:.2}ms",
-                        node_id, latency_ms
-                    );
+                    warn!("Latency too high for node {}: {:.2}ms", node_id, latency_ms);
                     return Err(GuardianError::Other(format!(
                         "Unacceptable latency: {:.2}ms",
                         latency_ms
@@ -500,7 +497,10 @@ impl OptimizedConnectionPool {
     ) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        debug!("Performing handshake with node {} at {:?}", node_id, address);
+        debug!(
+            "Performing handshake with node {} at {:?}",
+            node_id, address
+        );
 
         let handshake_start = Instant::now();
 
@@ -518,7 +518,10 @@ impl OptimizedConnectionPool {
         {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
-                return Err(GuardianError::Other(format!("TCP connection failure: {}", e)));
+                return Err(GuardianError::Other(format!(
+                    "TCP connection failure: {}",
+                    e
+                )));
             }
             Err(_) => {
                 return Err(GuardianError::Other("TCP connection timeout".to_string()));
@@ -571,9 +574,7 @@ impl OptimizedConnectionPool {
 
         // Validate the response size.
         if response_len == 0 || response_len > 1024 {
-            return Err(GuardianError::Other(
-                "Invalid response size".to_string(),
-            ));
+            return Err(GuardianError::Other("Invalid response size".to_string()));
         }
 
         let mut response_buf = vec![0u8; response_len];
@@ -713,10 +714,7 @@ impl OptimizedConnectionPool {
                             let mut breakers = self.circuit_breakers.write().await;
                             if let Some(breaker) = breakers.get_mut(&node_id) {
                                 breaker.state = CircuitState::HalfOpen;
-                                info!(
-                                    "Circuit breaker for {} transitioning to half-open",
-                                    node_id
-                                );
+                                info!("Circuit breaker for {} transitioning to half-open", node_id);
                             }
                             Ok(true)
                         } else {

@@ -110,7 +110,10 @@ impl GuardianDB {
             opts.event_bus = Some((*self.base.event_bus()).clone());
         }
 
-        tracing::debug!(address = address, "GuardianDB::log - Creating EventLogStore");
+        tracing::debug!(
+            address = address,
+            "GuardianDB::log - Creating EventLogStore"
+        );
 
         // Use create() directly for simple names (without a valid hash).
         // If it already exists, open it via the full address to preserve history.
@@ -647,9 +650,8 @@ impl EventLogStore for EventLogStoreWrapper {
             if arc_entry.hash() == hash {
                 // Convert Entry into Operation.
                 let entry = arc_entry.as_ref().clone();
-                let operation = crate::stores::operation::parse_operation(entry).map_err(|e| {
-                    GuardianError::Store(format!("Failed to parse entry: {}", e))
-                })?;
+                let operation = crate::stores::operation::parse_operation(entry)
+                    .map_err(|e| GuardianError::Store(format!("Failed to parse entry: {}", e)))?;
                 return Ok(operation);
             }
         }

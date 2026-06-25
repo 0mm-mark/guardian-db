@@ -35,45 +35,50 @@ impl StoreIndex for BaseIndex {
 
     /// Checks whether a key exists in the index.
     fn contains_key(&self, key: &str) -> Result<bool, Self::Error> {
-        let index_lock = self.index.read().map_err(|e| {
-            GuardianError::Store(format!("Failed to acquire read lock: {}", e))
-        })?;
+        let index_lock = self
+            .index
+            .read()
+            .map_err(|e| GuardianError::Store(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(index_lock.contains_key(key))
     }
 
     /// Returns a copy of the data for a specific key as bytes.
     fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, Self::Error> {
-        let index_lock = self.index.read().map_err(|e| {
-            GuardianError::Store(format!("Failed to acquire read lock: {}", e))
-        })?;
+        let index_lock = self
+            .index
+            .read()
+            .map_err(|e| GuardianError::Store(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(index_lock.get(key).cloned())
     }
 
     /// Returns all keys available in the index.
     fn keys(&self) -> Result<Vec<String>, Self::Error> {
-        let index_lock = self.index.read().map_err(|e| {
-            GuardianError::Store(format!("Failed to acquire read lock: {}", e))
-        })?;
+        let index_lock = self
+            .index
+            .read()
+            .map_err(|e| GuardianError::Store(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(index_lock.keys().cloned().collect())
     }
 
     /// Returns the number of entries in the index.
     fn len(&self) -> Result<usize, Self::Error> {
-        let index_lock = self.index.read().map_err(|e| {
-            GuardianError::Store(format!("Failed to acquire read lock: {}", e))
-        })?;
+        let index_lock = self
+            .index
+            .read()
+            .map_err(|e| GuardianError::Store(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(index_lock.len())
     }
 
     /// Checks whether the index is empty.
     fn is_empty(&self) -> Result<bool, Self::Error> {
-        let index_lock = self.index.read().map_err(|e| {
-            GuardianError::Store(format!("Failed to acquire read lock: {}", e))
-        })?;
+        let index_lock = self
+            .index
+            .read()
+            .map_err(|e| GuardianError::Store(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(index_lock.is_empty())
     }
@@ -86,9 +91,10 @@ impl StoreIndex for BaseIndex {
         let mut handled = HashSet::new();
 
         // Acquire a write lock to modify the index safely.
-        let mut index = self.index.write().map_err(|e| {
-            GuardianError::Store(format!("Failed to acquire write lock: {}", e))
-        })?;
+        let mut index = self
+            .index
+            .write()
+            .map_err(|e| GuardianError::Store(format!("Failed to acquire write lock: {}", e)))?;
 
         // Iterate over the provided entries in reverse order (newest to oldest).
         // This ensures that only the most recent operation for each key is applied.
@@ -138,9 +144,10 @@ impl StoreIndex for BaseIndex {
 
     /// Clears all data from the index.
     fn clear(&mut self) -> Result<(), Self::Error> {
-        let mut index_lock = self.index.write().map_err(|e| {
-            GuardianError::Store(format!("Failed to acquire write lock: {}", e))
-        })?;
+        let mut index_lock = self
+            .index
+            .write()
+            .map_err(|e| GuardianError::Store(format!("Failed to acquire write lock: {}", e)))?;
 
         index_lock.clear();
         Ok(())

@@ -195,12 +195,12 @@ impl ModelSchema {
         let created_at = created_at.into();
         let updated_at = updated_at.into();
 
-        self.fields.entry(created_at.clone()).or_insert_with(|| {
-            FieldDefinition::new(created_at.clone(), FieldType::Timestamp)
-        });
-        self.fields.entry(updated_at.clone()).or_insert_with(|| {
-            FieldDefinition::new(updated_at.clone(), FieldType::Timestamp)
-        });
+        self.fields
+            .entry(created_at.clone())
+            .or_insert_with(|| FieldDefinition::new(created_at.clone(), FieldType::Timestamp));
+        self.fields
+            .entry(updated_at.clone())
+            .or_insert_with(|| FieldDefinition::new(updated_at.clone(), FieldType::Timestamp));
         self.timestamps = Some(TimestampDefinition {
             created_at,
             updated_at,
@@ -365,7 +365,10 @@ impl ModelSchema {
     }
 
     /// Returns the document as a mutable JSON object, erroring if it is not one.
-    pub(crate) fn object_mut<'a>(&self, document: &'a mut Value) -> Result<&'a mut Map<String, Value>> {
+    pub(crate) fn object_mut<'a>(
+        &self,
+        document: &'a mut Value,
+    ) -> Result<&'a mut Map<String, Value>> {
         document
             .as_object_mut()
             .ok_or_else(|| OdmError::Validation {

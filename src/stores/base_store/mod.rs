@@ -1094,7 +1094,6 @@ impl BaseStore {
             cache_errors.len()
         );
 
-
         // Reset the retry metrics.
         {
             let mut metrics = self.retry_metrics.lock();
@@ -3082,10 +3081,7 @@ impl BaseStore {
         R: AsyncRead + Unpin,
     {
         let len = reader.read_u16().await.map_err(|e| {
-            GuardianError::Store(format!(
-                "Failed to read the snapshot size prefix: {}",
-                e
-            ))
+            GuardianError::Store(format!("Failed to read the snapshot size prefix: {}", e))
         })?;
 
         let mut buf = vec![0; len as usize];
