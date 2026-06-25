@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-db-derive"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "proc-macro2",
  "quote",
