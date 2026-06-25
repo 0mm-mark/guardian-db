@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-24
+
 ### Added
 - **Secure namespace sharing for iroh-docs-backed stores (KeyValue/Document)** so they replicate across peers (previously each node created an isolated namespace).
   - Added `DocTicket`-based capability sharing: `KeyValueStore::share_ticket()`/`DocumentStore::share_ticket()` and a new `CreateDBOptions.doc_ticket` to open a store joining a peer's shared namespace.
