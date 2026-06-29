@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Read-only replication with a cryptographic write guarantee** for iroh-docs-backed stores (KeyValue/Document), enabling a "one/two writers, many readers" topology where a reader cannot write — even if its software is compromised — because it never receives the namespace write secret.
+  - **Per-role ticket capability:** the ticket exchange now hands out a ticket matching the requester's authenticated role — a **read ticket** (`NamespaceId` only, no write secret) to readers and a **write ticket** (namespace secret) to write-authorized peers. The `TicketProvider` holds both pre-generated tickets and authorization returns the granted mode (`GrantedMode::Read`/`Write`), with `write` taking precedence over `read`.
+  - **`CreateDBOptions.read_only`:** opening a store read-only refuses local `put`/`delete` (fail-fast on the public `add_operation` write path and the inherent methods) and never creates a namespace (fail-closed when no ticket or cached namespace is available), so a reader cannot mint its own write secret.
+  - **Writability tracking:** each store records whether it holds the namespace secret (created locally, imported via a write vs read `DocTicket`, or reopened from a persisted flag); effective writability is `holds_secret && !read_only`.
+  - **`CreateAccessControllerOptions::read_only_replication(writers)`** helper to build the recommended ACL (`write: [writers]`, `read: ["*"]`).
+  - **Namespace rotation** support to truly revoke a provisioned writer (the namespace secret is symmetric and cannot be retracted via ACL edits): new `guardian_db::rotation::copy_key_value_state` helper to migrate state into a fresh namespace, plus a `docs/NAMESPACE_ROTATION.md` runbook.
+  - **Documentation:** `docs/READ_ONLY_REPLICATION.md` explaining the guarantee, the iroh-docs namespace-secret model, the enforcement layers, and usage.
+  - **Tests:** ticket-exchange per-role authorization (read-only peer never receives write, write precedence, no write-ticket leak), read-only fail-fast and no-create unit tests, rotation helper tests, and a two real-node integration test (`tests/integration_readonly.rs`) proving a reader replicates the writer's data but cannot write while the writer's state stays intact.
+
+### Changed
+- `IrohBackend::register_ticket_provider` now takes both a read and a write ticket (was a single write-capable ticket); KV/Document stores register via a new internal `share_tickets()` that generates both. `share_ticket()` is retained for compatibility and still returns a write-capable ticket.
+
 ## [0.17.0] - 2026-06-24
 
 ### Added

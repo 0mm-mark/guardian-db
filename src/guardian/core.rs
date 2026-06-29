@@ -1759,6 +1759,7 @@ impl GuardianDB {
             close_func: None,
             store_specific_opts: None,
             doc_ticket: options.doc_ticket,
+            read_only: options.read_only,
         };
 
         tracing::debug!("Options converted successfully");
@@ -3253,6 +3254,7 @@ impl BaseGuardianDB for GuardianDB {
             close_func: None,
             store_specific_opts: None,
             doc_ticket: options.doc_ticket.clone(),
+            read_only: options.read_only,
         };
 
         // Call the internal GuardianDB open method.
@@ -3304,6 +3306,7 @@ impl BaseGuardianDB for GuardianDB {
             close_func: None,
             store_specific_opts: None,
             doc_ticket: options.doc_ticket.clone(),
+            read_only: options.read_only,
         };
 
         // Call the internal GuardianDB create method.

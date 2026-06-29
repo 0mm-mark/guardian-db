@@ -1175,6 +1175,7 @@ impl BaseStore {
             close_func: None,
             store_specific_opts: None,
             doc_ticket: None,
+            read_only: None,
         });
         let cancellation_token = CancellationToken::new();
 

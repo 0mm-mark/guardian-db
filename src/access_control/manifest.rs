@@ -232,6 +232,25 @@ impl CreateAccessControllerOptions {
     pub fn from_params(params: &CreateAccessControllerOptions) -> Self {
         params.clone()
     }
+
+    /// Builds access-controller options for a **read-only replication** topology.
+    ///
+    /// Only the nodes whose ids are in `writers` may write (`write` role); every node may read
+    /// and replicate (`read: ["*"]`). The ids must be the hex-encoded iroh `EndpointId` of the
+    /// writer nodes (`hex::encode(node_id.as_bytes())`), matching what the ticket exchange
+    /// compares against the TLS-authenticated requester.
+    ///
+    /// This is the recommended secure configuration for the "one/two writers, many readers"
+    /// pattern: writer nodes hand out read-only `DocTicket`s to readers (no namespace secret),
+    /// so a compromised reader cannot originate writes. Pair it with
+    /// [`crate::traits::CreateDBOptions::read_only`] on the reader nodes so they also refuse
+    /// local writes and never create their own namespace.
+    pub fn read_only_replication(writers: Vec<String>) -> Self {
+        let mut access = HashMap::new();
+        access.insert("write".to_string(), writers);
+        access.insert("read".to_string(), vec!["*".to_string()]);
+        Self::new_simple("simple".to_string(), access)
+    }
 }
 
 /// Creates a new manifest and returns its Hash.

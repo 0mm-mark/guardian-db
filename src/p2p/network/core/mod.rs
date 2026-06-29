@@ -729,16 +729,20 @@ impl IrohBackend {
 
     /// Registers a store as a `DocTicket` provider, indexed by its address.
     ///
-    /// When an authorized peer (by the `access_controller`) requests this address's ticket
-    /// via [`ticket_exchange::TICKET_ALPN`], the handler will deliver it.
+    /// When an authorized peer requests this address's ticket via
+    /// [`ticket_exchange::TICKET_ALPN`], the handler delivers the capability matching the
+    /// peer's role: `write_ticket` (carries the namespace secret) for write-authorized peers,
+    /// `read_ticket` (namespace public key only) for read-only peers.
     pub async fn register_ticket_provider(
         &self,
         address: String,
-        ticket: String,
+        read_ticket: String,
+        write_ticket: String,
         access_controller: Arc<dyn crate::access_control::traits::AccessController>,
     ) {
         let provider = crate::p2p::network::core::ticket_exchange::TicketProvider {
-            ticket,
+            read_ticket,
+            write_ticket,
             access_controller,
         };
         self.ticket_registry.write().await.insert(address, provider);

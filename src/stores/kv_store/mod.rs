@@ -11,7 +11,7 @@ use crate::p2p::network::core::docs::WillowDocs;
 use crate::stores::operation::Operation;
 use crate::traits::{KeyValueStore, NewStoreOptions, Store, StoreIndex, TracerWrapper};
 use bytes::Bytes;
-use iroh_docs::{AuthorId, api::Doc, store::Query};
+use iroh_docs::{AuthorId, Capability, api::Doc, store::Query};
 use opentelemetry::trace::{TracerProvider, noop::NoopTracerProvider};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -22,6 +22,9 @@ pub mod index;
 
 // Cache key used to persist the iroh-docs document's NamespaceId.
 const NAMESPACE_CACHE_KEY: &[u8] = b"_iroh_docs_namespace_id";
+// Cache key used to persist whether this replica holds the namespace write secret.
+// Stored as a single byte: 1 = write-capable, 0 = read-only.
+const WRITABLE_CACHE_KEY: &[u8] = b"_iroh_docs_writable";
 
 /// StoreIndex implementation for the KeyValue Store.
 ///
@@ -231,6 +234,9 @@ pub struct GuardianDBKeyValue {
     emitter_interface: Arc<dyn crate::events::EmitterInterface + Send + Sync>,
     /// Empty log for compatibility with the Store trait (op_log()).
     empty_log: Arc<RwLock<crate::log::Log>>,
+    /// Whether this replica may originate writes. `false` when the store was opened read-only
+    /// (via `read_only` option) or imported from a read-only `DocTicket` (no namespace secret).
+    writable: bool,
 }
 
 #[async_trait::async_trait]
@@ -351,6 +357,10 @@ impl Store for GuardianDBKeyValue {
         op: Operation,
         _on_progress_callback: Option<tokio::sync::mpsc::Sender<crate::log::entry::Entry>>,
     ) -> Result<crate::log::entry::Entry> {
+        // Canonical write path for the public KeyValueStore API: enforce read-only here too,
+        // not just in put_impl/delete_impl.
+        self.ensure_writable()?;
+
         let key = op.key().cloned().unwrap_or_default();
 
         match op.op() {
@@ -459,6 +469,10 @@ impl KeyValueStore for GuardianDBKeyValue {
 
     /// Generates a `DocTicket` (with write capability) for this store's iroh-docs namespace.
     /// The peer that receives the ticket can import the same namespace and replicate securely.
+    ///
+    /// Note: this grants write capability (carries the namespace secret). For role-gated
+    /// sharing, the automatic ticket exchange hands out read or write tickets per requester
+    /// (see [`GuardianDBKeyValue::share_tickets`]).
     async fn share_ticket(&self) -> Result<String> {
         let ticket = self.docs.share_doc(&self.doc_handle, true).await?;
         Ok(ticket.to_string())
@@ -466,6 +480,52 @@ impl KeyValueStore for GuardianDBKeyValue {
 }
 
 impl GuardianDBKeyValue {
+    /// Generates both the read-only and read-write `DocTicket`s for this store's namespace.
+    ///
+    /// Returns `(read_ticket, write_ticket)`. The read ticket carries only the namespace
+    /// public key (no write secret); the write ticket carries the namespace secret. These are
+    /// registered with the ticket exchange so each requester receives the capability matching
+    /// its authenticated role.
+    async fn share_tickets(&self) -> Result<(String, String)> {
+        let read_ticket = self.docs.share_doc(&self.doc_handle, false).await?;
+        let write_ticket = self.docs.share_doc(&self.doc_handle, true).await?;
+        Ok((read_ticket.to_string(), write_ticket.to_string()))
+    }
+
+    /// Returns whether this replica may originate writes.
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+
+    /// Fails fast if this replica is read-only, so callers get a clear error instead of
+    /// producing entries that remote peers would silently reject.
+    fn ensure_writable(&self) -> Result<()> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(GuardianError::Store(
+                "store is read-only: this replica cannot originate writes".to_string(),
+            ))
+        }
+    }
+
+    /// Persists the replica's writability flag (best-effort; a failure only costs a fallback
+    /// to the default on reopen).
+    async fn persist_writable(cache: &dyn Datastore, writable: bool) {
+        if let Err(e) = cache.put(WRITABLE_CACHE_KEY, &[writable as u8]).await {
+            warn!("Failed to persist writability flag: {:?}", e);
+        }
+    }
+
+    /// Loads the replica's writability flag, defaulting to `true` for legacy stores that
+    /// predate the flag (they were always write-capable).
+    async fn load_writable(cache: &dyn Datastore) -> bool {
+        match cache.get(WRITABLE_CACHE_KEY).await {
+            Ok(Some(bytes)) if !bytes.is_empty() => bytes[0] != 0,
+            _ => true,
+        }
+    }
+
     /// Returns the number of key-value pairs in the store.
     pub fn len(&self) -> usize {
         self.index.len()
@@ -547,6 +607,8 @@ impl GuardianDBKeyValue {
     /// Synchronization with other peers is automatic via Willow.
     #[instrument(level = "debug", skip(self, value))]
     pub async fn put_impl(&self, key: &str, value: Vec<u8>) -> Result<Operation> {
+        self.ensure_writable()?;
+
         if key.is_empty() {
             return Err(GuardianError::Store("The key cannot be empty".to_string()));
         }
@@ -588,6 +650,8 @@ impl GuardianDBKeyValue {
     /// The deletion is propagated to other peers automatically via Willow.
     #[instrument(level = "debug", skip(self))]
     pub async fn delete_impl(&self, key: &str) -> Result<Operation> {
+        self.ensure_writable()?;
+
         if key.is_empty() {
             return Err(GuardianError::Store("The key cannot be empty".to_string()));
         }
@@ -732,6 +796,10 @@ impl GuardianDBKeyValue {
             .unwrap_or_default()
             .to_string();
 
+        // A node opened read-only must never create a namespace (it would mint its own write
+        // secret and become an isolated writer). It may only import an existing one.
+        let requested_read_only = opts.read_only.unwrap_or(false);
+
         // Resolve the DocTicket to use: an explicit ticket (opts) takes priority; otherwise,
         // try AUTOMATIC EXCHANGE with known peers — joining the shared namespace of
         // a peer that already holds this store and that authorizes this node (gated via AccessController).
@@ -740,24 +808,31 @@ impl GuardianDBKeyValue {
             None => client.backend().resolve_shared_ticket(&store_key).await,
         };
 
-        // If a DocTicket was resolved, import the peer's SHARED namespace.
-        // This is the secure replication path via capability: both nodes start using
-        // the same namespace and sync (range-based + live) starts with the ticket's peers.
-        let doc_handle = if let Some(ticket_str) = resolved_ticket.as_ref() {
+        // Establish the document, tracking whether this replica holds the namespace write
+        // secret (`doc_is_writable`). If a DocTicket was resolved, import the peer's SHARED
+        // namespace — the secure replication path via capability: both nodes start using the
+        // same namespace and sync (range-based + live) starts with the ticket's peers.
+        let (doc_handle, doc_is_writable) = if let Some(ticket_str) = resolved_ticket.as_ref() {
             let ticket = ticket_str
                 .parse::<iroh_docs::DocTicket>()
                 .map_err(|e| GuardianError::Store(format!("Invalid DocTicket: {}", e)))?;
+            // The ticket's capability determines whether we receive the write secret.
+            let ticket_writable = matches!(ticket.capability, Capability::Write(_));
             let doc = docs.import_doc(ticket).await?;
             let ns_id = doc.id();
-            // Persist the imported NamespaceId for future reopenings.
+            // Persist the imported NamespaceId and its writability for future reopenings.
             cache
                 .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
                 .await
                 .map_err(|e| {
                     GuardianError::Store(format!("Failed to persist imported NamespaceId: {}", e))
                 })?;
-            info!("Imported shared iroh-docs document via ticket: {:?}", ns_id);
-            doc
+            Self::persist_writable(cache.as_ref(), ticket_writable).await;
+            info!(
+                writable = ticket_writable,
+                "Imported shared iroh-docs document via ticket: {:?}", ns_id
+            );
+            (doc, ticket_writable)
         } else {
             // Try to retrieve the NamespaceId from the cache to reopen an existing document.
             match cache.get(NAMESPACE_CACHE_KEY).await {
@@ -769,8 +844,21 @@ impl GuardianDBKeyValue {
 
                     match docs.open_doc(namespace_id).await? {
                         Some(doc) => {
-                            info!("Reopened existing iroh-docs document: {:?}", namespace_id);
-                            doc
+                            // Writability was recorded when the namespace was first established;
+                            // legacy stores without the flag are assumed write-capable.
+                            let writable = Self::load_writable(cache.as_ref()).await;
+                            info!(
+                                writable,
+                                "Reopened existing iroh-docs document: {:?}", namespace_id
+                            );
+                            (doc, writable)
+                        }
+                        None if requested_read_only => {
+                            return Err(GuardianError::Store(format!(
+                                "Read-only store '{}' cannot create a namespace and the cached \
+                                 namespace {:?} was not found; no ticket available to import",
+                                store_key, namespace_id
+                            )));
                         }
                         None => {
                             // Document not found — create a new one.
@@ -789,10 +877,18 @@ impl GuardianDBKeyValue {
                                         e
                                     ))
                                 })?;
+                            Self::persist_writable(cache.as_ref(), true).await;
                             info!("Created new iroh-docs document: {:?}", ns_id);
-                            doc
+                            (doc, true)
                         }
                     }
+                }
+                _ if requested_read_only => {
+                    return Err(GuardianError::Store(format!(
+                        "Read-only store '{}' cannot create a namespace and none was available \
+                         to import (no ticket, no cached namespace)",
+                        store_key
+                    )));
                 }
                 _ => {
                     // No NamespaceId in the cache — create a new document.
@@ -804,11 +900,16 @@ impl GuardianDBKeyValue {
                         .map_err(|e| {
                             GuardianError::Store(format!("Failed to persist NamespaceId: {}", e))
                         })?;
+                    Self::persist_writable(cache.as_ref(), true).await;
                     info!("Created new iroh-docs document: {:?}", ns_id);
-                    doc
+                    (doc, true)
                 }
             }
         };
+
+        // Effective writability: a node explicitly opened read-only never writes, even if it
+        // happens to hold a write-capable namespace (defense in depth).
+        let writable = doc_is_writable && !requested_read_only;
 
         // --- 5. Create an empty Log for compatibility with the Store trait ---
 
@@ -850,6 +951,7 @@ impl GuardianDBKeyValue {
             tracer,
             emitter_interface,
             empty_log,
+            writable,
         };
 
         // Synchronize the local index with the iroh-docs document state.
@@ -875,13 +977,28 @@ impl GuardianDBKeyValue {
         store.spawn_live_index_sync();
 
         // Register this store as a DocTicket provider for authorized peers, enabling
-        // automatic namespace exchange on the network (capability gated by the AccessController).
-        if let Ok(ticket) = store.share_ticket().await {
-            store
-                .client
-                .backend()
-                .register_ticket_provider(store_key, ticket, access_controller_for_registry)
-                .await;
+        // automatic namespace exchange on the network. The capability is gated per requester
+        // by the AccessController: write-authorized peers get the write ticket (namespace
+        // secret), read-only peers get the read ticket (public key only).
+        match store.share_tickets().await {
+            Ok((read_ticket, write_ticket)) => {
+                store
+                    .client
+                    .backend()
+                    .register_ticket_provider(
+                        store_key,
+                        read_ticket,
+                        write_ticket,
+                        access_controller_for_registry,
+                    )
+                    .await;
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to generate share tickets, store not registered for exchange: {:?}",
+                    e
+                );
+            }
         }
 
         info!(

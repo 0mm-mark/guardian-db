@@ -15,6 +15,7 @@ pub mod message_marshaler;
 pub mod odm;
 pub mod p2p;
 pub mod reactive_synchronizer;
+pub mod rotation;
 pub mod stores;
 pub mod traits;
 

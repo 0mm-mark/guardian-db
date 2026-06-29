@@ -303,6 +303,11 @@ pub struct CreateDBOptions {
     /// Used by iroh-docs-based stores (KeyValue/Document) for secure replication via
     /// capability: when present, the store imports the ticket's namespace instead of creating a new one.
     pub doc_ticket: Option<String>,
+    /// Marks this store as a **read-only replica**. When `Some(true)`, iroh-docs-based stores
+    /// refuse local writes (`put`/`delete`) and never create a new namespace — they only import
+    /// an existing one (from `doc_ticket` or a peer). This enforces, at the node level, that a
+    /// designated reader cannot originate writes even if the namespace write secret is present.
+    pub read_only: Option<bool>,
 }
 
 impl Clone for CreateDBOptions {
@@ -327,6 +332,7 @@ impl Clone for CreateDBOptions {
             close_func: None,          // Cannot clone Box<dyn FnOnce()>
             store_specific_opts: None, // Cannot clone Box<dyn Any>
             doc_ticket: self.doc_ticket.clone(),
+            read_only: self.read_only,
         }
     }
 }
@@ -953,6 +959,10 @@ pub struct NewStoreOptions {
     /// When present, iroh-docs-based stores import the ticket's namespace (secure replication
     /// via capability) instead of creating a new namespace.
     pub doc_ticket: Option<String>,
+
+    /// Marks this store as a read-only replica: refuses local writes and never creates a
+    /// namespace (it must import an existing one). See [`CreateDBOptions::read_only`].
+    pub read_only: Option<bool>,
 }
 
 impl Default for NewStoreOptions {
@@ -980,6 +990,7 @@ impl Default for NewStoreOptions {
             close_func: None,
             store_specific_opts: None,
             doc_ticket: None,
+            read_only: None,
         }
     }
 }

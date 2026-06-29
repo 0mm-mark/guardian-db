@@ -6,13 +6,18 @@
 //!
 //! - **Responder** ([`TicketProtocolHandler`]): receives the requested store address, identifies
 //!   the peer by its iroh public key (authenticated by the QUIC TLS) and consults the store's
-//!   `AccessController`. It only delivers the ticket if the peer is authorized.
+//!   `AccessController`. It only delivers a ticket if the peer is authorized, and the ticket's
+//!   **capability matches the peer's role**: write-authorized peers receive a write ticket
+//!   (carrying the namespace secret), read-only peers receive a read ticket (namespace public
+//!   key only, no write secret).
 //! - **Requester** ([`request_ticket`]): opens a connection on the ALPN, sends the address and
 //!   receives the ticket (or a denial).
 //!
 //! The iroh QUIC connection authenticates the peer by its public key (`EndpointId`), so the
 //! decision to grant the ticket is made against an authenticated party — the node identity
-//! cannot be forged.
+//! cannot be forged. Because a read-only peer never receives the namespace secret, it is
+//! **cryptographically** unable to produce entries that other peers will accept, even if its
+//! software is compromised.
 
 use crate::access_control::traits::AccessController;
 use crate::guardian::error::{GuardianError, Result};
@@ -32,11 +37,27 @@ const RESP_GRANTED: u8 = 1;
 /// Responder response: access denied.
 const RESP_DENIED: u8 = 0;
 
-/// Provides a store's ticket and the access controller that decides who can obtain it.
+/// Capability granted to a requester, derived from its authenticated role in the ACL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantedMode {
+    /// Read-only: the peer receives a ticket without the namespace write secret.
+    Read,
+    /// Read-write: the peer receives a ticket carrying the namespace write secret.
+    Write,
+}
+
+/// Provides a store's tickets and the access controller that decides who can obtain which.
+///
+/// Two pre-generated tickets are held so the responder can hand out the capability matching
+/// the requester's authenticated role without minting tickets on the fly:
+/// - `write_ticket` carries the namespace secret (`ShareMode::Write`);
+/// - `read_ticket` carries only the namespace public key (`ShareMode::Read`).
 #[derive(Clone)]
 pub struct TicketProvider {
-    /// Serialized `DocTicket` of the store's iroh-docs namespace.
-    pub ticket: String,
+    /// Serialized read-only `DocTicket` (no write secret).
+    pub read_ticket: String,
+    /// Serialized read-write `DocTicket` (carries the namespace secret).
+    pub write_ticket: String,
     /// The store's access controller, consulted to authorize the requester.
     pub access_controller: Arc<dyn AccessController>,
 }
@@ -79,15 +100,22 @@ impl TicketProtocolHandler {
             return vec![RESP_DENIED];
         };
 
-        if is_authorized(&*provider.access_controller, requester).await {
-            debug!(address, peer = %requester.fmt_short(), "Ticket granted");
-            let mut out = Vec::with_capacity(provider.ticket.len() + 1);
-            out.push(RESP_GRANTED);
-            out.extend_from_slice(provider.ticket.as_bytes());
-            out
-        } else {
-            warn!(address, peer = %requester.fmt_short(), "Ticket denied by the access controller");
-            vec![RESP_DENIED]
+        match authorized_mode(&*provider.access_controller, requester).await {
+            Some(mode) => {
+                let ticket = match mode {
+                    GrantedMode::Write => &provider.write_ticket,
+                    GrantedMode::Read => &provider.read_ticket,
+                };
+                debug!(address, peer = %requester.fmt_short(), ?mode, "Ticket granted");
+                let mut out = Vec::with_capacity(ticket.len() + 1);
+                out.push(RESP_GRANTED);
+                out.extend_from_slice(ticket.as_bytes());
+                out
+            }
+            None => {
+                warn!(address, peer = %requester.fmt_short(), "Ticket denied by the access controller");
+                vec![RESP_DENIED]
+            }
         }
     }
 }
@@ -119,20 +147,30 @@ impl ProtocolHandler for TicketProtocolHandler {
     }
 }
 
-/// Checks whether the peer (`requester`, iroh key) is authorized to replicate the store.
+/// Determines which capability (if any) the peer (`requester`, iroh key) may obtain.
 ///
-/// Grants access if the access controller's "write" or "read" roles contain the `*` wildcard
-/// (public store) or the peer's hex key. Denies by default.
-async fn is_authorized(acl: &dyn AccessController, requester: PublicKey) -> bool {
+/// Write has precedence over read: a peer authorized for "write" receives [`GrantedMode::Write`]
+/// (namespace secret); a peer authorized only for "read" receives [`GrantedMode::Read`]
+/// (namespace public key, no secret). A role grants the peer if it contains the `*` wildcard
+/// (public store) or the peer's hex key. Returns `None` (deny) otherwise.
+async fn authorized_mode(acl: &dyn AccessController, requester: PublicKey) -> Option<GrantedMode> {
     let requester_hex = hex::encode(requester.as_bytes());
-    for role in ["write", "read"] {
-        if let Ok(keys) = acl.get_authorized_by_role(role).await
-            && (keys.iter().any(|k| k == "*") || keys.iter().any(|k| k == &requester_hex))
-        {
-            return true;
-        }
+    let role_grants = |keys: Vec<String>| {
+        keys.iter().any(|k| k == "*") || keys.iter().any(|k| k == &requester_hex)
+    };
+
+    // Check "write" first so write-authorized peers always get the stronger capability.
+    if let Ok(keys) = acl.get_authorized_by_role("write").await
+        && role_grants(keys)
+    {
+        return Some(GrantedMode::Write);
     }
-    false
+    if let Ok(keys) = acl.get_authorized_by_role("read").await
+        && role_grants(keys)
+    {
+        return Some(GrantedMode::Read);
+    }
+    None
 }
 
 /// Requests a peer's `DocTicket` for the store at `address`, over the [`TICKET_ALPN`].
@@ -194,26 +232,59 @@ mod tests {
         Arc::new(SimpleAccessController::new(Some(map))) as Arc<dyn AccessController>
     }
 
-    // ─── is_authorized ───────────────────────────────────────────────────────
+    // ─── authorized_mode ─────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn wildcard_write_authorizes_any_peer() {
+    async fn wildcard_write_grants_write_to_any_peer() {
         let acl = acl_with("write", vec!["*"]);
-        assert!(is_authorized(&*acl, random_public_key()).await);
+        assert_eq!(
+            authorized_mode(&*acl, random_public_key()).await,
+            Some(GrantedMode::Write)
+        );
     }
 
     #[tokio::test]
-    async fn wildcard_read_authorizes_any_peer() {
+    async fn wildcard_read_grants_read_to_any_peer() {
         let acl = acl_with("read", vec!["*"]);
-        assert!(is_authorized(&*acl, random_public_key()).await);
+        assert_eq!(
+            authorized_mode(&*acl, random_public_key()).await,
+            Some(GrantedMode::Read)
+        );
     }
 
     #[tokio::test]
-    async fn specific_authorized_key_is_granted() {
+    async fn read_only_peer_never_gets_write() {
+        // Peer is in "read" but NOT in "write": must receive Read, never Write.
+        let peer = random_public_key();
+        let peer_hex = hex::encode(peer.as_bytes());
+        let mut map = HashMap::new();
+        map.insert(
+            "write".to_string(),
+            vec![hex::encode(random_public_key().as_bytes())],
+        );
+        map.insert("read".to_string(), vec![peer_hex]);
+        let acl = Arc::new(SimpleAccessController::new(Some(map))) as Arc<dyn AccessController>;
+        assert_eq!(authorized_mode(&*acl, peer).await, Some(GrantedMode::Read));
+    }
+
+    #[tokio::test]
+    async fn write_precedence_over_read() {
+        // Peer listed in both roles must get the stronger capability.
+        let peer = random_public_key();
+        let peer_hex = hex::encode(peer.as_bytes());
+        let mut map = HashMap::new();
+        map.insert("write".to_string(), vec![peer_hex.clone()]);
+        map.insert("read".to_string(), vec![peer_hex]);
+        let acl = Arc::new(SimpleAccessController::new(Some(map))) as Arc<dyn AccessController>;
+        assert_eq!(authorized_mode(&*acl, peer).await, Some(GrantedMode::Write));
+    }
+
+    #[tokio::test]
+    async fn specific_authorized_key_gets_write() {
         let peer = random_public_key();
         let peer_hex = hex::encode(peer.as_bytes());
         let acl = acl_with("write", vec![peer_hex.as_str()]);
-        assert!(is_authorized(&*acl, peer).await);
+        assert_eq!(authorized_mode(&*acl, peer).await, Some(GrantedMode::Write));
     }
 
     #[tokio::test]
@@ -221,13 +292,13 @@ mod tests {
         // The ACL authorizes a different key, not the requester's → denied.
         let other_hex = hex::encode(random_public_key().as_bytes());
         let acl = acl_with("write", vec![other_hex.as_str()]);
-        assert!(!is_authorized(&*acl, random_public_key()).await);
+        assert_eq!(authorized_mode(&*acl, random_public_key()).await, None);
     }
 
     #[tokio::test]
     async fn empty_acl_denies() {
         let acl = acl_with("write", vec![]);
-        assert!(!is_authorized(&*acl, random_public_key()).await);
+        assert_eq!(authorized_mode(&*acl, random_public_key()).await, None);
     }
 
     // ─── TicketProtocolHandler::resolve ──────────────────────────────────────
@@ -240,12 +311,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_grants_ticket_to_authorized_peer() {
+    async fn resolve_grants_write_ticket_to_write_peer() {
         let registry = new_registry();
         registry.write().await.insert(
             "shared-kv".to_string(),
             TicketProvider {
-                ticket: "doc-ticket-xyz".to_string(),
+                read_ticket: "read-ticket-xyz".to_string(),
+                write_ticket: "write-ticket-xyz".to_string(),
                 access_controller: acl_with("write", vec!["*"]),
             },
         );
@@ -253,7 +325,34 @@ mod tests {
 
         let resp = handler.resolve("shared-kv", random_public_key()).await;
         assert_eq!(resp.first(), Some(&RESP_GRANTED));
-        assert_eq!(&resp[1..], b"doc-ticket-xyz");
+        assert_eq!(&resp[1..], b"write-ticket-xyz");
+    }
+
+    #[tokio::test]
+    async fn resolve_grants_read_ticket_to_read_only_peer() {
+        // The crux of the read-only guarantee: a read-only peer receives the read ticket,
+        // so the namespace write secret never leaves this node for that peer.
+        let peer = random_public_key();
+        let peer_hex = hex::encode(peer.as_bytes());
+        let mut map = HashMap::new();
+        map.insert("read".to_string(), vec![peer_hex]);
+        let acl = Arc::new(SimpleAccessController::new(Some(map))) as Arc<dyn AccessController>;
+
+        let registry = new_registry();
+        registry.write().await.insert(
+            "shared-kv".to_string(),
+            TicketProvider {
+                read_ticket: "read-ticket-xyz".to_string(),
+                write_ticket: "write-ticket-xyz".to_string(),
+                access_controller: acl,
+            },
+        );
+        let handler = TicketProtocolHandler::new(registry);
+
+        let resp = handler.resolve("shared-kv", peer).await;
+        assert_eq!(resp.first(), Some(&RESP_GRANTED));
+        // Must be the READ ticket — the write ticket must NOT leak to a read-only peer.
+        assert_eq!(&resp[1..], b"read-ticket-xyz");
     }
 
     #[tokio::test]
@@ -263,13 +362,14 @@ mod tests {
         registry.write().await.insert(
             "private-kv".to_string(),
             TicketProvider {
-                ticket: "secret-ticket".to_string(),
+                read_ticket: "secret-read-ticket".to_string(),
+                write_ticket: "secret-write-ticket".to_string(),
                 access_controller: acl_with("write", vec![other_hex.as_str()]),
             },
         );
         let handler = TicketProtocolHandler::new(registry);
 
-        // Requester differs from the authorized one → denied, and the ticket does NOT leak.
+        // Requester differs from the authorized one → denied, and no ticket leaks.
         let resp = handler.resolve("private-kv", random_public_key()).await;
         assert_eq!(resp, vec![RESP_DENIED]);
     }
