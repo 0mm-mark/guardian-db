@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-06-29
+
 ### Added
 - **Read-only replication with a cryptographic write guarantee** for iroh-docs-backed stores (KeyValue/Document), enabling a "one/two writers, many readers" topology where a reader cannot write — even if its software is compromised — because it never receives the namespace write secret.
   - **Per-role ticket capability:** the ticket exchange now hands out a ticket matching the requester's authenticated role — a **read ticket** (`NamespaceId` only, no write secret) to readers and a **write ticket** (namespace secret) to write-authorized peers. The `TicketProvider` holds both pre-generated tickets and authorization returns the granted mode (`GrantedMode::Read`/`Write`), with `write` taking precedence over `read`.

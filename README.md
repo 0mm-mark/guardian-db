@@ -4,7 +4,7 @@
 [![Discord](https://img.shields.io/discord/1410233136846995519?label=chat&logo=discord&logoColor=white&style=flat-square&color=7289DA)](https://discord.gg/Ezzk8PnGR5)
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-1.95.0+-orange.svg)
-![Version](https://img.shields.io/badge/version-0.17.0-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-0.17.1-brightgreen.svg)
 [![codecov](https://codecov.io/github/wmaslonek/guardian-db/branch/main/graph/badge.svg?token=AKOZE17VN8)](https://codecov.io/github/wmaslonek/guardian-db)
 
 ---
