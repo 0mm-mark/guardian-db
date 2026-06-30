@@ -513,7 +513,7 @@ fn print_progress_bar(stage: usize, total: usize, label: &str) {
     let bar_width = 20;
     let filled = (stage * bar_width).checked_div(total).unwrap_or(0);
     let empty = bar_width - filled;
-    let pct = if total > 0 { (stage * 100) / total } else { 0 };
+    let pct = (stage * 100).checked_div(total).unwrap_or(0);    
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
     // Clears the line and rewrites
     print!("\r{}\r", " ".repeat(80));
