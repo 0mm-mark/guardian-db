@@ -95,7 +95,6 @@ fn benchmark_document(index: usize, payload_bytes: usize) -> Value {
         "payload": payload(payload_bytes, index),
         "metadata": {
             "region": format!("region-{}", index % 8),
-            "active": index % 2 == 0,          // →
             "active": index.is_multiple_of(2),            
             "bucket": index % 128
         }
