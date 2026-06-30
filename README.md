@@ -287,6 +287,44 @@ The implemented guarantees are intentionally local to a collection instance. Gua
 
 See [`docs/odm.md`](docs/odm.md) for the full design notes and caveats.
 
+## PostgreSQL Compatibility (TypeORM, psql, node-postgres)
+
+GuardianDB now ships a **PostgreSQL-compatible relational layer** on top of its
+document model. Standard PostgreSQL clients — `psql`, node-postgres, **TypeORM**
+(`type: "postgres"`), DBeaver — connect over the PostgreSQL wire protocol and
+run ordinary SQL (DDL, DML, joins, aggregates, transactions, migrations), with
+no GuardianDB-specific client code.
+
+**NOTE Locking and other more advanced concepts in Postgres are to be supported**
+
+```bash
+cargo run --features pgwire --bin guardian-pgwire        # PostgreSQL gateway on 127.0.0.1:15432
+psql 'postgres://guardian:guardian@127.0.0.1:15432/app'
+```
+
+```ts
+import { DataSource } from "typeorm";
+const ds = new DataSource({
+  type: "postgres", host: "127.0.0.1", port: 15432,
+  username: "guardian", password: "guardian", database: "app",
+  synchronize: true, entities: [User, Post, Org],
+});
+await ds.initialize();   // schema sync, migrations, repositories, QueryBuilder, transactions
+```
+
+This lives inside the `guardian-db` crate as feature-gated modules:
+`relational` (types, catalog, storage trait), `sql`
+(parser/planner/executor, `information_schema`/`pg_catalog`), and `pgwire`
+(wire-protocol server). Enable the **`sql`** feature for the embedded engine —
+which maps relational storage onto a replicated GuardianDB document store,
+preserving the local-first / P2P model — or the **`pgwire`** feature (which
+implies `sql`) to also build the `guardian-pgwire` server binary.
+
+- Full guide & compatibility matrix: [`docs/postgres-compat.md`](docs/postgres-compat.md)
+- Example TypeORM app: [`examples/postgres-typeorm`](examples/postgres-typeorm)
+- Native driver: [`packages/guardiandb-postgres-typeorm`](packages/guardiandb-postgres-typeorm)
+- Conformance tests: [`tests/postgres-compat`](tests/postgres-compat)
+
 ## Store Types
 
 <details>

@@ -16,6 +16,11 @@ categories = ["database-implementations", "network-programming", "web-programmin
 [features]
 default = []
 odm = ["dep:guardian-db-derive", "uuid/v4"]
+# PostgreSQL-compatible SQL on top of GuardianDB's replicated document storage
+# (the `relational` + `sql` modules).
+sql = ["dep:sqlparser", "dep:rust_decimal", "uuid/v4"]
+# PostgreSQL wire-protocol server (the `pgwire` module + `guardian-pgwire` binary).
+pgwire = ["sql", "dep:pgwire"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -56,9 +61,13 @@ postcard = { version = "1.1.3", features = ["use-std"] }
 ratatui = "0.30.0"
 redb = "3.1.0"
 guardian-db-derive = { version = "0.16.0", path = "guardian-db-derive", optional = true }
+sqlparser = { version = "0.62", optional = true }
+rust_decimal = { version = "1.37", features = ["serde"], optional = true }
+pgwire = { version = "0.40", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+tokio-postgres = "0.7"
 criterion = "0.8.0"
 dialoguer = "0.12.0"
 console = "0.16.2"
@@ -78,3 +87,30 @@ required-features = ["odm"]
 [workspace]
 members = ["guardian-db-derive"]
 resolver = "2"
+
+[[bin]]
+name = "guardian-pgwire"
+path = "src/bin/guardian-pgwire.rs"
+required-features = ["pgwire"]
+
+[[example]]
+name = "postgres_iroh_gateway"
+path = "examples/postgres_iroh_gateway.rs"
+required-features = ["pgwire"]
+
+[[test]]
+name = "sql_conformance"
+path = "tests/sql_conformance.rs"
+required-features = ["sql"]
+[[test]]
+name = "sql_locks"
+path = "tests/sql_locks.rs"
+required-features = ["sql"]
+[[test]]
+name = "sql_replication"
+path = "tests/sql_replication.rs"
+required-features = ["sql"]
+[[test]]
+name = "pgwire_wire"
+path = "tests/pgwire_wire.rs"
+required-features = ["pgwire"]
