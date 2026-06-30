@@ -3,6 +3,7 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use guardian_db::odm::{Collection, FieldDefinition, FieldType, MemoryStorage, ModelSchema};
 use serde_json::{Value, json};
+use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::runtime::Runtime;

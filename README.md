@@ -606,6 +606,35 @@ cargo test --features odm odm
 
 # P2P/integration tests are sensitive to ordering — run single-threaded:
 cargo test --test integration_replication -- --test-threads=1
+# Benchmark features like queries, read operations, concurrency
+cargo test --features odm --test odm_benchmark_reliability
+cargo bench --features odm --bench odm_benchmark
+
+# Check the TypeScript ODM SDK
+cd sdk/typescript
+npm test
+cd ../..
+
+# To test above MongoDB's 16 MiB BSON document limit
+set GUARDIANDB_ODM_LARGE_DOC_MB 
+
+# Benchmark features with Typescript SSDK
+cd sdk/typescript
+npm run bench -- --mode=runAll --docs=10000 --batch-size=1000 --queries=2500 --updates=2500
+npm run bench -- --mode=large --large-mb=17
+
+
+# Check code quality and formatting
+cargo clippy                   # Comprehensive linting
+cargo fmt                      # Code formatting
+cargo check                    # Fast compilation check
+
+# Build documentation
+cargo doc --open               # Generate and open docs
+
+# Development tools
+cargo watch -x check           # Auto-rebuild on changes  
+cargo audit                    # Security audit
 ```
 
 ## Community & Support

@@ -324,3 +324,90 @@ mod tests {
         assert!(!changed);
     }
 }
+
+fn add_numbers(left: &Number, right: &Number, path: &str) -> Result<Number> {
+    // serde_json distinguishes integer and floating-point JSON numbers. Keep
+    // integer arithmetic integer whenever both operands are integers instead
+    // of routing every $inc through f64 (which turned 1024 + 1 into 1025.0).
+    if let (Some(left), Some(right)) = (integer_value(left), integer_value(right)) {
+        let next = left.checked_add(right).ok_or_else(|| {
+            OdmError::InvalidUpdate(format!(
+                "$inc for `{path}` overflowed the JSON integer range"
+            ))
+        })?;
+
+        if let Ok(value) = i64::try_from(next) {
+            return Ok(Number::from(value));
+        }
+        if let Ok(value) = u64::try_from(next) {
+            return Ok(Number::from(value));
+        }
+        return Err(OdmError::InvalidUpdate(format!(
+            "$inc for `{path}` overflowed the JSON integer range"
+        )));
+    }
+
+    let next = left.as_f64().unwrap_or(f64::NAN) + right.as_f64().unwrap_or(f64::NAN);
+    Number::from_f64(next).ok_or_else(|| {
+        OdmError::InvalidUpdate(format!("$inc for `{path}` produced a non-finite number"))
+    })
+}
+
+fn integer_value(number: &Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_update;
+    use crate::odm::error::OdmError;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn inc_preserves_integer_representation() {
+        let mut document = json!({ "counter": 1024 });
+        let changed = apply_update(
+            &mut document,
+            &json!({ "$inc": { "counter": 1, "created": 2 } }),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(document["counter"], json!(1025));
+        assert_eq!(document["created"], json!(2));
+        assert!(document["counter"].as_i64().is_some());
+    }
+
+    #[test]
+    fn inc_keeps_fractional_arithmetic_fractional() {
+        let mut document = json!({ "counter": 1.25 });
+        apply_update(
+            &mut document,
+            &json!({ "$inc": { "counter": 0.5 } }),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(document["counter"], json!(1.75));
+    }
+
+    #[test]
+    fn inc_reports_integer_overflow() {
+        let mut document = json!({ "counter": u64::MAX });
+        let error = apply_update(
+            &mut document,
+            &json!({ "$inc": { "counter": 1 } }),
+            &BTreeSet::new(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, OdmError::InvalidUpdate(message) if message.contains("overflowed"))
+        );
+    }
+}
