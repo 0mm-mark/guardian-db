@@ -1,15 +1,4 @@
 #[cfg(feature = "odm")]
-pub mod odm;
-
-#[cfg(feature = "sql")]
-pub mod relational;
-
-#[cfg(feature = "sql")]
-pub mod sql;
-
-#[cfg(feature = "pgwire")]
-pub mod pgwire;
-
 extern crate self as guardian_db;
 
 pub mod access_control;
@@ -25,7 +14,18 @@ pub mod message_marshaler;
 #[cfg(feature = "odm")]
 pub mod odm;
 pub mod p2p;
+/// PostgreSQL wire-protocol server fronting the [`sql`] engine. Enabled by the
+/// `pgwire` feature (which implies `sql`).
+#[cfg(feature = "pgwire")]
+pub mod pgwire;
 pub mod reactive_synchronizer;
+/// Storage-agnostic relational core (catalog, types, values, indexes) underlying
+/// the PostgreSQL compatibility layer. Enabled by the `sql` feature.
+#[cfg(feature = "sql")]
+pub mod relational;
+pub mod rotation;
+#[cfg(feature = "sql")]
+pub mod sql;
 pub mod stores;
 pub mod traits;
 
