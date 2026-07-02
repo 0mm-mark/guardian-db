@@ -110,7 +110,10 @@ jobs:
         run: cargo test --features odm --test odm_benchmark_reliability -- --test-threads=1
 
       - name: Smoke-test benchmark harnesses without Criterion timing loop
-        run: cargo test --features odm --benches -- --test-threads=1
+        # Single-threading is passed via RUST_TEST_THREADS (env) rather than the
+        # `--test-threads` CLI arg: Criterion 0.8's bench harness rejects unknown
+        # CLI args ("unexpected argument found"), but honors the libtest env var.
+        run: RUST_TEST_THREADS=1 cargo test --features odm --benches
 
       - name: Compile Rust benchmark binary
         run: cargo bench --features odm --bench odm_benchmark --no-run
