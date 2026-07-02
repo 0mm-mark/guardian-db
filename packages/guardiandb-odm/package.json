@@ -1,7 +1,7 @@
 {
-  "name": "guardiandb",
+  "name": "guardiandb-odm",
   "version": "0.16.0-odm.0",
-  "description": "TypeScript ODM client for GuardianDB",
+  "description": "TypeScript ODM for GuardianDB document collections (Iroh-backed). For the PostgreSQL compatibility layer use guardiandb-postgres-typeorm instead.",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
