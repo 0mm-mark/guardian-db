@@ -266,7 +266,10 @@ no GuardianDB-specific client code.
 
 ```bash
 cargo run --features pgwire --bin guardian-pgwire        # PostgreSQL gateway on 127.0.0.1:15432
-psql 'postgres://guardian:guardian@127.0.0.1:15432/app'
+
+# Any PostgreSQL client connects with an ordinary connection string.
+# (sslmode=disable: the loopback gateway does not negotiate TLS.)
+psql 'postgres://guardian:guardian@127.0.0.1:15432/app?sslmode=disable'
 ```
 
 ```ts
@@ -274,6 +277,8 @@ import { DataSource } from "typeorm";
 const ds = new DataSource({
   type: "postgres", host: "127.0.0.1", port: 15432,
   username: "guardian", password: "guardian", database: "app",
+  // or the single-string form:
+  // type: "postgres", url: "postgres://guardian:guardian@127.0.0.1:15432/app", ssl: false,
   synchronize: true, entities: [User, Post, Org],
 });
 await ds.initialize();   // schema sync, migrations, repositories, QueryBuilder, transactions

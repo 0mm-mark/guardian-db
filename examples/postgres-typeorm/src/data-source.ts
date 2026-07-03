@@ -11,8 +11,24 @@ import { Init1700000000000 } from "./migrations/1700000000000-Init";
  * This is exactly what you would write against a real PostgreSQL server — the
  * gateway speaks the PostgreSQL wire protocol, so `type: "postgres"` is all that
  * is required.
+ *
+ * Set DATABASE_URL to use a single connection string instead of the discrete
+ * PG* variables, e.g.:
+ *   DATABASE_URL=postgres://guardian:guardian@127.0.0.1:15432/app
  */
 export function options(overrides: Partial<DataSourceOptions> = {}): DataSourceOptions {
+  if (process.env.DATABASE_URL) {
+    return {
+      type: "postgres",
+      url: process.env.DATABASE_URL,
+      ssl: false, // the gateway is a plaintext loopback socket (no TLS)
+      entities: [Org, User, Post],
+      migrations: [Init1700000000000],
+      synchronize: false,
+      logging: ["error", "warn"],
+      ...overrides,
+    } as DataSourceOptions;
+  }
   return {
     type: "postgres",
     host: process.env.PGHOST ?? "127.0.0.1",
