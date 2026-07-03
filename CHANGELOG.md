@@ -25,12 +25,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.17.0] - 2026-06-24
 
 ### Added
-- **Secure namespace sharing for iroh-docs-backed stores (KeyValue/Document)** so they replicate across peers (previously each node created an isolated namespace).
-  - Added `DocTicket`-based capability sharing: `KeyValueStore::share_ticket()`/`DocumentStore::share_ticket()` and a new `CreateDBOptions.doc_ticket` to open a store joining a peer's shared namespace.
-  - Added **automatic ticket exchange** over the authenticated QUIC connection (new `/guardian-db/ticket/1` ALPN), gated by the store's `AccessController` (the requester is identified by its authenticated Iroh public key; `*` = public).
-  - Added **deterministic creator resolution** (lowest `EndpointId` wins) to avoid split-brain when peers open the same store concurrently.
-  - Added **reactive live index sync** so remote writes are reflected in `all()`/`get()`/`query()` without a manual reload.
-- **Expanded test coverage (+41 tests)**: ticket-exchange authorization gate, direct-channel wire format (CBOR round-trip + deterministic `TopicId`), store event types, key-synchronizer keypair persistence/trusted-peers, and ODM update operators (`$set`/`$unset`/`$inc`).
+- **PostgreSQL compatibility layer** — standard PostgreSQL clients (`psql`,
+  node-postgres, **TypeORM** with `type: "postgres"`, DBeaver) connect to
+  GuardianDB over the PostgreSQL wire protocol and run ordinary SQL with no
+  GuardianDB-specific client code.
+  - New feature-gated modules inside `guardian-db` (the engine is
+    storage-agnostic, driven through the `RelationalStorage` trait):
+    `guardian_db::relational` (PostgreSQL type system, value model, serializable
+    catalog, storage trait, BTree indexes, SQLSTATE errors) and
+    `guardian_db::sql` (sqlparser-based parser/planner/executor for DDL, DML with
+    RETURNING/ON CONFLICT, SELECT with joins/aggregates/subqueries/CTEs/set-ops,
+    expressions, local-atomic transactions, parameter binding, and
+    `information_schema`/`pg_catalog` introspection) behind the `sql` feature;
+    `guardian_db::pgwire` (wire-protocol server on `127.0.0.1:15432` with simple
+    + extended query, prepared statements and SQLSTATE errors) plus the
+    `guardian-pgwire` binary behind the `pgwire` feature.
+  - `sql` feature of `guardian-db` adds `guardian_db::sql`, a
+    `RelationalStorage` adapter over a replicated GuardianDB document store,
+    preserving the local-first / P2P model (verified on a real iroh node).
+  - A PostgreSQL-style **lock manager** for the single-node gateway: all eight
+    table-lock modes with the exact conflict matrix, row locks (`FOR UPDATE`/
+    `FOR SHARE` with `NOWAIT`/`SKIP LOCKED`), advisory locks (session/xact,
+    shared, try, two-key), `LOCK TABLE`, blocking waits with `lock_timeout`,
+    deadlock detection (`40P01`), transaction-abort semantics (`25P02`), and
+    `pg_catalog.pg_locks` monitoring.
+  - `examples/postgres-typeorm` (runnable TypeORM app with migration/seed/
+    queries/transactions), `packages/guardiandb-postgres-typeorm` (`GuardianDataSource`),
+    and `tests/postgres-compat` (node-postgres + TypeORM conformance, 16 tests).
+  - `docs/postgres-compat.md` with consistency/transaction/replication semantics
+    and a compatibility matrix; `tests/sql_conformance.rs`
+    pins documented gaps (clean-failure and `#[ignore]` tests).
+
+
 - **Optional ODM layer (`odm` feature)** for TypeORM/Mongoose-style document modeling on top of `DocumentStore`, without replacing GuardianDB's decentralized Iroh Docs/Willow storage model.
   - Added `guardian-db-derive` with `#[derive(Model)]`, `#[primary_key]`, `#[unique]`, `#[index]`, `#[model(collection = "...")]`, `#[model(timestamps)]`, flexible schemas, and schema version metadata.
   - Added typed and dynamic collection APIs with `insert_one`, batch `insert`, `find_one`, `find`, `find_by_id`, and first-match `update`.
@@ -38,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added local validation for required fields, nullability, field types, strict schemas, immutable primary keys, primary-key uniqueness, unique constraints, and secondary indexes.
   - Added `GuardianDB::init_collection`, `GuardianDB::list_collections`, and `GuardianDB::model_collection::<T>()` helpers under the ODM feature.
   - Added local transaction/consistency API scaffolding (`TransactionContext`, `ConsistencyLevel`) that explicitly rejects unsupported replicated transaction semantics until a distributed coordinator exists.
-- **TypeScript ODM SDK scaffold** in `sdk/typescript` exposing `GuardianDB.init`, `GuardianDB.listDatabases`, `initCollection`, `listCollections`, and Mongoose-style collection CRUD through a `GuardianTransport` boundary.
+- **TypeScript ODM SDK scaffold** in `packages/guardiandb-odm` exposing `GuardianDB.init`, `GuardianDB.listDatabases`, `initCollection`, `listCollections`, and Mongoose-style collection CRUD through a `GuardianTransport` boundary.
   - Includes a process-local reference transport for deterministic SDK tests and future native Node/WASM/mobile bridge development.
 - **ODM documentation and tests**, including `docs/odm.md`, Rust ODM integration tests, and TypeScript SDK tests covering the issue #17 usage flow, uniqueness rollback, update operators, collection listing, and version-conflict behavior.
 

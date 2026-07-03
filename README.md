@@ -210,10 +210,10 @@ Supported derive attributes include `#[primary_key]`, `#[unique]`, `#[index]`, `
 
 ### JavaScript/TypeScript SDK shape
 
-The TypeScript SDK in `sdk/typescript` exposes the collection API requested in the ODM RFC. The included process-local transport is for SDK development and tests; production Node/WASM/mobile bindings should implement `GuardianTransport` against the Rust/Iroh backend.
+The TypeScript ODM lives in its own package, [`guardiandb-odm`](packages/guardiandb-odm), and exposes the collection API requested in the ODM RFC. It targets regular GuardianDB (the document/collection store) — **not** the PostgreSQL compatibility layer; for SQL/TypeORM access via the `pgwire` server use [`guardiandb-postgres-typeorm`](packages/guardiandb-postgres-typeorm) instead. The included process-local transport is for SDK development and tests; production Node/WASM/mobile bindings should implement `GuardianTransport` against the Rust/Iroh backend.
 
 ```javascript
-import GuardianDB from "guardiandb";
+import GuardianDB from "guardiandb-odm";
 import Iroh from "iroh";
 
 const iroh = await Iroh.create();
@@ -253,6 +253,44 @@ ODM writes validate field types, primary keys, uniqueness, required/nullability 
 The implemented guarantees are intentionally local to a collection instance. GuardianDB remains decentralized and eventually convergent; disconnected peers can still create conflicting unique values that must be reconciled after replication. `TransactionContext` and `ConsistencyLevel` reserve the API shape for future replicated transaction coordination, while unsupported replicated transactions are rejected explicitly instead of implying global ACID semantics.
 
 See [`docs/odm.md`](docs/odm.md) for the full design notes and caveats.
+
+## PostgreSQL Compatibility (TypeORM, psql, node-postgres)
+
+GuardianDB now ships a **PostgreSQL-compatible relational layer** on top of its
+document model. Standard PostgreSQL clients — `psql`, node-postgres, **TypeORM**
+(`type: "postgres"`), DBeaver — connect over the PostgreSQL wire protocol and
+run ordinary SQL (DDL, DML, joins, aggregates, transactions, migrations), with
+no GuardianDB-specific client code.
+
+**NOTE Locking and other more advanced concepts in Postgres are to be supported**
+
+```bash
+cargo run --features pgwire --bin guardian-pgwire        # PostgreSQL gateway on 127.0.0.1:15432
+psql 'postgres://guardian:guardian@127.0.0.1:15432/app'
+```
+
+```ts
+import { DataSource } from "typeorm";
+const ds = new DataSource({
+  type: "postgres", host: "127.0.0.1", port: 15432,
+  username: "guardian", password: "guardian", database: "app",
+  synchronize: true, entities: [User, Post, Org],
+});
+await ds.initialize();   // schema sync, migrations, repositories, QueryBuilder, transactions
+```
+
+This lives inside the `guardian-db` crate as feature-gated modules:
+`relational` (types, catalog, storage trait), `sql`
+(parser/planner/executor, `information_schema`/`pg_catalog`), and `pgwire`
+(wire-protocol server). Enable the **`sql`** feature for the embedded engine —
+which maps relational storage onto a replicated GuardianDB document store,
+preserving the local-first / P2P model — or the **`pgwire`** feature (which
+implies `sql`) to also build the `guardian-pgwire` server binary.
+
+- Full guide & compatibility matrix: [`docs/postgres-compat.md`](docs/postgres-compat.md)
+- Example TypeORM app: [`examples/postgres-typeorm`](examples/postgres-typeorm)
+- Native driver: [`packages/guardiandb-postgres-typeorm`](packages/guardiandb-postgres-typeorm)
+- Conformance tests: [`tests/postgres-compat`](tests/postgres-compat)
 
 ## Store Types
 
@@ -606,6 +644,35 @@ cargo test --features odm odm
 
 # P2P/integration tests are sensitive to ordering — run single-threaded:
 cargo test --test integration_replication -- --test-threads=1
+# Benchmark features like queries, read operations, concurrency
+cargo test --features odm --test odm_benchmark_reliability
+cargo bench --features odm --bench odm_benchmark
+
+# Check the TypeScript ODM SDK
+cd packages/guardiandb-odm
+npm test
+cd ../..
+
+# To test above MongoDB's 16 MiB BSON document limit
+set GUARDIANDB_ODM_LARGE_DOC_MB 
+
+# Benchmark features with Typescript SSDK
+cd packages/guardiandb-odm
+npm run bench -- --mode=runAll --docs=10000 --batch-size=1000 --queries=2500 --updates=2500
+npm run bench -- --mode=large --large-mb=17
+
+
+# Check code quality and formatting
+cargo clippy                   # Comprehensive linting
+cargo fmt                      # Code formatting
+cargo check                    # Fast compilation check
+
+# Build documentation
+cargo doc --open               # Generate and open docs
+
+# Development tools
+cargo watch -x check           # Auto-rebuild on changes  
+cargo audit                    # Security audit
 ```
 
 ## Community & Support
