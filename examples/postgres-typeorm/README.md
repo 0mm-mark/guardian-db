@@ -106,11 +106,30 @@ The same typed-model + Zod pattern is also shown against the embedded
 
 ## Connecting to a long-running gateway
 
-In a real deployment, start the gateway separately and point TypeORM at it:
+In a real deployment, start the gateway separately and point any PostgreSQL
+client at it with an ordinary connection string:
 
 ```bash
 cargo run --features pgwire --bin guardian-pgwire            # listens on 127.0.0.1:15432
+
+# canonical connection string (sslmode=disable: the gateway has no TLS;
+# needed by libpq clients like psql — node-postgres/TypeORM work without it)
+psql 'postgres://guardian:guardian@127.0.0.1:15432/app?sslmode=disable'
 ```
+
+With TypeORM, either the single-string form:
+
+```ts
+const ds = new DataSource({
+  type: "postgres",
+  url: "postgres://guardian:guardian@127.0.0.1:15432/app",
+  ssl: false,
+  synchronize: true,
+  entities: [User, Post, Org],
+});
+```
+
+or discrete options:
 
 ```ts
 const ds = new DataSource({
@@ -125,10 +144,20 @@ const ds = new DataSource({
 });
 ```
 
-The TypeORM migration CLI works too:
+This example's [`data-source.ts`](./src/data-source.ts) honors `DATABASE_URL`,
+so the migration CLI and demos accept a connection string directly:
 
 ```bash
+DATABASE_URL=postgres://guardian:guardian@127.0.0.1:15432/app npm run migration:run
+# or with discrete PG* variables:
 PGPORT=15432 npm run migration:run
+```
+
+For a runnable end-to-end demo of both connection-string forms, see
+[`src/connection-string.ts`](./src/connection-string.ts):
+
+```bash
+npm run connection-string
 ```
 
 ## Native GuardianDB driver (optional)
