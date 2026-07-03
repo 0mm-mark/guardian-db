@@ -91,16 +91,46 @@ gateway **exactly** as to the in-memory one — same wire protocol, same SQL, no
 GuardianDB-specific code. The full runnable source is
 [`examples/postgres_iroh_gateway.rs`](../examples/postgres_iroh_gateway.rs).
 
-## 2. Connecting with `psql`
+## 2. Connection strings
+
+Every standard client connects with an ordinary PostgreSQL connection string
+(URI). With the default gateway flags the canonical string is:
+
+```
+postgres://guardian:guardian@127.0.0.1:15432/app?sslmode=disable
+```
+
+- **user/password** — `guardian`/`guardian` by default (`--username` to change;
+  the gateway accepts the password without enforcing it).
+- **database** — `app` by default (`--database`).
+- **`sslmode=disable`** — the gateway is a plaintext loopback TCP socket and
+  does not negotiate TLS. libpq-based clients (`psql`, DBeaver, Python's
+  `psycopg`) may try SSL first, so pass `sslmode=disable` explicitly;
+  node-postgres and TypeORM default to no-SSL and work without it.
+
+### `psql`
 
 ```bash
-psql 'postgres://guardian:guardian@127.0.0.1:15432/app'
+psql 'postgres://guardian:guardian@127.0.0.1:15432/app?sslmode=disable'
 ```
 
 ```sql
 CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, data JSONB);
 INSERT INTO users (email, data) VALUES ('a@x.com', '{"plan":"pro"}') RETURNING id;
 SELECT count(*) FROM users;
+```
+
+### node-postgres (`pg`)
+
+```ts
+import pg from "pg";
+
+const client = new pg.Client({
+  connectionString: "postgres://guardian:guardian@127.0.0.1:15432/app?sslmode=disable",
+});
+await client.connect();
+const { rows } = await client.query("SELECT count(*) FROM users");
+await client.end();
 ```
 
 ## 3. Connecting with TypeORM (`type: "postgres"`)
@@ -121,6 +151,18 @@ const ds = new DataSource({
   entities: [User, Post, Org],
 });
 await ds.initialize();
+```
+
+Or equivalently with a single connection string via `url`:
+
+```ts
+const ds = new DataSource({
+  type: "postgres",
+  url: process.env.DATABASE_URL ?? "postgres://guardian:guardian@127.0.0.1:15432/app",
+  ssl: false,
+  synchronize: true,
+  entities: [User, Post, Org],
+});
 ```
 
 `synchronize`, schema **re-introspection**, migrations (`QueryRunner`),
