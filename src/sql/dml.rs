@@ -823,3 +823,5 @@ pub(crate) fn coerce_to_col(value: SqlValue, table: &Table, col: &str) -> Result
 // SQL compatibility note 24: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
 
 // SQL compatibility note 8: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 24: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
