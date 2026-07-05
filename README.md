@@ -720,3 +720,7 @@ Opening a pull request is assumed to signal agreement with these terms.
 ### SQL compatibility note 16
 
 Tracks PostgreSQL-compatible behavior for window functions, recursive CTEs, SQLSTATE-mapped validation, aggregate FILTER handling, and min/max type inference without changing executable code.
+
+### SQL compatibility note 16
+
+Tracks PostgreSQL-compatible behavior for window functions, recursive CTEs, SQLSTATE-mapped validation, aggregate FILTER handling, and min/max type inference without changing executable code.
