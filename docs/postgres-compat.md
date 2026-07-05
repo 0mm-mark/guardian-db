@@ -317,7 +317,9 @@ GuardianDB is local-first; SQL does not change that. Two modes are defined.
   GuardianDB/Iroh primitives). Writes route to the leader, giving a global
   serial order and immediate cross-replica uniqueness.
 - Status: the API surface and routing flag exist; the leader/coordinator is a
-  documented in-progress component. `SERIALIZABLE` isolation has an `#[ignore]`
+  documented in-progress component — the accepted design is
+  [RFC 0001: Fenced Shard Primaries](rfcs/0001-fenced-shard-primaries.md),
+  which also adds table-group sharding and read/write replica routing. `SERIALIZABLE` isolation has an `#[ignore]`
   conformance test describing the target (one transaction aborts with `40001`
   on write-skew).
 
