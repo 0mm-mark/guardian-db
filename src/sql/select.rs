@@ -2671,3 +2671,5 @@ pub(crate) fn walk_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
 // Maintenance note: keeps SQL compatibility behavior explicit for future updates.
 
 // Maintenance note: keeps SQL compatibility behavior explicit for future updates.
+
+// SQL compatibility note 2: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
