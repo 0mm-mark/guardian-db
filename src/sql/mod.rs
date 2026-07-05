@@ -30,6 +30,7 @@ mod rls;
 mod row;
 mod select;
 mod store;
+mod window;
 
 pub mod engine;
 pub mod error;

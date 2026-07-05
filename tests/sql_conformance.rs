@@ -47,57 +47,601 @@ async fn scalar_i64(s: &mut Session<MemoryStorage>, sql: &str) -> i64 {
     }
 }
 
+/// All result rows rendered as text (NULL → "NULL").
+async fn rows_text(s: &mut Session<MemoryStorage>, sql: &str) -> Vec<Vec<String>> {
+    let r = ok(s, sql).await;
+    match r.into_iter().next() {
+        Some(ExecResult::Rows { rows, .. }) => rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|v| v.to_text().unwrap_or_else(|| "NULL".into()))
+                    .collect()
+            })
+            .collect(),
+        _ => panic!("expected rows from `{sql}`"),
+    }
+}
+
+/// Execute SQL and return (SQLSTATE, message) of the resulting error.
+async fn err_info(s: &mut Session<MemoryStorage>, sql: &str) -> (String, String) {
+    match s.execute(sql).await {
+        Ok(_) => panic!("expected `{sql}` to fail, but it succeeded"),
+        Err(e) => (e.sqlstate().to_string(), e.to_string()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Clean-failure gaps (these tests PASS — the feature fails with a clear code).
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn window_functions_unsupported() {
+// ---------------------------------------------------------------------------
+// Window functions (OVER)
+// ---------------------------------------------------------------------------
+
+async fn window_session() -> Session<MemoryStorage> {
     let mut s = session().await;
-    ok(&mut s, "CREATE TABLE t (id INT)").await;
-    ok(&mut s, "INSERT INTO t VALUES (1), (2)").await;
-    // 0A000 = feature_not_supported — for OVER *anywhere* in the query, not
-    // just the top-level projection. In particular, OVER in HAVING used to be
-    // silently evaluated as a plain aggregate.
-    for sql in [
-        "SELECT row_number() OVER (ORDER BY id) FROM t",
-        "SELECT * FROM (SELECT row_number() OVER (ORDER BY id) AS rn FROM t) q",
-        "SELECT id FROM t GROUP BY id HAVING count(*) OVER () > 0",
-        "SELECT id FROM t WHERE row_number() OVER () = 1",
-        "SELECT id FROM t GROUP BY row_number() OVER ()",
-        "SELECT id FROM t ORDER BY row_number() OVER ()",
-        "SELECT sum(id) OVER w FROM t WINDOW w AS (ORDER BY id)",
-    ] {
-        assert_eq!(err_code(&mut s, sql).await, "0A000", "for `{sql}`");
-    }
+    ok(&mut s, "CREATE TABLE t (v INT)").await;
+    ok(&mut s, "INSERT INTO t VALUES (10), (20), (20), (30)").await;
+    ok(&mut s, "CREATE TABLE emp (dept TEXT, sal INT)").await;
+    ok(
+        &mut s,
+        "INSERT INTO emp VALUES ('a', 100), ('a', 200), ('b', 300)",
+    )
+    .await;
+    s
 }
 
 #[tokio::test]
-async fn with_recursive_unsupported() {
-    let mut s = session().await;
-    // Self-referencing: must fail 0A000 up front — not with the internal
-    // 42P01 on the self-reference (which sidecar routing could forward).
+async fn window_ranking_with_ties() {
+    let mut s = window_session().await;
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, row_number() OVER (ORDER BY v), rank() OVER (ORDER BY v), \
+         dense_rank() OVER (ORDER BY v) FROM t ORDER BY v, 2",
+    )
+    .await;
     assert_eq!(
-        err_code(
+        rows,
+        vec![
+            vec!["10", "1", "1", "1"],
+            vec!["20", "2", "2", "2"],
+            vec!["20", "3", "2", "2"],
+            vec!["30", "4", "4", "3"],
+        ]
+    );
+    // percent_rank/cume_dist over two distinct rows: clean fractions.
+    let rows = rows_text(
+        &mut s,
+        "SELECT sal, percent_rank() OVER (ORDER BY sal), cume_dist() OVER (ORDER BY sal) \
+         FROM emp WHERE dept = 'a' ORDER BY sal",
+    )
+    .await;
+    assert_eq!(rows, vec![vec!["100", "0", "0.5"], vec!["200", "1", "1"]]);
+}
+
+#[tokio::test]
+async fn window_partition_boundaries() {
+    let mut s = window_session().await;
+    let rows = rows_text(
+        &mut s,
+        "SELECT dept, sal, row_number() OVER (PARTITION BY dept ORDER BY sal), \
+         sum(sal) OVER (PARTITION BY dept) FROM emp ORDER BY dept, sal",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["a", "100", "1", "300"],
+            vec!["a", "200", "2", "300"],
+            vec!["b", "300", "1", "300"],
+        ]
+    );
+    // Window calls also work inside a derived subquery.
+    assert_eq!(
+        scalar_i64(
             &mut s,
-            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) \
+            "SELECT count(*) FROM (SELECT row_number() OVER (ORDER BY v) AS rn FROM t) q \
+             WHERE rn <= 2",
+        )
+        .await,
+        2
+    );
+}
+
+#[tokio::test]
+async fn window_lag_lead_offset_default() {
+    let mut s = window_session().await;
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, lag(v) OVER (ORDER BY v, v), lead(v) OVER (ORDER BY v, v), \
+         lag(v, 2, -1) OVER (ORDER BY v, v), lead(v, 2) OVER (ORDER BY v, v) \
+         FROM t ORDER BY v",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["10", "NULL", "20", "-1", "20"],
+            vec!["20", "10", "20", "-1", "30"],
+            vec!["20", "20", "30", "10", "NULL"],
+            vec!["30", "20", "NULL", "20", "NULL"],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn window_running_sum_default_frame_includes_peers() {
+    let mut s = window_session().await;
+    // Default frame = RANGE UNBOUNDED PRECEDING..CURRENT ROW: peers of the
+    // current row are included, so the running sum jumps by peer groups
+    // (10,20,20,30 → 10,50,50,80) — the classic PostgreSQL behaviour.
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, sum(v) OVER (ORDER BY v) FROM t ORDER BY v",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["10", "10"],
+            vec!["20", "50"],
+            vec!["20", "50"],
+            vec!["30", "80"],
+        ]
+    );
+    // ROWS mode does not include peers: a true row-by-row running sum.
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, sum(v) OVER (ORDER BY v ROWS UNBOUNDED PRECEDING) FROM t ORDER BY v, 2",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["10", "10"],
+            vec!["20", "30"],
+            vec!["20", "50"],
+            vec!["30", "80"],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn window_rows_between_moving_frame() {
+    let mut s = window_session().await;
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, sum(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+         FROM t ORDER BY v, 2",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["10", "30"],
+            vec!["20", "50"],
+            vec!["20", "70"],
+            vec!["30", "50"],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn window_last_value_frame_gotcha() {
+    let mut s = window_session().await;
+    // Default frame ends at the current row's peer group, so last_value
+    // returns the current peer value — not the partition max (PG gotcha).
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, first_value(v) OVER (ORDER BY v), last_value(v) OVER (ORDER BY v) \
+         FROM t ORDER BY v",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["10", "10", "10"],
+            vec!["20", "10", "20"],
+            vec!["20", "10", "20"],
+            vec!["30", "10", "30"],
+        ]
+    );
+    // The explicit whole-partition frame gives the partition max.
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, last_value(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND \
+         UNBOUNDED FOLLOWING) FROM t ORDER BY v",
+    )
+    .await;
+    assert!(rows.iter().all(|r| r[1] == "30"), "{rows:?}");
+    // nth_value honours the frame too (NULL before the frame reaches row n).
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, nth_value(v, 2) OVER (ORDER BY v) FROM t ORDER BY v",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["10", "NULL"],
+            vec!["20", "20"],
+            vec!["20", "20"],
+            vec!["30", "20"],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn window_ntile_uneven() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE n5 (v INT)").await;
+    ok(&mut s, "INSERT INTO n5 VALUES (1), (2), (3), (4), (5)").await;
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, ntile(2) OVER (ORDER BY v), ntile(3) OVER (ORDER BY v) FROM n5 ORDER BY v",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "1", "1"],
+            vec!["2", "1", "1"],
+            vec!["3", "1", "2"],
+            vec!["4", "2", "2"],
+            vec!["5", "2", "3"],
+        ]
+    );
+    assert_eq!(
+        err_code(&mut s, "SELECT ntile(0) OVER (ORDER BY v) FROM n5").await,
+        "22023"
+    );
+}
+
+#[tokio::test]
+async fn window_in_order_by() {
+    let mut s = window_session().await;
+    let rows = rows_text(
+        &mut s,
+        "SELECT v FROM t ORDER BY row_number() OVER (ORDER BY v DESC)",
+    )
+    .await;
+    assert_eq!(rows, vec![vec!["30"], vec!["20"], vec!["20"], vec!["10"]]);
+}
+
+#[tokio::test]
+async fn window_multiple_windows() {
+    let mut s = window_session().await;
+    let rows = rows_text(
+        &mut s,
+        "SELECT dept, sal, row_number() OVER (PARTITION BY dept ORDER BY sal), \
+         rank() OVER (ORDER BY sal DESC), count(*) OVER () FROM emp ORDER BY dept, sal",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["a", "100", "1", "3", "3"],
+            vec!["a", "200", "2", "2", "3"],
+            vec!["b", "300", "1", "1", "3"],
+        ]
+    );
+}
+
+#[tokio::test]
+async fn window_named_window_clause() {
+    let mut s = window_session().await;
+    // OVER w + refinement OVER (w ORDER BY ...) inheriting the partition.
+    let rows = rows_text(
+        &mut s,
+        "SELECT dept, sal, sum(sal) OVER w, row_number() OVER (w ORDER BY sal) \
+         FROM emp WINDOW w AS (PARTITION BY dept) ORDER BY dept, sal",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["a", "100", "300", "1"],
+            vec!["a", "200", "300", "2"],
+            vec!["b", "300", "300", "1"],
+        ]
+    );
+    // Refinement may not override an existing ORDER BY.
+    let (code, msg) = err_info(
+        &mut s,
+        "SELECT row_number() OVER (w ORDER BY sal) FROM emp WINDOW w AS (ORDER BY dept)",
+    )
+    .await;
+    assert_eq!(code, "42P20");
+    assert!(msg.contains("cannot override ORDER BY"), "{msg}");
+    // Unknown named window.
+    assert_eq!(
+        err_code(&mut s, "SELECT row_number() OVER wnope FROM emp").await,
+        "42704"
+    );
+}
+
+#[tokio::test]
+async fn window_null_ordering_and_empty_input() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE tn (v INT)").await;
+    ok(&mut s, "INSERT INTO tn VALUES (1), (NULL), (2)").await;
+    // ASC → NULLS LAST (PostgreSQL default); count(v) skips the NULL.
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, row_number() OVER (ORDER BY v), count(v) OVER (ORDER BY v) \
+         FROM tn ORDER BY 2",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "1", "1"],
+            vec!["2", "2", "2"],
+            vec!["NULL", "3", "2"],
+        ]
+    );
+    // DESC → NULLS FIRST.
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, row_number() OVER (ORDER BY v DESC) FROM tn ORDER BY 2",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![vec!["NULL", "1"], vec!["2", "2"], vec!["1", "3"]]
+    );
+    // Zero input rows → zero output rows, no error.
+    let rows = rows_text(
+        &mut s,
+        "SELECT row_number() OVER (ORDER BY v) FROM tn WHERE v > 100",
+    )
+    .await;
+    assert!(rows.is_empty());
+}
+
+#[tokio::test]
+async fn window_aggregates_and_filter() {
+    let mut s = window_session().await;
+    let rows = rows_text(
+        &mut s,
+        "SELECT v, min(v) OVER (), max(v) OVER (), avg(v) OVER (), \
+         count(*) FILTER (WHERE v > 10) OVER () FROM t ORDER BY v LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows, vec![vec!["10", "10", "30", "20", "3"]]);
+    // string_agg as a window aggregate over the whole partition.
+    let rows = rows_text(
+        &mut s,
+        "SELECT string_agg(dept, ',') OVER (ORDER BY dept ROWS BETWEEN UNBOUNDED PRECEDING \
+         AND UNBOUNDED FOLLOWING) FROM emp LIMIT 1",
+    )
+    .await;
+    assert_eq!(rows, vec![vec!["a,a,b"]]);
+}
+
+#[tokio::test]
+async fn window_over_grouped_query() {
+    let mut s = window_session().await;
+    // Windows evaluate after GROUP BY/HAVING: sum of the per-group counts.
+    let rows = rows_text(
+        &mut s,
+        "SELECT dept, count(*), sum(count(*)) OVER (ORDER BY dept) FROM emp \
+         GROUP BY dept ORDER BY dept",
+    )
+    .await;
+    assert_eq!(rows, vec![vec!["a", "2", "2"], vec!["b", "1", "3"]]);
+}
+
+#[tokio::test]
+async fn window_out_of_subset_constructs_fail_typed() {
+    let mut s = window_session().await;
+    // 42P20: misplaced window functions.
+    for sql in [
+        "SELECT v FROM t WHERE row_number() OVER () = 1",
+        "SELECT v FROM t GROUP BY row_number() OVER ()",
+        "SELECT v FROM t GROUP BY v HAVING count(*) OVER () > 0",
+        // Nested window calls.
+        "SELECT sum(row_number() OVER ()) OVER () FROM t",
+        // Invalid frames.
+        "SELECT sum(v) OVER (ORDER BY v ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM t",
+        "SELECT sum(v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM t",
+    ] {
+        assert_eq!(err_code(&mut s, sql).await, "42P20", "for `{sql}`");
+    }
+    // 0A000 with a message naming the construct.
+    let (code, msg) = err_info(
+        &mut s,
+        "SELECT sum(v) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+    )
+    .await;
+    assert_eq!(code, "0A000");
+    assert!(msg.contains("RANGE with offset"), "{msg}");
+    let (code, msg) = err_info(
+        &mut s,
+        "SELECT sum(v) OVER (ORDER BY v GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+    )
+    .await;
+    assert_eq!(code, "0A000");
+    assert!(msg.contains("GROUPS"), "{msg}");
+    let (code, msg) = err_info(&mut s, "SELECT count(DISTINCT v) OVER () FROM t").await;
+    assert_eq!(code, "0A000");
+    assert!(msg.contains("DISTINCT"), "{msg}");
+    // 42809: OVER on a function that is not a window function or aggregate.
+    assert_eq!(
+        err_code(&mut s, "SELECT abs(v) OVER () FROM t").await,
+        "42809"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WITH RECURSIVE
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recursive_sequence_generation() {
+    let mut s = session().await;
+    assert_eq!(
+        scalar_i64(
+            &mut s,
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 10) \
              SELECT sum(n) FROM c",
         )
         .await,
-        "0A000"
+        55
     );
-    // Non-self-referencing: CTEs materialize non-recursively, so this used to
-    // silently succeed with base-case rows only — forbidden degraded
-    // semantics. The RECURSIVE keyword itself is the rejection trigger.
+    // WITH RECURSIVE without an actual self-reference is plain WITH.
+    assert_eq!(
+        scalar_i64(
+            &mut s,
+            "WITH RECURSIVE c AS (SELECT 1 AS n) SELECT n FROM c"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn recursive_transitive_closure_with_cycle() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE edges (src INT, dst INT)").await;
+    ok(&mut s, "INSERT INTO edges VALUES (1, 2), (2, 3), (3, 1)").await;
+    // The graph is a cycle; UNION dedup against the accumulation terminates.
+    assert_eq!(
+        scalar_i64(
+            &mut s,
+            "WITH RECURSIVE reach(node) AS (SELECT 2 UNION \
+             SELECT e.dst FROM edges e JOIN reach r ON e.src = r.node) \
+             SELECT count(*) FROM reach",
+        )
+        .await,
+        3
+    );
+}
+
+#[tokio::test]
+async fn recursive_union_all_with_limit() {
+    let mut s = session().await;
+    let rows = rows_text(
+        &mut s,
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 100) \
+         SELECT n FROM c ORDER BY n LIMIT 5",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![vec!["1"], vec!["2"], vec!["3"], vec!["4"], vec!["5"]]
+    );
+}
+
+#[tokio::test]
+async fn recursive_working_table_semantics() {
+    let mut s = session().await;
+    // Fibonacci: each iteration must see ONLY the previous iteration's row.
+    // If the recursive term were fed the full accumulation, every earlier row
+    // would spawn again each round and the row count would explode.
+    let rows = rows_text(
+        &mut s,
+        "WITH RECURSIVE fib(a, b) AS (SELECT 0, 1 UNION ALL SELECT b, a + b FROM fib \
+         WHERE b < 100) SELECT count(*), max(b) FROM fib",
+    )
+    .await;
+    assert_eq!(rows, vec![vec!["12", "144"]]);
+}
+
+#[tokio::test]
+async fn recursive_infinite_recursion_guard_errors() {
+    let mut s = session().await;
+    // Lower the session iteration cap so the guard fires fast; the query has
+    // no termination condition and must error (54001), not hang.
+    ok(
+        &mut s,
+        "SELECT set_config('guardian.recursive_max_iterations', '50', false)",
+    )
+    .await;
+    let (code, msg) = err_info(
+        &mut s,
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) \
+         SELECT count(*) FROM c",
+    )
+    .await;
+    assert_eq!(code, "54001");
+    assert!(msg.contains("50 iterations"), "{msg}");
+}
+
+#[tokio::test]
+async fn recursive_with_extra_plain_cte() {
+    let mut s = session().await;
+    assert_eq!(
+        scalar_i64(
+            &mut s,
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5), \
+             doubled AS (SELECT n * 2 AS m FROM seq) SELECT sum(m) FROM doubled",
+        )
+        .await,
+        30
+    );
+}
+
+#[tokio::test]
+async fn recursive_column_types_fixed_by_base_term() {
+    let mut s = session().await;
+    // Recursive-term rows coerce to the base term's types; an uncoercible
+    // value is a typed error, never a silently mistyped row.
     assert_eq!(
         err_code(
             &mut s,
-            "WITH RECURSIVE c AS (SELECT 1 AS n) SELECT * FROM c"
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT 'x' FROM c WHERE n = 1) \
+             SELECT * FROM c",
         )
         .await,
-        "0A000"
+        "22P02"
     );
-    // Inside a subquery.
+}
+
+#[tokio::test]
+async fn recursive_invalid_forms_fail_typed() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE edges (src INT, dst INT)").await;
+    // 42P19: invalid recursion shapes.
+    for sql in [
+        // Self-reference more than once.
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT c1.n FROM c c1, c c2) \
+         SELECT * FROM c",
+        // Self-reference inside a subquery.
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c \
+         WHERE n < (SELECT max(n) FROM c)) SELECT * FROM c",
+        // Self-reference in the non-recursive term.
+        "WITH RECURSIVE c(n) AS (SELECT n FROM c UNION ALL SELECT 1) SELECT * FROM c",
+        // Aggregate over the recursive reference.
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT max(n) + 1 FROM c WHERE n < 5) \
+         SELECT * FROM c",
+        // Self-reference on the nullable side of an outer join.
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL \
+         SELECT c.n + 1 FROM edges e LEFT JOIN c ON e.src = c.n) SELECT * FROM c",
+        // Self-reference without the UNION shape.
+        "WITH RECURSIVE c(n) AS (SELECT n FROM c) SELECT * FROM c",
+    ] {
+        assert_eq!(err_code(&mut s, sql).await, "42P19", "for `{sql}`");
+    }
+    // 0A000: recognized-but-unsupported recursive constructs.
+    let (code, msg) = err_info(
+        &mut s,
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3 \
+         ORDER BY n) SELECT * FROM c",
+    )
+    .await;
+    assert_eq!(code, "0A000");
+    assert!(msg.contains("ORDER BY in a recursive query"), "{msg}");
+    let (code, msg) = err_info(
+        &mut s,
+        "WITH RECURSIVE a(n) AS (SELECT m FROM b UNION ALL SELECT n FROM a WHERE n < 2), \
+         b(m) AS (SELECT 1) SELECT * FROM a",
+    )
+    .await;
+    assert_eq!(code, "0A000");
+    assert!(msg.contains("mutual recursion"), "{msg}");
+    // WITH (recursive or not) inside a subquery is still rejected.
     assert_eq!(
         err_code(
             &mut s,
