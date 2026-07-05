@@ -6,10 +6,12 @@
 //! node with no GuardianDB-specific code. Enabled by the `supabase` feature
 //! (which implies `sql`). Default builds are entirely unaffected.
 //!
-//! This module is a *foundation* slice: **REST** (PostgREST-compatible) and
-//! **Auth** (GoTrue-compatible) are implemented end-to-end; the other Kong
-//! services (realtime, storage, functions, graphql, pg-meta) return typed
-//! `501 Not Implemented` errors — never a bare 404 and never fake success.
+//! Implemented end-to-end: **REST** (PostgREST-compatible), **Auth**
+//! (GoTrue-compatible), **Storage** (storage-api-compatible, bytes in a
+//! replicated `bytea` table), **postgres-meta** (what Supabase Studio talks
+//! to) and **Realtime** (Phoenix-protocol websocket). The remaining Kong
+//! services (functions, graphql) return typed `501 Not Implemented` errors —
+//! never a bare 404 and never fake success.
 //!
 //! ## Scouted seams (Stage 0)
 //!
@@ -61,9 +63,12 @@
 //!     │                                resolve effective Postgres role,
 //!     │                                attach AuthContext extension)
 //!     │
-//!     ├─ /rest/v1/*   → rest.rs   → Session(role) → SQL → PostgREST JSON
-//!     ├─ /auth/v1/*   → auth.rs   → Session(service_role) → auth.* tables
-//!     └─ /storage|/realtime|/functions|/graphql|/pg-meta → 501 typed
+//!     ├─ /rest/v1/*    → rest.rs     → Session(role) → SQL → PostgREST JSON
+//!     ├─ /auth/v1/*    → auth.rs     → Session(service_role) → auth.* tables
+//!     ├─ /storage/v1/* → storage.rs  → Session(role) → storage.* tables (RLS)
+//!     ├─ /pg-meta/*    → pg_meta.rs  → catalog + pg_catalog views (service_role)
+//!     ├─ /realtime/v1/websocket → realtime.rs → Phoenix ws + change hook
+//!     └─ /functions|/graphql → 501 typed
 //! ```
 //!
 //! Each request opens a fresh [`Session`] bound to the resolved role. A single
@@ -74,8 +79,11 @@ pub mod auth;
 pub mod error;
 pub mod gateway;
 pub mod jwt;
+pub mod pg_meta;
 pub mod project;
+pub mod realtime;
 pub mod rest;
+pub mod storage;
 
 pub use error::SupaError;
 pub use gateway::{AppState, build_router};

@@ -39,11 +39,12 @@ pub mod parser;
 /// a GuardianDB [`DocumentStore`](crate::traits::DocumentStore).
 mod guardian_storage;
 
-pub use engine::{Database, Prepared, Session};
+pub use engine::{ChangeEvent, ChangeOp, Database, Prepared, Session};
 pub use error::{Result as SqlResult, SqlError};
 pub use guardian_storage::{Consistency, GuardianRelationalStorage, open_sql, open_sql_with};
 pub use parser::parse_sql;
 pub use result::{ExecResult, OutField};
+pub use rls::role_bypasses_rls;
 
 // Re-exports from the relational core for convenience.
 pub use crate::relational::{
