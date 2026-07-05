@@ -1051,3 +1051,5 @@ fn eval_extract(field: &DateTimeField, v: &SqlValue) -> Result<SqlValue> {
 // Maintenance note 5: documents compatibility expectations without changing runtime behavior.
 
 // Maintenance note 17: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
