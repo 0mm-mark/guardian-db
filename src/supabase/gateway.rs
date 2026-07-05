@@ -1,0 +1,275 @@
+//! The axum gateway: routing, middleware, and the shared execution helpers.
+//!
+//! [`build_router`] assembles the Kong-shaped routing table over an
+//! [`AppState`]. Two middleware layers run: [`request_id`] ensures every
+//! request/response carries an `x-request-id`, and [`require_apikey`] verifies
+//! the `apikey` (and optional `Authorization: Bearer`) against the project keys,
+//! resolves the effective Postgres role, and attaches an [`AuthContext`]. REST
+//! and Auth handlers then open a per-request [`Session`] bound to that role.
+
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::HeaderMap;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::routing::any;
+use chrono::Utc;
+
+use crate::relational::Catalog;
+use crate::sql::engine::{Database, Session};
+use crate::sql::{ExecResult, RelationalStorage, SqlError, SqlValue};
+use crate::supabase::error::SupaError;
+use crate::supabase::jwt::Claims;
+use crate::supabase::project::{ServiceConfig, SupabaseCompatProject};
+
+/// Shared, cheaply-cloneable gateway state (all `Arc`s).
+pub struct AppState<S: RelationalStorage> {
+    /// The relational database backing every request.
+    pub db: Arc<Database<S>>,
+    /// The single project this gateway serves.
+    pub project: Arc<SupabaseCompatProject>,
+    /// GoTrue-shaped service configuration.
+    pub config: Arc<ServiceConfig>,
+    /// One-shot guard so the `auth` schema is bootstrapped on first use.
+    pub schema_ready: Arc<tokio::sync::OnceCell<()>>,
+}
+
+impl<S: RelationalStorage> Clone for AppState<S> {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            project: self.project.clone(),
+            config: self.config.clone(),
+            schema_ready: self.schema_ready.clone(),
+        }
+    }
+}
+
+impl<S: RelationalStorage> AppState<S> {
+    pub fn new(
+        db: Arc<Database<S>>,
+        project: SupabaseCompatProject,
+        config: ServiceConfig,
+    ) -> Self {
+        Self {
+            db,
+            project: Arc::new(project),
+            config: Arc::new(config),
+            schema_ready: Arc::new(tokio::sync::OnceCell::new()),
+        }
+    }
+}
+
+/// The resolved authentication context for a request, attached as an extension
+/// by [`require_apikey`]. This is the seam an RLS-enforcement slice hooks into.
+#[derive(Clone, Debug)]
+pub struct AuthContext {
+    /// The effective Postgres role the request runs as
+    /// (`anon` / `authenticated` / `service_role`).
+    pub role: String,
+    /// The role carried by the `apikey` header.
+    pub api_key_role: String,
+    /// Verified claims from `Authorization: Bearer`, if one was supplied.
+    pub claims: Option<Claims>,
+    /// The request's `x-request-id`.
+    pub request_id: String,
+}
+
+impl AuthContext {
+    pub fn is_service_role(&self) -> bool {
+        self.role == "service_role"
+    }
+
+    /// The authenticated end-user id (the bearer token's `sub`), if any.
+    pub fn user_id(&self) -> Option<&str> {
+        self.claims
+            .as_ref()
+            .and_then(|c| c.sub.as_deref())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// A request/response correlation id extension.
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
+// ---------------------------------------------------------------------------
+// Router assembly
+// ---------------------------------------------------------------------------
+
+/// Build the full Kong-shaped router over `state`.
+pub fn build_router<S: RelationalStorage + 'static>(state: AppState<S>) -> Router {
+    let protected = Router::new()
+        .nest("/rest/v1", crate::supabase::rest::router::<S>())
+        .nest("/auth/v1", crate::supabase::auth::router::<S>())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_apikey::<S>,
+        ));
+
+    Router::new()
+        .merge(protected)
+        .merge(stub_router::<S>())
+        .route("/health", any(health))
+        .layer(axum::middleware::from_fn(request_id))
+        .with_state(state)
+}
+
+/// The not-yet-implemented Kong services. Each returns a typed `501` (never a
+/// bare 404 and never fake success). These sit outside the apikey layer so the
+/// answer is a clear "not implemented" regardless of credentials.
+fn stub_router<S: RelationalStorage + 'static>() -> Router<AppState<S>> {
+    Router::new()
+        .route("/realtime/v1/{*rest}", any(|| not_impl("REALTIME")))
+        .route("/storage/v1/{*rest}", any(|| not_impl("STORAGE")))
+        .route("/functions/v1/{*rest}", any(|| not_impl("FUNCTIONS")))
+        .route("/graphql/v1", any(|| not_impl("GRAPHQL")))
+        .route("/graphql/v1/{*rest}", any(|| not_impl("GRAPHQL")))
+        .route("/pg-meta/{*rest}", any(|| not_impl("PG_META")))
+        .route("/platform/pg-meta/{*rest}", any(|| not_impl("PG_META")))
+}
+
+async fn not_impl(service: &'static str) -> Response {
+    SupaError::NotImplemented(service).into_response()
+}
+
+async fn health() -> Response {
+    axum::Json(serde_json::json!({"status": "ok", "service": "guardian-supabase"})).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
+
+/// Ensure an `x-request-id` exists on the request (generating one if absent) and
+/// echo it on the response.
+pub async fn request_id(mut req: Request, next: Next) -> Response {
+    let rid = header_str(req.headers(), "x-request-id")
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    req.extensions_mut().insert(RequestId(rid.clone()));
+    let mut resp = next.run(req).await;
+    if let Ok(value) = rid.parse() {
+        resp.headers_mut().insert("x-request-id", value);
+    }
+    resp
+}
+
+/// Verify the `apikey` (and optional bearer) against the project keys, resolve
+/// the effective role, and attach an [`AuthContext`].
+pub async fn require_apikey<S: RelationalStorage + 'static>(
+    State(state): State<AppState<S>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let now = Utc::now().timestamp();
+    let headers = req.headers();
+
+    // The apikey header is required; Supabase clients also accept the apikey in
+    // Authorization, so fall back to a bearer token when the header is absent.
+    let apikey = header_str(headers, "apikey")
+        .map(str::to_string)
+        .or_else(|| bearer_token(headers).map(str::to_string));
+    let Some(apikey) = apikey else {
+        return SupaError::MissingApiKey.into_response();
+    };
+    let api_claims = match state.project.keys.verify_api_key(&apikey, now) {
+        Ok(c) => c,
+        Err(_) => return SupaError::InvalidApiKey.into_response(),
+    };
+    let api_key_role = api_claims.pg_role().to_string();
+
+    // A distinct Authorization bearer identifies the caller (anon token or a
+    // real user access token). If present it must verify.
+    let claims = match bearer_token(headers) {
+        Some(tok) => match state.project.keys.verify_api_key(tok, now) {
+            Ok(c) => Some(c),
+            Err(e) => return SupaError::InvalidJwt(e).into_response(),
+        },
+        None => None,
+    };
+
+    // Effective role: the bearer's role wins (PostgREST semantics); otherwise the
+    // apikey's role.
+    let role = claims
+        .as_ref()
+        .map(|c| c.pg_role().to_string())
+        .unwrap_or_else(|| api_key_role.clone());
+
+    let request_id = req
+        .extensions()
+        .get::<RequestId>()
+        .map(|r| r.0.clone())
+        .or_else(|| header_str(req.headers(), "x-request-id").map(str::to_string))
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    req.extensions_mut().insert(AuthContext {
+        role,
+        api_key_role,
+        claims,
+        request_id,
+    });
+    next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
+// Header helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    header_str(headers, "authorization").and_then(|v| {
+        v.strip_prefix("Bearer ")
+            .or_else(|| {
+                v.strip_prefix("bearer ")
+                    .or_else(|| v.strip_prefix("BEARER "))
+            })
+            .map(str::trim)
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Shared engine execution helpers
+// ---------------------------------------------------------------------------
+
+/// Load and deserialize the persisted catalog, if any. Used to coerce REST
+/// filter/body values to their declared column types.
+pub(crate) async fn load_catalog<S: RelationalStorage>(
+    db: &Database<S>,
+) -> Result<Option<Catalog>, SupaError> {
+    match db.storage().load_catalog().await {
+        Ok(Some(json)) => serde_json::from_value(json)
+            .map(Some)
+            .map_err(|e| SupaError::Internal(format!("corrupt catalog: {e}"))),
+        Ok(None) => Ok(None),
+        Err(e) => Err(SupaError::Internal(format!("catalog load failed: {e}"))),
+    }
+}
+
+/// Run a single parameterised statement as `role`, returning its result.
+pub(crate) async fn run_sql<S: RelationalStorage + 'static>(
+    db: &Arc<Database<S>>,
+    role: &str,
+    sql: &str,
+    params: Vec<SqlValue>,
+) -> Result<ExecResult, SqlError> {
+    let mut session = Session::new(db.clone(), role.to_string());
+    let prepared = session.prepare(sql)?;
+    session.execute_one(&prepared.statement, &params).await
+}
+
+/// Run a multi-statement SQL batch as `role` (no params). Used for DDL
+/// bootstrap where several statements execute in order.
+pub(crate) async fn run_batch<S: RelationalStorage + 'static>(
+    db: &Arc<Database<S>>,
+    role: &str,
+    sql: &str,
+) -> Result<Vec<ExecResult>, SqlError> {
+    let mut session = Session::new(db.clone(), role.to_string());
+    session.execute(sql).await
+}
