@@ -32,9 +32,10 @@ async fn err_code(s: &mut Session<MemoryStorage>, sql: &str) -> String {
 /// First row/column of a row-producing result, as PostgreSQL text output.
 async fn scalar(s: &mut Session<MemoryStorage>, sql: &str) -> Option<String> {
     match ok(s, sql).await.pop() {
-        Some(ExecResult::Rows { rows, .. }) => {
-            rows.first().and_then(|r| r.first()).and_then(|v| v.to_text())
-        }
+        Some(ExecResult::Rows { rows, .. }) => rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.to_text()),
         other => panic!("`{sql}` did not produce rows: {other:?}"),
     }
 }
@@ -47,7 +48,10 @@ async fn scalar(s: &mut Session<MemoryStorage>, sql: &str) -> Option<String> {
 async fn create_extension_gates_functions() {
     let mut s = session().await;
     // Not installed: typed undefined-function error naming the extension.
-    assert_eq!(&err_code(&mut s, "SELECT uuid_generate_v4()").await, "42883");
+    assert_eq!(
+        &err_code(&mut s, "SELECT uuid_generate_v4()").await,
+        "42883"
+    );
     ok(&mut s, "CREATE EXTENSION \"uuid-ossp\"").await;
     let u = scalar(&mut s, "SELECT uuid_generate_v4()").await.unwrap();
     assert_eq!(u.len(), 36);
@@ -63,7 +67,10 @@ async fn create_extension_unknown_name_is_typed() {
 async fn create_extension_duplicate_and_if_not_exists() {
     let mut s = session().await;
     ok(&mut s, "CREATE EXTENSION pgcrypto").await;
-    assert_eq!(&err_code(&mut s, "CREATE EXTENSION pgcrypto").await, "42710");
+    assert_eq!(
+        &err_code(&mut s, "CREATE EXTENSION pgcrypto").await,
+        "42710"
+    );
     ok(&mut s, "CREATE EXTENSION IF NOT EXISTS pgcrypto").await;
 }
 
@@ -179,7 +186,10 @@ async fn extension_state_persists_across_sessions() {
     );
     // Fresh storage: not installed.
     let mut s3 = session().await;
-    assert_eq!(&err_code(&mut s3, "SELECT digest('a','md5')").await, "42883");
+    assert_eq!(
+        &err_code(&mut s3, "SELECT digest('a','md5')").await,
+        "42883"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -191,18 +201,24 @@ async fn pg_trgm_operators_and_gucs() {
     let mut s = session().await;
     ok(&mut s, "CREATE EXTENSION pg_trgm").await;
     assert_eq!(
-        scalar(&mut s, "SELECT similarity('word','two words')").await.as_deref(),
+        scalar(&mut s, "SELECT similarity('word','two words')")
+            .await
+            .as_deref(),
         Some("0.36363637")
     );
     // Default threshold 0.3: 'word' % 'two words' is true.
     assert_eq!(
-        scalar(&mut s, "SELECT 'word' % 'two words'").await.as_deref(),
+        scalar(&mut s, "SELECT 'word' % 'two words'")
+            .await
+            .as_deref(),
         Some("t")
     );
     // Raise the threshold via SET; the operator observes it.
     ok(&mut s, "SET pg_trgm.similarity_threshold = 0.5").await;
     assert_eq!(
-        scalar(&mut s, "SELECT 'word' % 'two words'").await.as_deref(),
+        scalar(&mut s, "SELECT 'word' % 'two words'")
+            .await
+            .as_deref(),
         Some("f")
     );
     // set_limit()/show_limit() round-trip and persist for the session.
@@ -215,7 +231,9 @@ async fn pg_trgm_operators_and_gucs() {
         Some("0.2")
     );
     assert_eq!(
-        scalar(&mut s, "SELECT 'word' % 'two words'").await.as_deref(),
+        scalar(&mut s, "SELECT 'word' % 'two words'")
+            .await
+            .as_deref(),
         Some("t")
     );
 }
@@ -249,7 +267,11 @@ async fn citext_column_semantics() {
 async fn vector_column_and_distance_operators() {
     let mut s = session().await;
     ok(&mut s, "CREATE EXTENSION vector").await;
-    ok(&mut s, "CREATE TABLE items (id INT PRIMARY KEY, v VECTOR(2))").await;
+    ok(
+        &mut s,
+        "CREATE TABLE items (id INT PRIMARY KEY, v VECTOR(2))",
+    )
+    .await;
     ok(&mut s, "INSERT INTO items VALUES (1,'[1,2]'), (2,'[4,6]')").await;
     // Dimension enforcement.
     assert_eq!(
@@ -257,15 +279,21 @@ async fn vector_column_and_distance_operators() {
         "42804"
     );
     assert_eq!(
-        scalar(&mut s, "SELECT v <-> '[4,6]'::vector FROM items WHERE id = 1")
-            .await
-            .as_deref(),
+        scalar(
+            &mut s,
+            "SELECT v <-> '[4,6]'::vector FROM items WHERE id = 1"
+        )
+        .await
+        .as_deref(),
         Some("5")
     );
     assert_eq!(
-        scalar(&mut s, "SELECT l2_distance('[1,2]'::vector,'[4,6]'::vector)")
-            .await
-            .as_deref(),
+        scalar(
+            &mut s,
+            "SELECT l2_distance('[1,2]'::vector,'[4,6]'::vector)"
+        )
+        .await
+        .as_deref(),
         Some("5")
     );
     // ORDER BY nearest-neighbour, the canonical pgvector query shape.
@@ -286,11 +314,15 @@ async fn fuzzystrmatch_and_unaccent_functions() {
     ok(&mut s, "CREATE EXTENSION fuzzystrmatch").await;
     ok(&mut s, "CREATE EXTENSION unaccent").await;
     assert_eq!(
-        scalar(&mut s, "SELECT levenshtein('kitten','sitting')").await.as_deref(),
+        scalar(&mut s, "SELECT levenshtein('kitten','sitting')")
+            .await
+            .as_deref(),
         Some("3")
     );
     assert_eq!(
-        scalar(&mut s, "SELECT soundex('Margaret')").await.as_deref(),
+        scalar(&mut s, "SELECT soundex('Margaret')")
+            .await
+            .as_deref(),
         Some("M626")
     );
     assert_eq!(
@@ -319,7 +351,9 @@ async fn show_and_current_setting() {
     );
     // Extension GUC default is visible without SET once registered.
     assert_eq!(
-        scalar(&mut s, "SHOW pg_trgm.similarity_threshold").await.as_deref(),
+        scalar(&mut s, "SHOW pg_trgm.similarity_threshold")
+            .await
+            .as_deref(),
         Some("0.3")
     );
     // Unknown parameter: typed.
