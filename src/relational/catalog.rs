@@ -190,6 +190,11 @@ pub struct Table {
     /// catalogs written before this field existed keep loading unchanged.
     #[serde(default)]
     pub rls_enabled: bool,
+    /// `ALTER TABLE ... FORCE ROW LEVEL SECURITY`: owner roles lose their
+    /// row-security exemption on this table. Same backward-compatible serde
+    /// default as `rls_enabled`.
+    #[serde(default)]
+    pub rls_forced: bool,
     /// Row-security policies (`CREATE POLICY`). Same backward-compatible
     /// serde default as `rls_enabled`.
     #[serde(default)]
@@ -517,11 +522,32 @@ impl Catalog {
         Ok(())
     }
 
+    /// Foreign keys on *other* tables whose referenced table is `q` (the
+    /// constraint's declaring table plus the constraint itself).
+    pub fn referencing_foreign_keys(&self, q: &QualifiedName) -> Vec<(QualifiedName, ForeignKey)> {
+        let mut out = Vec::new();
+        for table in self.tables.values() {
+            for fk in &table.foreign_keys {
+                if fk.ref_schema == q.schema && fk.ref_table == q.name {
+                    out.push((table.qualified(), fk.clone()));
+                }
+            }
+        }
+        out
+    }
+
     pub fn drop_table_qualified(&mut self, q: &QualifiedName) -> Result<Table> {
         let table = self
             .tables
             .remove(q)
             .ok_or_else(|| RelError::UndefinedTable(q.to_string_qualified()))?;
+        // Foreign keys on other tables referencing the dropped table go with it
+        // (DROP ... CASCADE drops the dependent constraint in PostgreSQL; the
+        // executor guards the non-CASCADE path with 2BP01 before calling this).
+        for t in self.tables.values_mut() {
+            t.foreign_keys
+                .retain(|fk| !(fk.ref_schema == q.schema && fk.ref_table == q.name));
+        }
         // Drop dependent indexes and sequences.
         let idx_keys: Vec<QualifiedName> = self
             .indexes
@@ -702,6 +728,7 @@ mod tests {
             checks: vec![],
             storage_collection: String::new(),
             rls_enabled: false,
+            rls_forced: false,
             policies: vec![],
         }
     }

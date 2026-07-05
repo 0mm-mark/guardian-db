@@ -18,8 +18,12 @@
 //!   checks new rows with `WITH CHECK` (falling back to `USING`); INSERT uses
 //!   `WITH CHECK`; DELETE and SELECT use `USING`;
 //! * expressions evaluating to false **or NULL** deny;
-//! * the roles `service_role`, `postgres` and `guardian` (the engine owner)
-//!   bypass row security entirely, as does any table with `rls_enabled = false`.
+//! * the role `service_role` (Supabase's `BYPASSRLS` equivalent) bypasses row
+//!   security entirely; `postgres` and `guardian` (the engine's owner names)
+//!   bypass it like PostgreSQL table owners — unless the table sets
+//!   `FORCE ROW LEVEL SECURITY`, which revokes exactly that owner exemption
+//!   (`BYPASSRLS` beats `FORCE`, as in PostgreSQL). Tables with
+//!   `rls_enabled = false` are never filtered.
 //!
 //! [`LoadedTable`]: crate::sql::store::LoadedTable
 
@@ -30,15 +34,27 @@ use crate::sql::store::RowValues;
 use sqlparser::ast::{Expr, Statement, TableFactor};
 use std::collections::{BTreeSet, HashMap};
 
-/// Roles that bypass row security entirely. `service_role` mirrors Supabase's
-/// `BYPASSRLS` service key; `postgres` and `guardian` are the engine's
-/// owner/superuser names (table owners are not subject to RLS in PostgreSQL
-/// unless FORCE ROW LEVEL SECURITY, which GuardianDB does not support).
-const BYPASS_ROLES: &[&str] = &["service_role", "postgres", "guardian"];
+/// Roles equivalent to PostgreSQL's `BYPASSRLS` attribute: they bypass row
+/// security even under `FORCE ROW LEVEL SECURITY`. `service_role` mirrors
+/// Supabase's service key.
+const BYPASS_ROLES: &[&str] = &["service_role"];
 
-/// Does `role` bypass row security?
+/// The engine's owner/superuser role names. Like PostgreSQL table owners they
+/// are not subject to row security, unless a table declares
+/// `FORCE ROW LEVEL SECURITY` — which revokes exactly this exemption.
+const OWNER_ROLES: &[&str] = &["postgres", "guardian"];
+
+/// Does `role` bypass row security on tables *without*
+/// `FORCE ROW LEVEL SECURITY`? (Owner roles and `BYPASSRLS` roles alike.)
 pub fn role_bypasses_rls(role: &str) -> bool {
-    BYPASS_ROLES.contains(&role)
+    BYPASS_ROLES.contains(&role) || OWNER_ROLES.contains(&role)
+}
+
+/// Does `role` bypass row security on `table`, honouring its
+/// `FORCE ROW LEVEL SECURITY` flag? `BYPASSRLS`-equivalent roles always
+/// bypass; owner roles only until the table is FORCEd.
+pub fn role_bypasses_rls_on(role: &str, table: &Table) -> bool {
+    BYPASS_ROLES.contains(&role) || (OWNER_ROLES.contains(&role) && !table.rls_forced)
 }
 
 /// Which expression of a policy applies: `USING` (visibility of existing rows)
@@ -87,16 +103,17 @@ impl Exec {
     /// variables are copied into the context (policy expressions read them via
     /// `current_setting()` / `auth.uid()`) and before any evaluation.
     pub fn init_rls(&mut self, stmt: &Statement) -> Result<()> {
-        if role_bypasses_rls(&self.username) {
+        if BYPASS_ROLES.contains(&self.username.as_str()) {
             return Ok(());
         }
         // Enforced tables among the ones this statement loaded, in stable order
         // (a policy subquery scanning another RLS table sees that table's
-        // already-computed filtering when it sorts earlier).
+        // already-computed filtering when it sorts earlier). Owner roles skip
+        // tables that have not FORCEd row security.
         let mut keys: Vec<QualifiedName> = self
             .tables
             .iter()
-            .filter(|(_, l)| l.meta.rls_enabled)
+            .filter(|(_, l)| l.meta.rls_enabled && !role_bypasses_rls_on(&self.username, &l.meta))
             .map(|(q, _)| q.clone())
             .collect();
         keys.sort();
