@@ -1752,3 +1752,5 @@ fn push_name(name: &sqlparser::ast::ObjectName, out: &mut NameOut) {
 // Maintenance note 1: documents compatibility expectations without changing runtime behavior.
 
 // Maintenance note 13: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note 25: documents compatibility expectations without changing runtime behavior.
