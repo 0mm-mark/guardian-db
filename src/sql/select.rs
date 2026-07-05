@@ -2669,3 +2669,5 @@ pub(crate) fn walk_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
 // Maintenance note 15: documents compatibility expectations without changing runtime behavior.
 
 // Maintenance note: keeps SQL compatibility behavior explicit for future updates.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
