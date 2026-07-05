@@ -2663,3 +2663,5 @@ pub(crate) fn walk_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
         _ => {}
     }
 }
+
+// Maintenance note 3: documents compatibility expectations without changing runtime behavior.
