@@ -214,3 +214,5 @@ pub type Result<T> = std::result::Result<T, RelError>;
 // Maintenance note 12: documents compatibility expectations without changing runtime behavior.
 
 // Maintenance note 24: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
