@@ -187,13 +187,13 @@ fn type_owner(ty: &SqlType) -> Option<&'static str> {
 /// DDL gate: error (like PostgreSQL's `type "citext" does not exist`) when a
 /// column uses an extension type whose extension is not installed.
 pub fn check_type_usable(catalog: &Catalog, ty: &SqlType) -> Result<()> {
-    if let Some(owner) = type_owner(ty) {
-        if !catalog.extension_installed(owner) {
-            return Err(SqlError::UndefinedType(format!(
-                "{} — provided by extension \"{owner}\"; run CREATE EXTENSION {owner}",
-                ty.name()
-            )));
-        }
+    if let Some(owner) = type_owner(ty)
+        && !catalog.extension_installed(owner)
+    {
+        return Err(SqlError::UndefinedType(format!(
+            "{} — provided by extension \"{owner}\"; run CREATE EXTENSION {owner}",
+            ty.name()
+        )));
     }
     Ok(())
 }
