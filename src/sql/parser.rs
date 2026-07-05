@@ -10,6 +10,16 @@ pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(parse_error)
 }
 
+/// Parse a single scalar expression (used for stored expression texts such as
+/// row-security policy `USING` / `WITH CHECK` clauses).
+pub fn parse_expr(text: &str) -> Result<sqlparser::ast::Expr> {
+    Parser::new(&PostgreSqlDialect {})
+        .try_with_sql(text)
+        .map_err(parse_error)?
+        .parse_expr()
+        .map_err(parse_error)
+}
+
 /// Split a SQL string into top-level `;`-separated statements without parsing
 /// them.
 ///

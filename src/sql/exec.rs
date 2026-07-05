@@ -55,6 +55,9 @@ pub struct Exec {
     /// and extension functions; writes (e.g. `set_limit`) are copied back to
     /// the session after the statement.
     pub vars: RefCell<HashMap<String, String>>,
+    /// Row-security state for this statement (see [`crate::sql::rls`]).
+    /// Empty (the default) means no enforcement applies.
+    pub rls: crate::sql::rls::RlsContext,
 }
 
 impl Exec {
@@ -84,6 +87,7 @@ impl Exec {
             pending_locks: RefCell::new(Vec::new()),
             for_update_filter: None,
             vars: RefCell::new(HashMap::new()),
+            rls: crate::sql::rls::RlsContext::default(),
         }
     }
 

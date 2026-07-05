@@ -87,6 +87,8 @@ impl Exec {
             foreign_keys,
             checks,
             storage_collection: String::new(),
+            rls_enabled: false,
+            policies: Vec::new(),
         };
         self.catalog.insert_table(table)?;
 
@@ -661,6 +663,12 @@ impl Exec {
                     });
                 }
             }
+            AlterTableOperation::EnableRowLevelSecurity => {
+                self.catalog.get_table_mut(q).unwrap().rls_enabled = true;
+            }
+            AlterTableOperation::DisableRowLevelSecurity => {
+                self.catalog.get_table_mut(q).unwrap().rls_enabled = false;
+            }
             AlterTableOperation::DropConstraint {
                 name, if_exists, ..
             } => {
@@ -687,6 +695,111 @@ impl Exec {
             }
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Row-level security policies
+    // ------------------------------------------------------------------
+
+    /// `CREATE POLICY name ON table [AS PERMISSIVE|RESTRICTIVE]
+    /// [FOR ALL|SELECT|INSERT|UPDATE|DELETE] [TO role, ...]
+    /// [USING (expr)] [WITH CHECK (expr)]`.
+    pub fn exec_create_policy(&mut self, cp: &sqlparser::ast::CreatePolicy) -> Result<ExecResult> {
+        use crate::relational::catalog::{Policy, PolicyCmd};
+        use sqlparser::ast::{CreatePolicyCommand, CreatePolicyType, Owner};
+
+        let (schema, n) = split_schema_table(&cp.table_name);
+        let q = self
+            .catalog
+            .resolve_table_name(schema.as_deref(), &n)
+            .ok_or_else(|| SqlError::UndefinedTable(n.clone()))?;
+        let name = ident_name(&cp.name);
+        if self.catalog.require_table(&q)?.policy(&name).is_some() {
+            return Err(SqlError::DuplicateObject(format!(
+                "policy \"{name}\" for table \"{}\"",
+                q.name
+            )));
+        }
+
+        let cmd = match cp.command {
+            None | Some(CreatePolicyCommand::All) => PolicyCmd::All,
+            Some(CreatePolicyCommand::Select) => PolicyCmd::Select,
+            Some(CreatePolicyCommand::Insert) => PolicyCmd::Insert,
+            Some(CreatePolicyCommand::Update) => PolicyCmd::Update,
+            Some(CreatePolicyCommand::Delete) => PolicyCmd::Delete,
+        };
+        // PostgreSQL rejects clauses that can never apply to the command.
+        if cp.with_check.is_some() && matches!(cmd, PolicyCmd::Select | PolicyCmd::Delete) {
+            return Err(SqlError::Syntax(
+                "WITH CHECK cannot be applied to SELECT or DELETE".into(),
+            ));
+        }
+        if cp.using.is_some() && cmd == PolicyCmd::Insert {
+            return Err(SqlError::Syntax(
+                "only WITH CHECK expression allowed for INSERT".into(),
+            ));
+        }
+
+        // `TO PUBLIC` (or no TO clause) means every role: an empty list.
+        let mut roles: Vec<String> = Vec::new();
+        let mut is_public = cp.to.is_none();
+        for owner in cp.to.iter().flatten() {
+            match owner {
+                Owner::Ident(ident) => {
+                    let role = ident_name(ident);
+                    if role.eq_ignore_ascii_case("public") {
+                        is_public = true;
+                    } else {
+                        roles.push(role);
+                    }
+                }
+                Owner::CurrentRole | Owner::CurrentUser | Owner::SessionUser => {
+                    roles.push(self.username.clone());
+                }
+            }
+        }
+        if is_public {
+            roles.clear();
+        }
+
+        // Expressions are stored as SQL text and validated to round-trip
+        // through the expression parser (they are re-parsed at evaluation).
+        let using_expr = cp.using.as_ref().map(policy_expr_text).transpose()?;
+        let check_expr = cp.with_check.as_ref().map(policy_expr_text).transpose()?;
+
+        let permissive = !matches!(cp.policy_type, Some(CreatePolicyType::Restrictive));
+        let table = self.catalog.get_table_mut(&q).unwrap();
+        table.policies.push(Policy {
+            name,
+            cmd,
+            roles,
+            using_expr,
+            check_expr,
+            permissive,
+        });
+        self.catalog_dirty = true;
+        Ok(ExecResult::empty_command("CREATE POLICY"))
+    }
+
+    /// `DROP POLICY [IF EXISTS] name ON table`.
+    pub fn exec_drop_policy(&mut self, dp: &sqlparser::ast::DropPolicy) -> Result<ExecResult> {
+        let (schema, n) = split_schema_table(&dp.table_name);
+        let q = self
+            .catalog
+            .resolve_table_name(schema.as_deref(), &n)
+            .ok_or_else(|| SqlError::UndefinedTable(n.clone()))?;
+        let name = ident_name(&dp.name);
+        let table = self.catalog.get_table_mut(&q).unwrap();
+        let before = table.policies.len();
+        table.policies.retain(|p| p.name != name);
+        if table.policies.len() == before && !dp.if_exists {
+            return Err(SqlError::UndefinedObject(format!(
+                "policy \"{name}\" for table \"{}\"",
+                q.name
+            )));
+        }
+        self.catalog_dirty = true;
+        Ok(ExecResult::empty_command("DROP POLICY"))
     }
 
     /// Rename a column in the catalog and rewrite stored rows.
@@ -759,6 +872,16 @@ impl Exec {
         }
         Ok(())
     }
+}
+
+/// Render a policy expression to its stored SQL text, verifying the text
+/// parses back as an expression (rejecting it with SQLSTATE 42601 otherwise,
+/// so a policy can never be stored that would fail at evaluation time).
+fn policy_expr_text(expr: &sqlparser::ast::Expr) -> Result<String> {
+    let text = expr.to_string();
+    crate::sql::parser::parse_expr(&text)
+        .map_err(|e| SqlError::Syntax(format!("invalid policy expression ({text}): {e}")))?;
+    Ok(text)
 }
 
 /// Extract a column name from an index column (must be a plain identifier).

@@ -654,13 +654,7 @@ impl Exec {
         frames: &[Frame],
         aggs: Option<&HashMap<String, SqlValue>>,
     ) -> Result<SqlValue> {
-        let name = func
-            .name
-            .0
-            .last()
-            .and_then(|p| p.as_ident())
-            .map(ident_name)
-            .unwrap_or_default();
+        let name = crate::sql::names::function_dispatch_name(&func.name);
         if funcs::is_aggregate(&name) {
             if let Some(map) = aggs {
                 let key = func.to_string();

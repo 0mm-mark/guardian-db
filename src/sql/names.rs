@@ -23,6 +23,22 @@ pub fn object_name_parts(name: &ObjectName) -> Vec<String> {
         .collect()
 }
 
+/// The lower-cased dispatch name of a function call. Calls qualified with the
+/// `auth` namespace keep the qualifier (`auth.uid`) because those are distinct
+/// Supabase builtins; any other qualifier (`pg_catalog.`, `public.`) is
+/// dropped, matching PostgreSQL's search-path resolution for builtins. A
+/// quoted `"auth.uid"` single identifier also dispatches correctly, since the
+/// returned name is the same either way.
+pub fn function_dispatch_name(name: &ObjectName) -> String {
+    let parts = object_name_parts(name);
+    let base = parts.last().cloned().unwrap_or_default();
+    if parts.len() >= 2 && parts[parts.len() - 2] == "auth" {
+        format!("auth.{base}")
+    } else {
+        base
+    }
+}
+
 /// Split an object name into `(schema, name)`. A three-part name's leading
 /// catalog/database component is ignored (PostgreSQL only allows the current db).
 pub fn split_schema_table(name: &ObjectName) -> (Option<String>, String) {

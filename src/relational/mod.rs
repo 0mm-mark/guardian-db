@@ -24,8 +24,8 @@ pub mod types;
 pub mod value;
 
 pub use catalog::{
-    Catalog, CheckConstraint, Column, FIRST_USER_OID, ForeignKey, Index, PrimaryKey, QualifiedName,
-    ReferentialAction, Schema, Sequence, Table, UniqueConstraint, View,
+    Catalog, CheckConstraint, Column, FIRST_USER_OID, ForeignKey, Index, Policy, PolicyCmd,
+    PrimaryKey, QualifiedName, ReferentialAction, Schema, Sequence, Table, UniqueConstraint, View,
 };
 pub use error::{RelError, Result};
 pub use index::{SecondaryIndex, composite_key, ordered_key};

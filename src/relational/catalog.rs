@@ -133,6 +133,47 @@ pub struct CheckConstraint {
     pub expr: String,
 }
 
+/// The command class a row-security policy applies to (`FOR ALL | SELECT |
+/// INSERT | UPDATE | DELETE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyCmd {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl PolicyCmd {
+    /// The `pg_policies.cmd` spelling.
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            PolicyCmd::All => "ALL",
+            PolicyCmd::Select => "SELECT",
+            PolicyCmd::Insert => "INSERT",
+            PolicyCmd::Update => "UPDATE",
+            PolicyCmd::Delete => "DELETE",
+        }
+    }
+}
+
+/// A row-level security policy (`CREATE POLICY`). Expressions are stored as
+/// raw SQL text (validated to parse at CREATE time) and evaluated per row at
+/// execution time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Policy {
+    pub name: String,
+    pub cmd: PolicyCmd,
+    /// Roles the policy applies to; empty means PUBLIC (every role).
+    pub roles: Vec<String>,
+    /// Raw SQL text of the `USING` expression (visibility of existing rows).
+    pub using_expr: Option<String>,
+    /// Raw SQL text of the `WITH CHECK` expression (validity of new rows).
+    pub check_expr: Option<String>,
+    /// `AS PERMISSIVE` (ORed) vs `AS RESTRICTIVE` (ANDed).
+    pub permissive: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
     pub oid: u32,
@@ -145,11 +186,23 @@ pub struct Table {
     pub checks: Vec<CheckConstraint>,
     /// Opaque storage collection name for this table's rows.
     pub storage_collection: String,
+    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`. Defaults to `false` so
+    /// catalogs written before this field existed keep loading unchanged.
+    #[serde(default)]
+    pub rls_enabled: bool,
+    /// Row-security policies (`CREATE POLICY`). Same backward-compatible
+    /// serde default as `rls_enabled`.
+    #[serde(default)]
+    pub policies: Vec<Policy>,
 }
 
 impl Table {
     pub fn column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
+    }
+
+    pub fn policy(&self, name: &str) -> Option<&Policy> {
+        self.policies.iter().find(|p| p.name == name)
     }
 
     pub fn column_mut(&mut self, name: &str) -> Option<&mut Column> {
@@ -648,6 +701,8 @@ mod tests {
             foreign_keys: vec![],
             checks: vec![],
             storage_collection: String::new(),
+            rls_enabled: false,
+            policies: vec![],
         }
     }
 

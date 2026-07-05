@@ -99,6 +99,14 @@ impl<S: RelationalStorage> Session<S> {
         self.txn.is_some()
     }
 
+    /// Set a session variable directly (equivalent to `SET name = value`, no
+    /// SQL round-trip). Used by the Supabase gateway to inject the request's
+    /// JWT claims (`request.jwt.claims`) for row-security policy evaluation.
+    pub fn set_var(&mut self, name: &str, value: &str) {
+        self.vars
+            .insert(name.to_ascii_lowercase(), value.to_string());
+    }
+
     /// Parse and execute a (possibly multi-statement) SQL string.
     ///
     /// The input is split into top-level statements first (quote- and
@@ -438,6 +446,24 @@ impl<S: RelationalStorage> Session<S> {
         // Preload referenced tables.
         let mut names = Vec::new();
         collect_stmt(stmt, &mut names);
+        // Row-security policies may reference other tables (e.g. in EXISTS
+        // subqueries); preload those too so policy evaluation can scan them.
+        let mut policy_names = Vec::new();
+        for (schema, name) in &names {
+            if let Some(q) = catalog.resolve_table_name(schema.as_deref(), name)
+                && let Some(table) = catalog.get_table(&q)
+                && table.rls_enabled
+            {
+                for policy in &table.policies {
+                    for text in policy.using_expr.iter().chain(policy.check_expr.iter()) {
+                        if let Ok(expr) = crate::sql::parser::parse_expr(text) {
+                            collect_expr(&expr, &mut policy_names);
+                        }
+                    }
+                }
+            }
+        }
+        names.extend(policy_names);
         let mut tables: HashMap<QualifiedName, LoadedTable> = HashMap::new();
         for (schema, name) in &names {
             if let Some(q) = catalog.resolve_table_name(schema.as_deref(), name)
@@ -461,6 +487,9 @@ impl<S: RelationalStorage> Session<S> {
             self.session_id,
         );
         exec.vars = std::cell::RefCell::new(self.vars.clone());
+        // Row security: compute per-table visibility once, before anything is
+        // evaluated (CTEs, scans and DML snapshots all consult it).
+        exec.init_rls(stmt)?;
         // Pre-materialize top-level CTEs.
         if let Statement::Query(q) = stmt
             && let Some(with) = &q.with
@@ -708,6 +737,8 @@ impl<S: RelationalStorage> Session<S> {
             } => exec.exec_drop(object_type, *if_exists, names, *cascade),
             Statement::Truncate(_) => exec.exec_truncate(stmt),
             Statement::Set(_) => Ok(ExecResult::empty_command("SET")),
+            Statement::CreatePolicy(cp) => exec.exec_create_policy(cp),
+            Statement::DropPolicy(dp) => exec.exec_drop_policy(dp),
             Statement::CreateExtension(ce) => exec.exec_create_extension(ce),
             Statement::DropExtension(de) => exec.exec_drop_extension(de),
             Statement::ShowVariable { variable } => {

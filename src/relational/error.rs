@@ -106,6 +106,11 @@ pub enum RelError {
     #[error("constraint \"{0}\" is invalid")]
     InvalidConstraint(String),
 
+    /// Permission denied (SQLSTATE 42501). Carries the full PostgreSQL-shaped
+    /// message, e.g. `new row violates row-level security policy for table "t"`.
+    #[error("{0}")]
+    InsufficientPrivilege(String),
+
     #[error("deadlock detected")]
     DeadlockDetected { detail: String },
 
@@ -160,6 +165,7 @@ impl RelError {
             RelError::FeatureNotSupported(_) => "0A000",
             RelError::InvalidParameter(_) => "22023",
             RelError::InvalidConstraint(_) => "42P10",
+            RelError::InsufficientPrivilege(_) => "42501",
             RelError::DeadlockDetected { .. } => "40P01",
             RelError::LockNotAvailable(_) => "55P03",
             RelError::InFailedTransaction => "25P02",
