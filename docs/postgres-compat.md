@@ -776,3 +776,7 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 | `src/sql`            | engine (DDL/DML/SELECT/joins/aggregates/txn/index) + conformance gaps |
 | `src/pgwire`         | `tokio-postgres` over TCP (startup, query, errors, txn)|
 | `tests/postgres-compat` | node-postgres + TypeORM (synchronize, migrations, relations, QueryBuilder, transactions) |
+
+### SQL compatibility note 15
+
+Tracks PostgreSQL-compatible behavior for window functions, recursive CTEs, SQLSTATE-mapped validation, aggregate FILTER handling, and min/max type inference without changing executable code.
