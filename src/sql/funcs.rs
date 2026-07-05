@@ -535,3 +535,5 @@ mod tests {
 // Maintenance note 8: documents compatibility expectations without changing runtime behavior.
 
 // Maintenance note 20: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
