@@ -1462,3 +1462,5 @@ mod tests {
         assert!(SqlValue::Int4(1).cast(&SqlType::HStore).is_err());
     }
 }
+
+// Maintenance note 11: documents compatibility expectations without changing runtime behavior.
