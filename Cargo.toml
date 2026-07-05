@@ -24,7 +24,9 @@ pgwire = ["sql", "dep:pgwire"]
 # Supabase-compatible HTTP gateway (Kong-shaped REST + Auth) over the `sql`
 # engine (the `supabase` module + `guardian-supabase` binary). Reuses the
 # hmac/sha2/base64/bcrypt crypto already pulled in by `sql`.
-supabase = ["sql", "dep:axum", "dep:tower"]
+# `graphql-parser` (pure Rust, tiny dep tree) parses GraphQL documents for the
+# pg_graphql-compatible `/graphql/v1` endpoint.
+supabase = ["sql", "dep:axum", "dep:tower", "dep:graphql-parser"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -81,6 +83,9 @@ pgwire = { version = "0.40", optional = true }
 # powers the in-process `oneshot` integration tests.
 axum = { version = "0.8", optional = true, features = ["ws"] }
 tower = { version = "0.5", optional = true, features = ["util"] }
+# Spec-compliant GraphQL document parser for the pg_graphql-compatible endpoint
+# (fragments, variables, directives — what GraphiQL's introspection query uses).
+graphql-parser = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -157,6 +162,11 @@ required-features = ["supabase"]
 [[test]]
 name = "supabase_storage_realtime"
 path = "tests/supabase_storage_realtime.rs"
+required-features = ["supabase"]
+
+[[test]]
+name = "supabase_graphql"
+path = "tests/supabase_graphql.rs"
 required-features = ["supabase"]
 
 [[bench]]

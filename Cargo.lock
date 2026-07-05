@@ -1907,6 +1907,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "graphql-parser"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a818c0d883d7c0801df27be910917750932be279c7bc82dc541b8769425f409"
+dependencies = [
+ "combine",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "guardian-db"
 version = "0.17.1"
 dependencies = [
@@ -1927,6 +1937,7 @@ dependencies = [
  "fastrand",
  "futures",
  "futures-lite",
+ "graphql-parser",
  "guardian-db-derive",
  "hex",
  "hmac 0.12.1",

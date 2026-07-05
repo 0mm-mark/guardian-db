@@ -126,8 +126,8 @@ async fn missing_apikey_is_401_typed() {
 #[tokio::test]
 async fn functions_service_is_501_not_404() {
     // Storage / realtime / pg-meta are implemented since stage 3 (see
-    // tests/supabase_storage_realtime.rs); functions and graphql keep their
-    // precise typed 501s.
+    // tests/supabase_storage_realtime.rs) and graphql since stage 4 (see
+    // tests/supabase_graphql.rs); functions keeps its precise typed 501.
     let h = harness().await;
     let (status, _h, body) = call(
         &h.app,
