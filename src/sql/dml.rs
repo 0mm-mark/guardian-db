@@ -811,3 +811,5 @@ pub(crate) fn coerce_to_col(value: SqlValue, table: &Table, col: &str) -> Result
 }
 
 // Maintenance note 7: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note 19: documents compatibility expectations without changing runtime behavior.
