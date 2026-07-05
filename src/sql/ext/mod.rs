@@ -54,7 +54,9 @@ impl ExtCtx<'_> {
     }
 
     pub fn set_var(&self, name: &str, value: impl Into<String>) {
-        self.vars.borrow_mut().insert(name.to_string(), value.into());
+        self.vars
+            .borrow_mut()
+            .insert(name.to_string(), value.into());
     }
 
     /// Read a float-valued GUC with a hard fallback.
@@ -200,11 +202,7 @@ pub fn check_type_usable(catalog: &Catalog, ty: &SqlType) -> Result<()> {
 pub fn dependent_tables(catalog: &Catalog, ext: &str) -> Vec<String> {
     let mut out = Vec::new();
     for table in catalog.tables() {
-        if table
-            .columns
-            .iter()
-            .any(|c| type_owner(&c.ty) == Some(ext))
-        {
+        if table.columns.iter().any(|c| type_owner(&c.ty) == Some(ext)) {
             out.push(format!("{}.{}", table.schema, table.name));
         }
     }
@@ -258,7 +256,9 @@ pub fn dispatch_operator(
     );
     match op {
         // pg_trgm operators on text operands.
-        "%" | "<%" | "%>" | "<<%" | "%>>" if text_pair && catalog.extension_installed("pg_trgm") => {
+        "%" | "<%" | "%>" | "<<%" | "%>>"
+            if text_pair && catalog.extension_installed("pg_trgm") =>
+        {
             Some(pg_trgm::operator(ctx, op, left, right))
         }
         "<->" if text_pair && catalog.extension_installed("pg_trgm") => {
@@ -273,12 +273,8 @@ pub fn dispatch_operator(
 }
 
 fn both_text(l: &SqlValue, r: &SqlValue) -> bool {
-    let textual = |v: &SqlValue| {
-        matches!(
-            v,
-            SqlValue::Text(_) | SqlValue::Citext(_) | SqlValue::Null
-        )
-    };
+    let textual =
+        |v: &SqlValue| matches!(v, SqlValue::Text(_) | SqlValue::Citext(_) | SqlValue::Null);
     textual(l) && textual(r)
 }
 

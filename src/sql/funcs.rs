@@ -227,10 +227,7 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
                 Some(SqlValue::Text(s)) | Some(SqlValue::Citext(s)) => s.to_ascii_lowercase(),
                 _ => return Err(SqlError::InvalidParameter("set_config: name".into())),
             };
-            let value = args
-                .get(1)
-                .and_then(SqlValue::to_text)
-                .unwrap_or_default();
+            let value = args.get(1).and_then(SqlValue::to_text).unwrap_or_default();
             exec.vars.borrow_mut().insert(name, value.clone());
             Text(value)
         }

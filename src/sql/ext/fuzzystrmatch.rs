@@ -126,9 +126,7 @@ fn call(_ctx: &ExtCtx, name: &str, args: &[SqlValue]) -> Result<SqlValue> {
 /// Wrong argument count for a known function name: PostgreSQL reports this
 /// as an unknown function signature (SQLSTATE 42883).
 fn bad_arity(name: &str, got: usize, want: &str) -> SqlError {
-    SqlError::UndefinedFunction(format!(
-        "{name} takes {want} arguments; {got} given"
-    ))
+    SqlError::UndefinedFunction(format!("{name} takes {want} arguments; {got} given"))
 }
 
 fn check_arity(name: &str, args: &[SqlValue], want: usize) -> Result<()> {
@@ -1248,8 +1246,11 @@ fn double_metaphone(input: &str) -> (String, String) {
                     // Schlesinger's rule.
                     if word.at(current + 2) == b'H' {
                         // Dutch origin: 'school', 'schooner'.
-                        if word.string_at(current + 3, 2, &[b"OO", b"ER", b"EN", b"UY", b"ED", b"EM"])
-                        {
+                        if word.string_at(
+                            current + 3,
+                            2,
+                            &[b"OO", b"ER", b"EN", b"UY", b"ED", b"EM"],
+                        ) {
                             // 'schermerhorn', 'schenker'.
                             if word.string_at(current + 3, 2, &[b"ER", b"EN"]) {
                                 add(&mut primary, b"X");
@@ -1350,11 +1351,7 @@ fn double_metaphone(input: &str) -> (String, String) {
                         }
                     }
                     if (current == last && word.vowel(current - 1))
-                        || word.string_at(
-                            current - 1,
-                            5,
-                            &[b"EWSKI", b"EWSKY", b"OWSKI", b"OWSKY"],
-                        )
+                        || word.string_at(current - 1, 5, &[b"EWSKI", b"EWSKY", b"OWSKI", b"OWSKY"])
                         || word.string_at(0, 3, &[b"SCH"])
                     {
                         // 'Arnow' should match 'Arnoff'.
@@ -1396,9 +1393,7 @@ fn double_metaphone(input: &str) -> (String, String) {
                     current += 2;
                 } else {
                     if word.string_at(current + 1, 2, &[b"ZO", b"ZI", b"ZA"])
-                        || (word.slavo_germanic()
-                            && current > 0
-                            && word.at(current - 1) != b'T')
+                        || (word.slavo_germanic() && current > 0 && word.at(current - 1) != b'T')
                     {
                         add(&mut primary, b"S");
                         add(&mut secondary, b"TS");
@@ -1549,9 +1544,7 @@ mod tests {
 
     #[test]
     fn levenshtein_less_equal_banded() {
-        let lle = |a: &str, b: &str, max: i32| {
-            int("levenshtein_less_equal", &[t(a), t(b), i(max)])
-        };
+        let lle = |a: &str, b: &str, max: i32| int("levenshtein_less_equal", &[t(a), t(b), i(max)]);
         // Real distance is 4; with max 2 PostgreSQL's band collapses at 3.
         assert_eq!(lle("extensive", "exhaustive", 2), 3);
         assert_eq!(lle("extensive", "exhaustive", 4), 4);
@@ -1668,12 +1661,7 @@ mod tests {
 
     #[test]
     fn dmetaphone_matches_postgres() {
-        let dm = |s: &str| {
-            (
-                text("dmetaphone", &[t(s)]),
-                text("dmetaphone_alt", &[t(s)]),
-            )
-        };
+        let dm = |s: &str| (text("dmetaphone", &[t(s)]), text("dmetaphone_alt", &[t(s)]));
         let pair = |p: &str, a: &str| (p.to_string(), a.to_string());
         assert_eq!(dm("gumbo"), pair("KMP", "KMP"));
         assert_eq!(dm("metaphone"), pair("MTFN", "MTFN"));
@@ -1710,10 +1698,7 @@ mod tests {
         for (name, args) in [
             ("levenshtein", vec![null.clone(), t("x")]),
             ("levenshtein", vec![t("x"), null.clone()]),
-            (
-                "levenshtein_less_equal",
-                vec![t("x"), t("y"), null.clone()],
-            ),
+            ("levenshtein_less_equal", vec![t("x"), t("y"), null.clone()]),
             ("soundex", vec![null.clone()]),
             ("difference", vec![null.clone(), null.clone()]),
             ("metaphone", vec![t("x"), null.clone()]),
