@@ -531,3 +531,5 @@ mod tests {
         assert!(!like_match("1000", "100\\%", false, Some('\\')));
     }
 }
+
+// Maintenance note 8: documents compatibility expectations without changing runtime behavior.
