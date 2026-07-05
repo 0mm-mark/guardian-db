@@ -1190,3 +1190,5 @@ impl UniqueKind for sqlparser::ast::UniqueConstraint {
 // SQL compatibility note 7: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
 
 // SQL compatibility note 23: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 7: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
