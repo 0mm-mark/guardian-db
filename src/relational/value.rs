@@ -821,14 +821,14 @@ fn parse_vector_text(text: &str) -> Result<Vec<f32>> {
 }
 
 fn check_vector_dims(v: &[f32], dims: Option<u32>) -> Result<()> {
-    if let Some(d) = dims {
-        if v.len() as u32 != d {
-            return Err(RelError::DatatypeMismatch {
-                column: String::new(),
-                expected: format!("vector({d})"),
-                actual: format!("vector({})", v.len()),
-            });
-        }
+    if let Some(d) = dims
+        && v.len() as u32 != d
+    {
+        return Err(RelError::DatatypeMismatch {
+            column: String::new(),
+            expected: format!("vector({d})"),
+            actual: format!("vector({})", v.len()),
+        });
     }
     Ok(())
 }
