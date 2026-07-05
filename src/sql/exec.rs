@@ -51,6 +51,10 @@ pub struct Exec {
     /// For `SELECT ... FOR UPDATE SKIP LOCKED`: restricts a table's scan to the
     /// rows that were lockable.
     pub for_update_filter: Option<(QualifiedName, BTreeSet<String>)>,
+    /// Session variables (`SET name = value`), readable by `current_setting()`
+    /// and extension functions; writes (e.g. `set_limit`) are copied back to
+    /// the session after the statement.
+    pub vars: RefCell<HashMap<String, String>>,
 }
 
 impl Exec {
@@ -79,6 +83,7 @@ impl Exec {
             session_id,
             pending_locks: RefCell::new(Vec::new()),
             for_update_filter: None,
+            vars: RefCell::new(HashMap::new()),
         }
     }
 

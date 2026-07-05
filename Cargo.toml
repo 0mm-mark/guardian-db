@@ -18,7 +18,7 @@ default = []
 odm = ["dep:guardian-db-derive", "uuid/v4"]
 # PostgreSQL-compatible SQL on top of GuardianDB's replicated document storage
 # (the `relational` + `sql` modules).
-sql = ["dep:sqlparser", "dep:rust_decimal", "uuid/v4"]
+sql = ["dep:sqlparser", "dep:rust_decimal", "uuid/v4", "uuid/v1", "uuid/v3", "uuid/v5", "uuid/v6", "uuid/v7", "dep:sha1", "dep:sha2", "dep:md-5", "dep:hmac", "dep:bcrypt", "dep:unicode-normalization"]
 # PostgreSQL wire-protocol server (the `pgwire` module + `guardian-pgwire` binary).
 pgwire = ["sql", "dep:pgwire"]
 
@@ -64,6 +64,12 @@ guardian-db-derive = { version = "0.17.0", path = "guardian-db-derive", optional
 # PostgreSQL compatibility layer (the `relational` + `sql` + `pgwire` modules);
 # pulled in only by the `sql` / `pgwire` features.
 sqlparser = { version = "0.62", optional = true }
+sha1 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
+bcrypt = { version = "0.17", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
 rust_decimal = { version = "1.37", features = ["serde"], optional = true }
 pgwire = { version = "0.40", optional = true }
 

@@ -11,8 +11,8 @@ use crate::sql::names::{ident_name, split_schema_table};
 use crate::sql::result::ExecResult;
 use crate::sql::store::{Mutation, encode_row};
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, CreateIndex, CreateTable,
-    Statement, TableConstraint,
+    AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, CreateExtension,
+    CreateIndex, CreateTable, DropExtension, Statement, TableConstraint,
 };
 
 impl Exec {
@@ -152,6 +152,7 @@ impl Exec {
             Some(t) => (t, true),
             None => (crate::sql::eval::parse_data_type(&col.data_type)?, false),
         };
+        crate::sql::ext::check_type_usable(&self.catalog, &ty)?;
 
         let mut nullable = true;
         let mut default: Option<String> = None;
@@ -538,6 +539,12 @@ impl Exec {
             }
             AlterTableOperation::AlterColumn { column_name, op } => {
                 let cname = ident_name(column_name);
+                // Extension-type availability must be checked before the
+                // mutable catalog borrow below.
+                if let AlterColumnOperation::SetDataType { data_type, .. } = op {
+                    let ty = crate::sql::eval::parse_data_type(data_type)?;
+                    crate::sql::ext::check_type_usable(&self.catalog, &ty)?;
+                }
                 let table = self.catalog.get_table_mut(q).unwrap();
                 let col = table
                     .column_mut(&cname)
@@ -771,6 +778,102 @@ fn map_action(action: Option<sqlparser::ast::ReferentialAction>) -> ReferentialA
         Some(sqlparser::ast::ReferentialAction::SetNull) => ReferentialAction::SetNull,
         Some(sqlparser::ast::ReferentialAction::SetDefault) => ReferentialAction::SetDefault,
         _ => ReferentialAction::NoAction,
+    }
+
+}
+
+impl Exec {
+    // ------------------------------------------------------------------
+    // Extensions
+    // ------------------------------------------------------------------
+
+    /// `CREATE EXTENSION [IF NOT EXISTS] name [WITH] [SCHEMA s] [VERSION v] [CASCADE]`.
+    ///
+    /// GuardianDB implements a fixed registry of extensions natively (see
+    /// [`crate::sql::ext`]); binary PostgreSQL extensions cannot be loaded
+    /// into this engine, so anything outside the registry fails with a typed
+    /// error pointing at `pg_available_extensions`.
+    pub fn exec_create_extension(&mut self, ce: &CreateExtension) -> Result<ExecResult> {
+        let name = ident_name(&ce.name).to_lowercase();
+        let def = crate::sql::ext::find(&name).ok_or_else(|| {
+            SqlError::FeatureNotSupported(format!(
+                "extension \"{name}\" is not available — GuardianDB implements a fixed \
+                 set of extensions natively (binary PostgreSQL extensions cannot be \
+                 loaded); see SELECT * FROM pg_available_extensions"
+            ))
+        })?;
+        if self.catalog.extension_installed(def.name) {
+            if ce.if_not_exists {
+                return Ok(ExecResult::empty_command("CREATE EXTENSION"));
+            }
+            return Err(SqlError::DuplicateObject(format!(
+                "extension \"{}\"",
+                def.name
+            )));
+        }
+        if let Some(v) = &ce.version {
+            let requested = ident_name(v);
+            if requested != def.default_version {
+                return Err(SqlError::UndefinedObject(format!(
+                    "extension \"{}\" version \"{requested}\" (available: \"{}\")",
+                    def.name, def.default_version
+                )));
+            }
+        }
+        // `SCHEMA x` is accepted and ignored: none of the registry extensions
+        // are relocatable and their objects live in the system namespace.
+        for req in def.requires {
+            if !self.catalog.extension_installed(req) {
+                if !ce.cascade {
+                    return Err(SqlError::FeatureNotSupported(format!(
+                        "required extension \"{req}\" is not installed — use CREATE \
+                         EXTENSION ... CASCADE to install it automatically"
+                    )));
+                }
+                let dep = crate::sql::ext::find(req).ok_or_else(|| {
+                    SqlError::Internal(format!("extension dependency {req} not in registry"))
+                })?;
+                self.catalog.install_extension(dep.name, dep.default_version);
+            }
+        }
+        self.catalog.install_extension(def.name, def.default_version);
+        self.catalog_dirty = true;
+        Ok(ExecResult::empty_command("CREATE EXTENSION"))
+    }
+
+    /// `DROP EXTENSION [IF EXISTS] name [, ...] [CASCADE | RESTRICT]`.
+    ///
+    /// Tables with columns of an extension-provided type block the drop under
+    /// RESTRICT (the default). CASCADE-dropping dependent columns is refused
+    /// explicitly rather than destroying data implicitly.
+    pub fn exec_drop_extension(&mut self, de: &DropExtension) -> Result<ExecResult> {
+        use sqlparser::ast::ReferentialAction as RA;
+        for ident in &de.names {
+            let name = ident_name(ident).to_lowercase();
+            if !self.catalog.extension_installed(&name) {
+                if de.if_exists {
+                    continue;
+                }
+                return Err(SqlError::UndefinedObject(format!("extension \"{name}\"")));
+            }
+            let dependents = crate::sql::ext::dependent_tables(&self.catalog, &name);
+            if !dependents.is_empty() {
+                if matches!(de.cascade_or_restrict, Some(RA::Cascade)) {
+                    return Err(SqlError::FeatureNotSupported(format!(
+                        "DROP EXTENSION {name} CASCADE would drop columns of: {} — \
+                         drop or alter those tables first",
+                        dependents.join(", ")
+                    )));
+                }
+                return Err(SqlError::FeatureNotSupported(format!(
+                    "cannot drop extension {name} because other objects depend on it: {}",
+                    dependents.join(", ")
+                )));
+            }
+            self.catalog.uninstall_extension(&name);
+            self.catalog_dirty = true;
+        }
+        Ok(ExecResult::empty_command("DROP EXTENSION"))
     }
 }
 

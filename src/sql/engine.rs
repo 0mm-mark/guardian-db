@@ -58,6 +58,8 @@ pub struct Session<S: RelationalStorage> {
     txn: Option<Transaction>,
     session_id: SessionId,
     lock_timeout: Option<Duration>,
+    /// Session variables (`SET name = value`), including extension GUCs.
+    vars: HashMap<String, String>,
 }
 
 impl<S: RelationalStorage> Drop for Session<S> {
@@ -85,6 +87,7 @@ impl<S: RelationalStorage> Session<S> {
             txn: None,
             session_id,
             lock_timeout: None,
+            vars: HashMap::new(),
         }
     }
 
@@ -209,6 +212,7 @@ impl<S: RelationalStorage> Session<S> {
             self.db.locks.clone(),
             self.session_id,
         );
+        exec.vars = std::cell::RefCell::new(self.vars.clone());
         // Pre-materialize top-level CTEs.
         if let Statement::Query(q) = stmt
             && let Some(with) = &q.with
@@ -221,6 +225,8 @@ impl<S: RelationalStorage> Session<S> {
             }
         }
         let result = self.dispatch(&mut exec, stmt)?;
+        // Persist variable writes made during execution (e.g. `set_limit`).
+        self.vars = exec.vars.borrow().clone();
 
         // Acquire row / blocking-advisory locks queued during execution.
         let pending: Vec<_> = exec.pending_locks.borrow_mut().drain(..).collect();
@@ -292,25 +298,37 @@ impl<S: RelationalStorage> Session<S> {
         Ok(ExecResult::empty_command("LOCK TABLE"))
     }
 
-    /// Parse `SET lock_timeout = ...` (ms, `'Ns'`, or `'Nms'`); 0 disables it.
+    /// Observe `SET name = value`. `lock_timeout` feeds the lock manager; every
+    /// other variable (extension GUCs like `pg_trgm.similarity_threshold`,
+    /// application settings) is stored as a session variable readable via
+    /// `SHOW` / `current_setting()`.
     fn apply_set(&mut self, text: &str) {
-        let lower = text.to_ascii_lowercase();
-        if !lower.contains("lock_timeout") {
+        let body = text.trim().trim_end_matches(';');
+        let Some(eq) = body.find('=') else { return };
+        // "SET [LOCAL|SESSION] <name>" — take the last identifier before `=`.
+        let name = body[..eq]
+            .trim()
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or("")
+            .trim_matches('"')
+            .to_ascii_lowercase();
+        if name.is_empty() {
             return;
         }
-        if let Some(eq) = text.find('=') {
-            let raw = text[eq + 1..]
-                .trim()
-                .trim_end_matches(';')
-                .trim()
-                .trim_matches(|c| c == '\'' || c == '"');
-            let ms = parse_timeout_ms(raw);
+        let raw = body[eq + 1..]
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .to_string();
+        if name == "lock_timeout" {
+            let ms = parse_timeout_ms(&raw);
             self.lock_timeout = if ms == 0 {
                 None
             } else {
                 Some(Duration::from_millis(ms))
             };
         }
+        self.vars.insert(name, raw);
     }
 
     fn dispatch(&self, exec: &mut Exec, stmt: &Statement) -> Result<ExecResult> {
@@ -354,6 +372,34 @@ impl<S: RelationalStorage> Session<S> {
             } => exec.exec_drop(object_type, *if_exists, names, *cascade),
             Statement::Truncate(_) => exec.exec_truncate(stmt),
             Statement::Set(_) => Ok(ExecResult::empty_command("SET")),
+            Statement::CreateExtension(ce) => exec.exec_create_extension(ce),
+            Statement::DropExtension(de) => exec.exec_drop_extension(de),
+            Statement::ShowVariable { variable } => {
+                let name = variable
+                    .iter()
+                    .map(|i| crate::sql::names::ident_name(i).to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let value = exec
+                    .vars
+                    .borrow()
+                    .get(&name)
+                    .cloned()
+                    .or_else(|| crate::sql::ext::default_guc(&name).map(str::to_string))
+                    .or_else(|| builtin_show_default(&name));
+                match value {
+                    Some(v) => Ok(ExecResult::Rows {
+                        fields: vec![crate::sql::result::OutField::new(
+                            name.clone(),
+                            crate::relational::SqlType::Text,
+                        )],
+                        rows: vec![vec![crate::relational::SqlValue::Text(v)]],
+                    }),
+                    None => Err(SqlError::UndefinedObject(format!(
+                        "unrecognized configuration parameter \"{name}\""
+                    ))),
+                }
+            }
             other => self.dispatch_fallback(other),
         }
     }
@@ -656,6 +702,22 @@ fn map_lock_table_mode(mode: Option<sqlparser::ast::LockTableMode>) -> LockMode 
         Some(M::Exclusive) => LockMode::Exclusive,
         // PostgreSQL's default for LOCK TABLE with no mode is ACCESS EXCLUSIVE.
         Some(M::AccessExclusive) | None => LockMode::AccessExclusive,
+    }
+}
+
+/// Values `SHOW` reports for standard PostgreSQL parameters we do not track
+/// as session variables. Mirrors what the pgwire startup already advertises.
+fn builtin_show_default(name: &str) -> Option<String> {
+    match name {
+        "server_version" => Some("16.0 (GuardianDB)".to_string()),
+        "server_encoding" | "client_encoding" => Some("UTF8".to_string()),
+        "datestyle" => Some("ISO, MDY".to_string()),
+        "timezone" | "time_zone" => Some("UTC".to_string()),
+        "transaction_isolation" => Some("read committed".to_string()),
+        "standard_conforming_strings" => Some("on".to_string()),
+        "lock_timeout" => Some("0".to_string()),
+        "search_path" => Some("\"$user\", public".to_string()),
+        _ => None,
     }
 }
 

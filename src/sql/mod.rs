@@ -19,6 +19,7 @@ mod conv;
 mod ddl;
 mod dml;
 mod eval;
+pub mod ext;
 mod exec;
 mod funcs;
 pub mod lock;

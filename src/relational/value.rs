@@ -38,6 +38,11 @@ pub enum SqlValue {
     /// Covers both `json` and `jsonb`.
     Json(Json),
     Array(Vec<SqlValue>),
+    /// Case-insensitive text (`citext` extension). Stored and rendered verbatim;
+    /// compares and indexes case-insensitively.
+    Citext(String),
+    /// Fixed-dimension float vector (`vector` / pgvector extension).
+    Vector(Vec<f32>),
 }
 
 impl SqlValue {
@@ -71,6 +76,8 @@ impl SqlValue {
                 let inner = items.first().map(|v| v.type_of()).unwrap_or(SqlType::Text);
                 SqlType::Array(Box::new(inner))
             }
+            SqlValue::Citext(_) => SqlType::Citext,
+            SqlValue::Vector(v) => SqlType::Vector(Some(v.len() as u32)),
         }
     }
 
@@ -103,6 +110,16 @@ impl SqlValue {
             SqlValue::Timestamptz(ts) => Json::String(ts.to_rfc3339()),
             SqlValue::Json(v) => v.clone(),
             SqlValue::Array(items) => Json::Array(items.iter().map(|v| v.encode_json()).collect()),
+            SqlValue::Citext(s) => Json::String(s.clone()),
+            SqlValue::Vector(v) => Json::Array(
+                v.iter()
+                    .map(|f| {
+                        serde_json::Number::from_f64(*f as f64)
+                            .map(Json::Number)
+                            .unwrap_or(Json::Null)
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -171,6 +188,18 @@ impl SqlValue {
                 }
                 SqlValue::Array(items)
             }
+            SqlType::Citext => {
+                SqlValue::Citext(value.as_str().ok_or_else(|| bad("citext"))?.to_string())
+            }
+            SqlType::Vector(dims) => {
+                let arr = value.as_array().ok_or_else(|| bad("vector"))?;
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr {
+                    out.push(json_as_f64(item).ok_or_else(|| bad("vector"))? as f32);
+                }
+                check_vector_dims(&out, *dims)?;
+                SqlValue::Vector(out)
+            }
             SqlType::Unknown => SqlValue::Json(value.clone()),
         };
         Ok(out)
@@ -200,6 +229,8 @@ impl SqlValue {
             SqlValue::Timestamptz(ts) => ts.format("%Y-%m-%d %H:%M:%S%.f%:z").to_string(),
             SqlValue::Json(v) => v.to_string(),
             SqlValue::Array(items) => format_array(items),
+            SqlValue::Citext(s) => s.clone(),
+            SqlValue::Vector(v) => format_vector(v),
         };
         Some(s)
     }
@@ -247,6 +278,12 @@ impl SqlValue {
                 SqlValue::Json(serde_json::from_str(text).map_err(|_| bad())?)
             }
             SqlType::Array(inner) => parse_array_text(text, inner)?,
+            SqlType::Citext => SqlValue::Citext(text.to_string()),
+            SqlType::Vector(dims) => {
+                let v = parse_vector_text(text)?;
+                check_vector_dims(&v, *dims)?;
+                SqlValue::Vector(v)
+            }
             SqlType::Unknown => SqlValue::Text(text.to_string()),
         };
         Ok(out)
@@ -301,7 +338,7 @@ impl SqlValue {
 
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            SqlValue::Text(s) => Some(s),
+            SqlValue::Text(s) | SqlValue::Citext(s) => Some(s),
             _ => None,
         }
     }
@@ -311,6 +348,7 @@ impl SqlValue {
         match self {
             SqlValue::Null => "\u{0}null".to_string(),
             SqlValue::Text(s) => format!("s:{s}"),
+            SqlValue::Citext(s) => format!("s:{}", s.to_lowercase()),
             SqlValue::Bool(b) => format!("b:{b}"),
             SqlValue::Uuid(u) => format!("u:{u}"),
             v if v.type_of().is_numeric() => {
@@ -345,6 +383,20 @@ impl SqlValue {
         match (self, other) {
             (Bool(a), Bool(b)) => a.partial_cmp(b),
             (Text(a), Text(b)) => Some(a.cmp(b)),
+            // citext comparison is case-insensitive and wins over plain text
+            // (PostgreSQL: the citext side determines the comparison semantics).
+            (Citext(a), Citext(b)) | (Citext(a), Text(b)) | (Text(a), Citext(b)) => {
+                Some(a.to_lowercase().cmp(&b.to_lowercase()))
+            }
+            (Vector(a), Vector(b)) => {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    match x.partial_cmp(y) {
+                        Some(Ordering::Equal) => continue,
+                        other => return other,
+                    }
+                }
+                Some(a.len().cmp(&b.len()))
+            }
             (Uuid(a), Uuid(b)) => Some(a.cmp(b)),
             (Bytea(a), Bytea(b)) => Some(a.cmp(b)),
             (Date(a), Date(b)) => Some(a.cmp(b)),
@@ -446,6 +498,27 @@ impl SqlValue {
             SqlType::Text | SqlType::Varchar(_) | SqlType::Char(_) => {
                 SqlValue::Text(self.to_text().unwrap_or_default())
             }
+            SqlType::Citext => SqlValue::Citext(self.to_text().unwrap_or_default()),
+            SqlType::Vector(dims) => match self {
+                SqlValue::Vector(v) => {
+                    check_vector_dims(v, *dims)?;
+                    self.clone()
+                }
+                SqlValue::Text(s) | SqlValue::Citext(s) => {
+                    let v = parse_vector_text(s)?;
+                    check_vector_dims(&v, *dims)?;
+                    SqlValue::Vector(v)
+                }
+                SqlValue::Array(items) => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for it in items {
+                        v.push(it.as_f64().ok_or_else(|| bad(target))? as f32);
+                    }
+                    check_vector_dims(&v, *dims)?;
+                    SqlValue::Vector(v)
+                }
+                _ => return Err(bad(target)),
+            },
             SqlType::Json | SqlType::Jsonb => match self {
                 SqlValue::Json(_) => self.clone(),
                 SqlValue::Text(s) => {
@@ -714,6 +787,50 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+fn format_vector(v: &[f32]) -> String {
+    let mut out = String::from("[");
+    for (i, f) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format_float(*f as f64));
+    }
+    out.push(']');
+    out
+}
+
+fn parse_vector_text(text: &str) -> Result<Vec<f32>> {
+    let bad = || RelError::InvalidTextRepresentation {
+        ty: "vector".into(),
+        value: text.to_string(),
+    };
+    let inner = text
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(bad)?;
+    if inner.trim().is_empty() {
+        return Err(bad()); // PG: vector must have at least 1 dimension
+    }
+    inner
+        .split(',')
+        .map(|p| p.trim().parse::<f32>().map_err(|_| bad()))
+        .collect()
+}
+
+fn check_vector_dims(v: &[f32], dims: Option<u32>) -> Result<()> {
+    if let Some(d) = dims {
+        if v.len() as u32 != d {
+            return Err(RelError::DatatypeMismatch {
+                column: String::new(),
+                expected: format!("vector({d})"),
+                actual: format!("vector({})", v.len()),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, ()> {

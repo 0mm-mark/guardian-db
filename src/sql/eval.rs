@@ -403,6 +403,33 @@ impl Exec {
 
         let a = self.eval_inner(left, frames, aggs)?;
         let b = self.eval_inner(right, frames, aggs)?;
+        // Extension-owned operators first: pg_trgm text ops (`%`, `<->`, ...)
+        // and pgvector distance ops. `%` on non-numeric operands and the
+        // custom-operator tokens fall through to extension dispatch; numeric
+        // `%` stays ordinary modulo arithmetic.
+        {
+            let op_token = match op {
+                Modulo if !(a.type_of().is_numeric() && b.type_of().is_numeric()) => {
+                    Some("%".to_string())
+                }
+                Custom(t) => Some(t.clone()),
+                PGCustomBinaryOperator(parts) => Some(parts.join(".")),
+                Arrow => Some("->".to_string()),
+                _ => None,
+            };
+            // `->` belongs to JSON below; only divert genuinely unknown ones.
+            if let Some(tok) = op_token.filter(|t| t != "->") {
+                let ctx = crate::sql::ext::ExtCtx {
+                    now: self.now,
+                    vars: &self.vars,
+                };
+                if let Some(result) =
+                    crate::sql::ext::dispatch_operator(&self.catalog, &ctx, &tok, &a, &b)
+                {
+                    return result;
+                }
+            }
+        }
         match op {
             Plus | Minus | Multiply | Divide | Modulo | PGExp => arith(&a, op, &b),
             StringConcat => {

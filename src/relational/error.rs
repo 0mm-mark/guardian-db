@@ -88,6 +88,12 @@ pub enum RelError {
     #[error("object \"{0}\" does not exist")]
     UndefinedObject(String),
 
+    #[error("{0} already exists")]
+    DuplicateObject(String),
+
+    #[error("function {0} does not exist")]
+    UndefinedFunction(String),
+
     #[error("syntax error: {0}")]
     Syntax(String),
 
@@ -140,6 +146,8 @@ impl RelError {
             RelError::CannotCoerce { .. } => "42846",
             RelError::UndefinedType(_) => "42704",
             RelError::UndefinedObject(_) => "42704",
+            RelError::DuplicateObject(_) => "42710",
+            RelError::UndefinedFunction(_) => "42883",
             RelError::Syntax(_) => "42601",
             RelError::FeatureNotSupported(_) => "0A000",
             RelError::InvalidParameter(_) => "22023",

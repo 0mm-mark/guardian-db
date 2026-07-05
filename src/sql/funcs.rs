@@ -200,12 +200,52 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
             Some(v) if !v.is_null() => Text(v.to_text().unwrap_or_default()),
             _ => Null,
         },
-        "set_config" => args.get(1).cloned().unwrap_or(Null),
+        "current_setting" => {
+            let name = match args.first() {
+                Some(SqlValue::Text(s)) | Some(SqlValue::Citext(s)) => s.to_ascii_lowercase(),
+                _ => return Err(SqlError::InvalidParameter("current_setting: name".into())),
+            };
+            let missing_ok = matches!(args.get(1), Some(SqlValue::Bool(true)));
+            let value = exec
+                .vars
+                .borrow()
+                .get(&name)
+                .cloned()
+                .or_else(|| crate::sql::ext::default_guc(&name).map(str::to_string));
+            match value {
+                Some(v) => Text(v),
+                None if missing_ok => Null,
+                None => {
+                    return Err(SqlError::UndefinedObject(format!(
+                        "unrecognized configuration parameter \"{name}\""
+                    )));
+                }
+            }
+        }
+        "set_config" => {
+            let name = match args.first() {
+                Some(SqlValue::Text(s)) | Some(SqlValue::Citext(s)) => s.to_ascii_lowercase(),
+                _ => return Err(SqlError::InvalidParameter("set_config: name".into())),
+            };
+            let value = args
+                .get(1)
+                .and_then(SqlValue::to_text)
+                .unwrap_or_default();
+            exec.vars.borrow_mut().insert(name, value.clone());
+            Text(value)
+        }
         "pg_advisory_lock" | "pg_advisory_unlock" | "pg_notify" => Null,
         other => {
-            return Err(SqlError::FeatureNotSupported(format!(
-                "function {other} is not supported"
-            )));
+            let ctx = crate::sql::ext::ExtCtx {
+                now: exec.now,
+                vars: &exec.vars,
+            };
+            return match crate::sql::ext::dispatch_function(&exec.catalog, &ctx, other, &args) {
+                Some(result) => result,
+                None => Err(SqlError::FeatureNotSupported(format!(
+                    "function {other} is not supported"
+                ))),
+            };
         }
     };
     Ok(out)
