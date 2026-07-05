@@ -288,19 +288,29 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
                 now: exec.now,
                 vars: &exec.vars,
             };
-            return match crate::sql::ext::dispatch_function(&exec.catalog, &ctx, other, &args) {
-                Some(result) => result,
-                // Unknown function: 42883, like PostgreSQL. This is also what
-                // makes sidecar fallback-routing fire for functions that only
-                // exist on the PostgreSQL sidecar (PostGIS, TimescaleDB, ...).
-                None => Err(SqlError::UndefinedFunction(format!(
-                    "{other}({})",
-                    args.iter()
-                        .map(|a| a.type_of().name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))),
-            };
+            if let Some(result) =
+                crate::sql::ext::dispatch_function(&exec.catalog, &ctx, other, &args)
+            {
+                return result;
+            }
+            // User-defined functions are checked *after* builtins/extension
+            // functions, so a UDF can never shadow a core function — this is
+            // the only overload-resolution rule implemented (name+arity, not
+            // PostgreSQL's full per-argument-type resolution; see
+            // `Catalog::insert_function`).
+            if let Some(def) = exec.catalog.find_function(None, other, args.len()) {
+                return crate::sql::udf::call_function(exec, def, args);
+            }
+            // Unknown function: 42883, like PostgreSQL. This is also what
+            // makes sidecar fallback-routing fire for functions that only
+            // exist on the PostgreSQL sidecar (PostGIS, TimescaleDB, ...).
+            return Err(SqlError::UndefinedFunction(format!(
+                "{other}({})",
+                args.iter()
+                    .map(|a| a.type_of().name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
     };
     Ok(out)

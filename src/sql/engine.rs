@@ -560,6 +560,22 @@ impl<S: RelationalStorage> Session<S> {
             }
         }
         names.extend(policy_names);
+        // A called user-defined function's body can touch tables this
+        // statement's own text never mentions (e.g. `SELECT my_proc(1)` where
+        // `my_proc` is a PL/pgSQL function that updates some other table).
+        // Table loading is synchronous and preload-driven (see
+        // `crate::sql::exec`), so — rather than analyzing exactly which
+        // functions this statement calls, including transitively through
+        // other functions it calls — every user-defined function's body is
+        // scanned for table references whenever the catalog has any. Extra
+        // preloaded tables are harmless (unused entries in `Exec::tables`);
+        // the alternative (a precise call-graph analysis) risks a false
+        // "relation does not exist" for a table a called function needs.
+        for f in catalog.functions() {
+            for body_stmt in crate::sql::udf::body_statements(f) {
+                collect_stmt(&body_stmt, &mut names);
+            }
+        }
         let mut tables: HashMap<QualifiedName, LoadedTable> = HashMap::new();
         for (schema, name) in &names {
             if let Some(q) = catalog.resolve_table_name(schema.as_deref(), name)
@@ -616,7 +632,7 @@ impl<S: RelationalStorage> Session<S> {
         }
 
         // Commit or stage the produced mutations / catalog changes.
-        let mutations = std::mem::take(&mut exec.mutations);
+        let mutations = std::mem::take(&mut *exec.mutations.lock().unwrap());
         let catalog_dirty = exec.catalog_dirty;
         let new_catalog = exec.catalog;
         match &mut self.txn {
@@ -835,6 +851,8 @@ impl<S: RelationalStorage> Session<S> {
             Statement::DropPolicy(dp) => exec.exec_drop_policy(dp),
             Statement::CreateExtension(ce) => exec.exec_create_extension(ce),
             Statement::DropExtension(de) => exec.exec_drop_extension(de),
+            Statement::CreateFunction(cf) => exec.exec_create_function(cf),
+            Statement::DropFunction(df) => exec.exec_drop_function(df),
             Statement::ShowVariable { variable } => {
                 let name = variable
                     .iter()
@@ -866,9 +884,6 @@ impl<S: RelationalStorage> Session<S> {
             // generic fallback message. These arms serve the extended query
             // protocol; the simple protocol already rejects the same statements
             // by keyword prefix (see [`unsupported_by_prefix`]).
-            Statement::CreateFunction(_) => Err(SqlError::FeatureNotSupported(
-                "CREATE FUNCTION is not supported".into(),
-            )),
             Statement::CreateProcedure { .. } => Err(SqlError::FeatureNotSupported(
                 "CREATE PROCEDURE is not supported".into(),
             )),
@@ -1151,12 +1166,13 @@ fn unsupported_by_prefix(segment: &str) -> Option<&'static str> {
     let words = leading_keywords(segment, 4);
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
     match (w(0), w(1)) {
-        ("CREATE", "FUNCTION") => Some("CREATE FUNCTION"),
+        // CREATE FUNCTION is implemented (see `crate::sql::udf`) and parses
+        // cleanly under sqlparser 0.62's PostgreSQL dialect, so it is not
+        // rejected by prefix here.
         ("CREATE", "PROCEDURE") => Some("CREATE PROCEDURE"),
         ("CREATE", "TRIGGER") => Some("CREATE TRIGGER"),
         ("CREATE", "CONSTRAINT") if w(2) == "TRIGGER" => Some("CREATE TRIGGER"),
         ("CREATE", "OR") if w(2) == "REPLACE" => match w(3) {
-            "FUNCTION" => Some("CREATE FUNCTION"),
             "PROCEDURE" => Some("CREATE PROCEDURE"),
             "TRIGGER" => Some("CREATE TRIGGER"),
             _ => None,

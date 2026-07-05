@@ -24,7 +24,8 @@ pub mod types;
 pub mod value;
 
 pub use catalog::{
-    Catalog, CheckConstraint, Column, FIRST_USER_OID, ForeignKey, Index, Policy, PolicyCmd,
+    Catalog, CheckConstraint, Column, DropFunctionByName, FIRST_USER_OID, ForeignKey,
+    FunctionArgDef, FunctionDef, FunctionLanguage, FunctionVolatility, Index, Policy, PolicyCmd,
     PrimaryKey, QualifiedName, ReferentialAction, Schema, Sequence, Table, UniqueConstraint, View,
 };
 pub use error::{RelError, Result};

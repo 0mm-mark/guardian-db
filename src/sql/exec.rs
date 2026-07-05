@@ -13,7 +13,8 @@ use crate::sql::store::{LoadedTable, Mutation};
 use chrono::{DateTime, Utc};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, Mutex};
 
 /// A single name-resolution frame (an intermediate row + its schema).
 pub struct Frame<'a> {
@@ -31,8 +32,14 @@ pub struct Exec {
     pub params: Vec<SqlValue>,
     /// Statement timestamp used by `now()` / `current_timestamp`.
     pub now: DateTime<Utc>,
-    /// Accumulated storage mutations.
-    pub mutations: Vec<Mutation>,
+    /// Accumulated storage mutations. Shared (`Arc<Mutex<_>>` rather than a
+    /// plain field, so a user-defined function's body — invoked from deep
+    /// inside expression evaluation (`&Exec`, not `&mut Exec`; see
+    /// [`crate::sql::udf`]) — can record its own INSERT/UPDATE/DELETE effects
+    /// into the same accumulator the enclosing statement commits) needs
+    /// `Send` (recursive async handlers box statement futures as
+    /// `dyn Future + Send`), which rules out `Rc`/`RefCell`.
+    pub mutations: Arc<Mutex<Vec<Mutation>>>,
     /// Set when DDL changes the catalog.
     pub catalog_dirty: bool,
     /// CTE results in scope for the current query.
@@ -58,6 +65,12 @@ pub struct Exec {
     /// Row-security state for this statement (see [`crate::sql::rls`]).
     /// Empty (the default) means no enforcement applies.
     pub rls: crate::sql::rls::RlsContext,
+    /// User-defined-function call depth, shared across an entire statement's
+    /// call chain (including nested sub-[`Exec`]s built for each UDF
+    /// invocation; see [`crate::sql::udf::call_function`]) so self-recursion
+    /// is bounded regardless of how deep the Rust call stack for any single
+    /// invocation goes.
+    pub udf_depth: Arc<AtomicU32>,
 }
 
 impl Exec {
@@ -77,7 +90,7 @@ impl Exec {
             tables,
             params,
             now,
-            mutations: Vec::new(),
+            mutations: Arc::new(Mutex::new(Vec::new())),
             catalog_dirty: false,
             cte: HashMap::new(),
             database,
@@ -88,6 +101,7 @@ impl Exec {
             for_update_filter: None,
             vars: RefCell::new(HashMap::new()),
             rls: crate::sql::rls::RlsContext::default(),
+            udf_depth: Arc::new(AtomicU32::new(0)),
         }
     }
 

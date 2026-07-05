@@ -97,6 +97,20 @@ pub enum RelError {
     #[error("function {0} does not exist")]
     UndefinedFunction(String),
 
+    #[error("{0}")]
+    DuplicateFunction(String),
+
+    /// Ambiguous, unqualified `DROP FUNCTION name` when more than one
+    /// signature shares the name (SQLSTATE 42725).
+    #[error("{0}")]
+    AmbiguousFunction(String),
+
+    /// Structurally invalid `CREATE FUNCTION` (SQLSTATE 42P13), e.g. a
+    /// PL/pgSQL body whose control flow can fall off the end without a
+    /// `RETURN`, or a definition missing a required clause.
+    #[error("{0}")]
+    InvalidFunctionDefinition(String),
+
     #[error("syntax error: {0}")]
     Syntax(String),
 
@@ -112,6 +126,11 @@ pub enum RelError {
     /// self-reference appearing more than once or inside a subquery.
     #[error("{0}")]
     InvalidRecursion(String),
+
+    /// An uncaught PL/pgSQL `RAISE EXCEPTION` (SQLSTATE P0001, PostgreSQL's
+    /// `plpgsql_raise` default for a `RAISE` with no explicit `SQLSTATE`).
+    #[error("{0}")]
+    RaisedException(String),
 
     /// `OVER` attached to a function that is neither a window function nor an
     /// aggregate (SQLSTATE 42809).
@@ -185,10 +204,14 @@ impl RelError {
             RelError::UndefinedObject(_) => "42704",
             RelError::DuplicateObject(_) => "42710",
             RelError::UndefinedFunction(_) => "42883",
+            RelError::DuplicateFunction(_) => "42723",
+            RelError::AmbiguousFunction(_) => "42725",
+            RelError::InvalidFunctionDefinition(_) => "42P13",
             RelError::Syntax(_) => "42601",
             RelError::FeatureNotSupported(_) => "0A000",
             RelError::WindowingError(_) => "42P20",
             RelError::InvalidRecursion(_) => "42P19",
+            RelError::RaisedException(_) => "P0001",
             RelError::WrongObjectType(_) => "42809",
             RelError::StatementTooComplex(_) => "54001",
             RelError::InvalidParameter(_) => "22023",

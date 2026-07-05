@@ -405,6 +405,107 @@ Claims are ordinary session variables: `SET request.jwt.claims = '{"sub":
 to `current_setting('request.jwt.claims')` and the helpers above. The
 Supabase gateway injects them automatically per request.
 
+### User-defined functions (`CREATE FUNCTION`)
+
+`CREATE [OR REPLACE] FUNCTION` / `DROP FUNCTION` are implemented for two
+languages (see `src/sql/udf.rs`; behavioral tests in `tests/sql_functions.rs`).
+Trigger functions (`RETURNS trigger`) are out of scope for now — `CREATE
+TRIGGER` itself is not implemented — and are rejected at `CREATE FUNCTION`
+time with `0A000`.
+
+**`LANGUAGE SQL`**: the body is one or more `;`-separated plain SQL
+statements (`SELECT`/`INSERT`/`UPDATE`/`DELETE`). Arguments bind both
+positionally (`$1`, `$2`, ... exactly like a prepared statement — the same
+mechanism `Exec::param` already uses for bound query parameters) and by the
+declared parameter name, matching PostgreSQL (a SQL-language body may use
+either spelling, or both). All statements run in order; the function's
+result is the *last* statement's result (its first row's first column, or
+`NULL` if it produced no rows, or if the last statement was a
+`INSERT`/`UPDATE`/`DELETE` without rows to return) — this matches
+PostgreSQL, including running the earlier statements purely for their side
+effects.
+
+**`LANGUAGE plpgsql`**: a deliberately small, explicitly-bounded subset —
+enough for a non-trivial function or (later) trigger body, not full
+PL/pgSQL:
+
+| Supported | Rejected (typed `0A000`, naming the construct) |
+| --- | --- |
+| `DECLARE` locals with optional `:=`/`DEFAULT` defaults | `CURSOR` declarations → `"cursors"` |
+| `:=` assignment | — |
+| `IF ... THEN [ELSIF ... THEN ...] [ELSE ...] END IF` | — |
+| `RETURN [expr]` | — |
+| `RAISE [NOTICE\|WARNING\|EXCEPTION] 'msg'[, args]` | `RAISE ... USING` → `"RAISE ... USING"` |
+| Plain SQL statements (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) | any other statement kind (DDL, ...) inside a body → named after the statement (e.g. `"CREATE TABLE is not supported inside a function body"`) |
+| `IN` parameters (bound by name) | `OUT`/`INOUT`/`VARIADIC` parameters → `"OUT parameters"` / `"INOUT parameters"` / `"VARIADIC parameters"` |
+| — | `FOR`/`WHILE` loops, bare `LOOP` → `"FOR loop"` / `"WHILE loop"` / `"LOOP"` |
+| — | `EXCEPTION` handler blocks → `"EXCEPTION handler"` |
+| — | dynamic SQL (`EXECUTE`) → `"dynamic SQL (EXECUTE)"` |
+| — | nested `BEGIN`/`DECLARE` blocks → `"nested block"` |
+| — | `PERFORM`, cursor `OPEN`/`FETCH`/`CLOSE`, `GET DIAGNOSTICS` → named individually |
+| — | `RETURNS TABLE` / `RETURNS SETOF` → `"RETURNS TABLE"` / `"RETURNS SETOF"` |
+
+`STRICT` / `RETURNS NULL ON NULL INPUT` *is* honored (any `NULL` argument
+short-circuits to a `NULL` result without invoking the body); `SECURITY
+DEFINER`/`INVOKER` and `PARALLEL` are accepted and ignored (no privilege
+separation or parallel execution model exists to apply them to).
+
+**Argument binding**, matching PostgreSQL: `LANGUAGE SQL` bodies may use
+positional `$1`/`$2`/... (via `Exec::param`, the same mechanism a prepared
+statement's placeholders use) *or* the declared parameter name; PL/pgSQL
+bodies reference the declared parameter name (and `DECLARE`d locals) by name
+only — there is no `$n` in PL/pgSQL. By-name binding (both languages) is
+implemented by substituting each variable's *current value* as a literal
+directly into the statement/expression AST before it reaches the normal
+evaluator — so a variable always wins over a same-named table column.
+PostgreSQL's actual default (`plpgsql.variable_conflict`) is stricter
+(errors on the ambiguity); this repo does not model per-session GUCs for
+it, so unqualified shadowing is a deliberate, documented simplification.
+
+**Deliberate divergence from PostgreSQL — DDL-time validation.**
+PostgreSQL does not validate a PL/pgSQL function body's structure at
+`CREATE FUNCTION` time (that requires the separate `plpgsql_check`
+extension); a function with a typo or an unsupported construct is only
+discovered when it is first *called*. This repo's truthfulness contract
+requires every construct to either work or fail typed immediately, so
+GuardianDB parses and validates the full body — including the fixed
+unsupported-construct list above, and a static check that every control-flow
+path ends in `RETURN` (PostgreSQL's own "control reached end of function
+without RETURN", `42P13`, which real PostgreSQL only raises when it is
+actually reached at runtime) — at `CREATE FUNCTION` time instead. A broken
+function can therefore never silently exist in the catalog.
+
+**Overload resolution** is name+arity only, not PostgreSQL's full
+per-argument-type resolution: two `CREATE FUNCTION`s with the same name and
+argument *count* are the same signature regardless of declared argument
+*types* (a second one without `OR REPLACE` is `42723`; call dispatch — see
+`funcs::call_scalar` — can only disambiguate by arity anyway). User-defined
+functions are looked up *after* every builtin and extension function, so a
+UDF can never shadow a core function.
+
+**Recursion.** Direct self-recursion is supported, with a bounded call-depth
+guard (25 calls) shared across an entire statement's UDF call chain
+(including calls through other user-defined functions, not just literal
+self-calls) — exceeding it is SQLSTATE `54001` (`statement_too_complex`),
+the same code PostgreSQL's own stack-depth guard reports and this engine's
+`WITH RECURSIVE` iteration cap already reuses. Unlike that iteration cap
+(which bounds a `loop`, not stack depth), each nested UDF call recurses on
+the real Rust call stack (re-parsing and re-evaluating the callee) through
+several stack frames per level (parser, evaluator, statement executor) —
+measured empirically against unoptimized (`dev` profile) builds, since debug
+frames are much larger than release ones — so 25 is sized to stay well
+under a worker thread's stack budget (e.g. Tokio's 2 MiB default worker
+stack) rather than to mirror PostgreSQL's own
+`max_stack_depth` default.
+
+**`pg_proc`** reflects every created function: `proname`, `pronamespace`,
+`prolang` (`sql`/`plpgsql`), `provolatile` (`i`/`s`/`v`), `proisstrict`,
+`prorettype`, `pronargs`, `proargtypes` (space-separated type OIDs), `prosrc`
+(the raw body text). `IMMUTABLE`/`STABLE`/`VOLATILE` are parsed, stored and
+introspectable, but — like the rest of this engine — nothing plans or
+caches differently based on volatility; it is truthfully reported, not
+acted on.
+
 ---
 
 ## 6. Extensions
@@ -606,7 +707,8 @@ Each gap has a conformance test in `tests/sql_conformance.rs`
 | `WITH` inside a subquery             | ✗      | error `0A000` (top-level `WITH` ok)    |
 | `COPY` (bulk load)                   | ✗      | error `0A000` (no CopyIn/Out framing)  |
 | Materialized views                   | ✗      | error `0A000`                          |
-| `CREATE FUNCTION` / `CREATE PROCEDURE` / `CREATE TRIGGER` / `DROP TRIGGER` | ✗ | error `0A000` for **every** spelling — detected by keyword prefix before the parser, since sqlparser 0.62 parses only some forms (which would otherwise leak `42601`) |
+| `CREATE FUNCTION` (`LANGUAGE SQL` / `plpgsql` subset) | ✓ | see §5 "User-defined functions" for the exact PL/pgSQL subset and its typed `0A000` exclusions |
+| `CREATE PROCEDURE` / `CREATE TRIGGER` / `DROP TRIGGER` | ✗ | error `0A000` for **every** spelling — detected by keyword prefix before the parser, since sqlparser 0.62 parses only some forms (which would otherwise leak `42601`); `CREATE FUNCTION ... RETURNS trigger` is rejected the same way |
 | Full-text search                     | ✗      | error `0A000` — the function family (`to_tsvector`, `to_tsquery`, `plainto_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery`, `ts_rank`, `ts_rank_cd`, `ts_headline`, `setweight`, `ts_delete`, `tsvector_to_array`) is *named*-unsupported (never `42883`, so it is never sidecar-routed), and `@@` is an unsupported operator; the `tsvector`/`tsquery` types are `42704` |
 | Generated/computed columns           | ✗      | ignored test                           |
 | `SAVEPOINT` partial rollback         | partial| `SAVEPOINT`/`RELEASE` no-op; `ROLLBACK TO` collapses to full rollback |

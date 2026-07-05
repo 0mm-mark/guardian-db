@@ -683,17 +683,39 @@ async fn copy_not_supported_by_engine() {
 }
 
 #[tokio::test]
-async fn create_function_unsupported() {
+async fn create_function_basic_forms_now_supported() {
+    // `CREATE FUNCTION` is implemented (see `guardian_db::sql::udf` and
+    // `tests/sql_functions.rs` for the full behavioral test suite); this test
+    // only pins that the basic forms parse and execute, since this file used
+    // to pin them as a blanket 0A000 rejection.
     let mut s = session().await;
-    // Stable 0A000 for every spelling, including the ones sqlparser cannot
-    // parse (keyword-prefix detection runs before the parser).
-    for sql in [
+    ok(
+        &mut s,
         "CREATE FUNCTION add(a int, b int) RETURNS int AS 'select a + b' LANGUAGE sql",
+    )
+    .await;
+    assert_eq!(scalar_i64(&mut s, "SELECT add(2, 3)").await, 5);
+    ok(
+        &mut s,
         "CREATE OR REPLACE FUNCTION add(a int, b int) RETURNS int AS 'select a + b' LANGUAGE sql",
-        "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
-    ] {
-        assert_eq!(err_code(&mut s, sql).await, "0A000", "for `{sql}`");
-    }
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn create_function_trigger_return_type_unsupported() {
+    // Trigger functions (`RETURNS trigger`) are out of scope: `CREATE
+    // TRIGGER` itself is not implemented (see `create_trigger_unsupported`),
+    // and PL/pgSQL's `NEW`/`OLD` magic variables are not modeled.
+    let mut s = session().await;
+    assert_eq!(
+        err_code(
+            &mut s,
+            "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql"
+        )
+        .await,
+        "0A000"
+    );
 }
 
 #[tokio::test]

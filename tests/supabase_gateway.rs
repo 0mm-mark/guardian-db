@@ -377,6 +377,34 @@ async fn rest_rpc_scalar_function() {
     );
 }
 
+/// `/rpc/{name}` transparently reaches user-defined functions too: it just
+/// compiles to `SELECT name(args...)` over the same SQL engine that resolves
+/// `CREATE FUNCTION`-registered functions (see `guardian_db::sql::udf`).
+#[tokio::test]
+async fn rest_rpc_calls_user_defined_function() {
+    let h = harness().await;
+    let mut s = Session::new(h.db.clone(), "postgres");
+    s.execute("CREATE FUNCTION add_one(n int) RETURNS int LANGUAGE SQL AS $$ SELECT $1 + 1 $$")
+        .await
+        .unwrap();
+
+    let (status, _h, body) = call(
+        &h.app,
+        "POST",
+        "/rest/v1/rpc/add_one",
+        Some(&h.anon),
+        None,
+        None,
+        Some(json!({"n": 41})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body.to_string().contains("42"),
+        "rpc add_one(41) should return 42: {body}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
