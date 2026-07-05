@@ -281,6 +281,18 @@ impl Catalog {
         self.extensions.remove(name).is_some()
     }
 
+    /// Update the stored version of an installed extension (`ALTER EXTENSION
+    /// ... UPDATE`). Returns `false` if the extension is not installed.
+    pub fn set_extension_version(&mut self, name: &str, version: &str) -> bool {
+        match self.extensions.get_mut(name) {
+            Some(v) => {
+                *v = version.to_string();
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn allocate_oid(&mut self) -> u32 {
         let oid = self.next_oid;
         self.next_oid += 1;

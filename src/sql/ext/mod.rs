@@ -14,6 +14,7 @@
 //! function-dispatch miss costs one short scan, which is noise next to the
 //! per-statement table loads.
 
+pub mod alter;
 pub mod citext;
 pub mod fuzzystrmatch;
 pub mod pg_trgm;
