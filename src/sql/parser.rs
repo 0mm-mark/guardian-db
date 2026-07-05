@@ -7,7 +7,63 @@ use sqlparser::parser::Parser;
 
 /// Parse a SQL string (possibly containing multiple `;`-separated statements).
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
-    Parser::parse_sql(&PostgreSqlDialect {}, sql).map_err(parse_error)
+    Parser::parse_sql(&PostgreSqlDialect {}, sql).or_else(|first_err| {
+        // PostgreSQL treats WITH as an optional noise word in
+        // `CREATE EXTENSION name [WITH] [SCHEMA ..] [VERSION ..] [CASCADE]`;
+        // sqlparser 0.62 requires it. On a parse error only, retry with the
+        // noise word inserted — everything that already parses is untouched.
+        let mut changed = false;
+        let retried: Vec<String> = split_statements(sql)
+            .into_iter()
+            .map(|seg| match normalize_create_extension(&seg) {
+                Some(fixed) => {
+                    changed = true;
+                    fixed
+                }
+                None => seg,
+            })
+            .collect();
+        if !changed {
+            return Err(parse_error(first_err));
+        }
+        Parser::parse_sql(&PostgreSqlDialect {}, &retried.join(";"))
+            .map_err(|_| parse_error(first_err))
+    })
+}
+
+/// Insert the `WITH` noise word into a `CREATE EXTENSION` statement whose
+/// options begin without it (`CREATE EXTENSION x CASCADE` — valid PostgreSQL,
+/// unparseable by sqlparser 0.62). Returns `None` when the statement is not
+/// that shape.
+fn normalize_create_extension(stmt: &str) -> Option<String> {
+    let mut tokens: Vec<(usize, &str)> = Vec::new();
+    let mut pos = 0;
+    for tok in stmt.split_whitespace() {
+        let start = stmt[pos..].find(tok)? + pos;
+        tokens.push((start, tok));
+        pos = start + tok.len();
+    }
+    let word = |i: usize, w: &str| {
+        tokens
+            .get(i)
+            .is_some_and(|(_, t)| t.eq_ignore_ascii_case(w))
+    };
+    if !(word(0, "CREATE") && word(1, "EXTENSION")) {
+        return None;
+    }
+    let mut i = 2;
+    if word(i, "IF") && word(i + 1, "NOT") && word(i + 2, "EXISTS") {
+        i += 3;
+    }
+    // tokens[i] is the extension name; the option list follows.
+    let (offset, first_option) = *tokens.get(i + 1)?;
+    if ["SCHEMA", "VERSION", "CASCADE"]
+        .iter()
+        .any(|w| first_option.eq_ignore_ascii_case(w))
+    {
+        return Some(format!("{}WITH {}", &stmt[..offset], &stmt[offset..]));
+    }
+    None
 }
 
 /// Parse a single scalar expression (used for stored expression texts such as
@@ -152,6 +208,28 @@ mod tests {
     fn parse_error_is_syntax() {
         let err = parse_sql("SELEKT 1").unwrap_err();
         assert_eq!(err.sqlstate(), "42601");
+    }
+
+    #[test]
+    fn create_extension_without_with_noise_word_parses() {
+        // PostgreSQL's optional WITH: sqlparser 0.62 needs it inserted.
+        for sql in [
+            "CREATE EXTENSION earthdistance CASCADE",
+            "CREATE EXTENSION IF NOT EXISTS earthdistance CASCADE",
+            "create extension pg_trgm version '1.6'",
+            "SELECT 1; CREATE EXTENSION cube CASCADE; SELECT 2",
+        ] {
+            assert!(parse_sql(sql).is_ok(), "{sql}");
+        }
+        // The canonical spellings keep parsing, and non-CREATE-EXTENSION
+        // errors surface unchanged.
+        assert!(parse_sql("CREATE EXTENSION x WITH SCHEMA public CASCADE").is_ok());
+        assert_eq!(
+            parse_sql("CREATE EXTENSION x FROBNICATE")
+                .unwrap_err()
+                .sqlstate(),
+            "42601"
+        );
     }
 
     #[test]
