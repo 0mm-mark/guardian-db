@@ -60,6 +60,9 @@ pub enum RelError {
         detail: String,
     },
 
+    #[error("cannot drop {object} because other objects depend on it")]
+    DependentObjectsStillExist { object: String, detail: String },
+
     #[error("new row for relation \"{table}\" violates check constraint \"{constraint}\"")]
     CheckViolation { table: String, constraint: String },
 
@@ -88,6 +91,12 @@ pub enum RelError {
     #[error("object \"{0}\" does not exist")]
     UndefinedObject(String),
 
+    #[error("{0} already exists")]
+    DuplicateObject(String),
+
+    #[error("function {0} does not exist")]
+    UndefinedFunction(String),
+
     #[error("syntax error: {0}")]
     Syntax(String),
 
@@ -99,6 +108,11 @@ pub enum RelError {
 
     #[error("constraint \"{0}\" is invalid")]
     InvalidConstraint(String),
+
+    /// Permission denied (SQLSTATE 42501). Carries the full PostgreSQL-shaped
+    /// message, e.g. `new row violates row-level security policy for table "t"`.
+    #[error("{0}")]
+    InsufficientPrivilege(String),
 
     #[error("deadlock detected")]
     DeadlockDetected { detail: String },
@@ -114,11 +128,19 @@ pub enum RelError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// An error carrying an explicit SQLSTATE: either reported verbatim by
+    /// the PostgreSQL sidecar runtime, or a local error re-tagged during
+    /// sidecar routing (e.g. to append a routing hint without changing the
+    /// code). `sqlstate` is validated to be 5 alphanumeric ASCII characters
+    /// at construction.
+    #[error("{message}")]
+    Sidecar { sqlstate: String, message: String },
 }
 
 impl RelError {
     /// The 5-character SQLSTATE code for this error.
-    pub fn sqlstate(&self) -> &'static str {
+    pub fn sqlstate(&self) -> &str {
         match self {
             RelError::UndefinedTable(_) => "42P01",
             RelError::DuplicateTable(_) => "42P07",
@@ -132,6 +154,7 @@ impl RelError {
             RelError::NotNullViolation { .. } => "23502",
             RelError::ForeignKeyViolation { .. } => "23503",
             RelError::ForeignKeyViolationReferenced { .. } => "23503",
+            RelError::DependentObjectsStillExist { .. } => "2BP01",
             RelError::CheckViolation { .. } => "23514",
             RelError::DatatypeMismatch { .. } => "42804",
             RelError::InvalidTextRepresentation { .. } => "22P02",
@@ -140,15 +163,19 @@ impl RelError {
             RelError::CannotCoerce { .. } => "42846",
             RelError::UndefinedType(_) => "42704",
             RelError::UndefinedObject(_) => "42704",
+            RelError::DuplicateObject(_) => "42710",
+            RelError::UndefinedFunction(_) => "42883",
             RelError::Syntax(_) => "42601",
             RelError::FeatureNotSupported(_) => "0A000",
             RelError::InvalidParameter(_) => "22023",
             RelError::InvalidConstraint(_) => "42P10",
+            RelError::InsufficientPrivilege(_) => "42501",
             RelError::DeadlockDetected { .. } => "40P01",
             RelError::LockNotAvailable(_) => "55P03",
             RelError::InFailedTransaction => "25P02",
             RelError::Storage(_) => "58030",
             RelError::Internal(_) => "XX000",
+            RelError::Sidecar { sqlstate, .. } => sqlstate,
         }
     }
 

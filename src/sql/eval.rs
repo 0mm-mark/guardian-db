@@ -403,6 +403,61 @@ impl Exec {
 
         let a = self.eval_inner(left, frames, aggs)?;
         let b = self.eval_inner(right, frames, aggs)?;
+        // Extension-owned operators first: pg_trgm text ops (`%`, `<->`, ...),
+        // pgvector distances, and the hstore/intarray/ltree/cube operator
+        // sets. Tokens are only produced when the operand shapes could belong
+        // to an extension (numeric `%` stays modulo, text `||` stays concat,
+        // JSON `->` keeps its own path); dispatch_operator additionally gates
+        // on the owning extension being installed and returns `None`
+        // otherwise, so unclaimed operators keep their normal error paths.
+        {
+            let hstore_side = matches!(a, SqlValue::HStore(_)) || matches!(b, SqlValue::HStore(_));
+            let ltree_side = matches!(a, SqlValue::Ltree(_)) || matches!(b, SqlValue::Ltree(_));
+            let array_side = matches!(a, SqlValue::Array(_)) || matches!(b, SqlValue::Array(_));
+            let ext_shaped = hstore_side
+                || array_side
+                || matches!(a, SqlValue::Cube { .. })
+                || matches!(b, SqlValue::Cube { .. });
+            let op_token = match op {
+                Modulo if !(a.type_of().is_numeric() && b.type_of().is_numeric()) => {
+                    Some("%".to_string())
+                }
+                Custom(t) => Some(t.clone()),
+                PGCustomBinaryOperator(parts) => Some(parts.join(".")),
+                LtDashGt => Some("<->".to_string()),
+                Spaceship
+                    if matches!(a, SqlValue::Vector(_)) || matches!(b, SqlValue::Vector(_)) =>
+                {
+                    Some("<=>".to_string())
+                }
+                // `->` with an hstore left operand is the hstore key lookup;
+                // JSON `->` (any other left operand) is untouched.
+                Arrow if matches!(a, SqlValue::HStore(_)) => Some("->".to_string()),
+                AtArrow => Some("@>".to_string()),
+                ArrowAt => Some("<@".to_string()),
+                PGOverlap => Some("&&".to_string()),
+                Question => Some("?".to_string()),
+                PGRegexMatch if ltree_side => Some("~".to_string()),
+                StringConcat if hstore_side => Some("||".to_string()),
+                Plus if ext_shaped => Some("+".to_string()),
+                Minus if ext_shaped => Some("-".to_string()),
+                BitwiseOr if array_side => Some("|".to_string()),
+                BitwiseAnd if array_side => Some("&".to_string()),
+                PGBitwiseXor if array_side => Some("#".to_string()),
+                _ => None,
+            };
+            if let Some(tok) = op_token {
+                let ctx = crate::sql::ext::ExtCtx {
+                    now: self.now,
+                    vars: &self.vars,
+                };
+                if let Some(result) =
+                    crate::sql::ext::dispatch_operator(&self.catalog, &ctx, &tok, &a, &b)
+                {
+                    return result;
+                }
+            }
+        }
         match op {
             Plus | Minus | Multiply | Divide | Modulo | PGExp => arith(&a, op, &b),
             StringConcat => {
@@ -621,13 +676,7 @@ impl Exec {
         frames: &[Frame],
         aggs: Option<&HashMap<String, SqlValue>>,
     ) -> Result<SqlValue> {
-        let name = func
-            .name
-            .0
-            .last()
-            .and_then(|p| p.as_ident())
-            .map(ident_name)
-            .unwrap_or_default();
+        let name = crate::sql::names::function_dispatch_name(&func.name);
         if funcs::is_aggregate(&name) {
             if let Some(map) = aggs {
                 let key = func.to_string();
