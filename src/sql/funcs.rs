@@ -241,8 +241,15 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
             };
             return match crate::sql::ext::dispatch_function(&exec.catalog, &ctx, other, &args) {
                 Some(result) => result,
-                None => Err(SqlError::FeatureNotSupported(format!(
-                    "function {other} is not supported"
+                // Unknown function: 42883, like PostgreSQL. This is also what
+                // makes sidecar fallback-routing fire for functions that only
+                // exist on the PostgreSQL sidecar (PostGIS, TimescaleDB, ...).
+                None => Err(SqlError::UndefinedFunction(format!(
+                    "{other}({})",
+                    args.iter()
+                        .map(|a| a.type_of().name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ))),
             };
         }

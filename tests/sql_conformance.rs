@@ -111,7 +111,12 @@ async fn full_text_search_unsupported() {
         "SELECT * FROM t WHERE to_tsvector(body) @@ to_tsquery('cat')",
     )
     .await;
-    assert!(code == "0A000" || code == "42601", "got {code}");
+    // 42883: unknown functions fail like PostgreSQL's undefined_function
+    // (which also lets a configured PostgreSQL sidecar serve them).
+    assert!(
+        code == "0A000" || code == "42601" || code == "42883",
+        "got {code}"
+    );
 }
 
 // ---------------------------------------------------------------------------

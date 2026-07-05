@@ -60,6 +60,9 @@ pub struct Session<S: RelationalStorage> {
     lock_timeout: Option<Duration>,
     /// Session variables (`SET name = value`), including extension GUCs.
     vars: HashMap<String, String>,
+    /// Lazily pinned connection to the PostgreSQL sidecar runtime (closed
+    /// when the session drops, ending the backend session with it).
+    sidecar: Option<crate::sql::ext::sidecar::SidecarConn>,
 }
 
 impl<S: RelationalStorage> Drop for Session<S> {
@@ -88,6 +91,7 @@ impl<S: RelationalStorage> Session<S> {
             session_id,
             lock_timeout: None,
             vars: HashMap::new(),
+            sidecar: None,
         }
     }
 
@@ -187,7 +191,7 @@ impl<S: RelationalStorage> Session<S> {
             self.apply_set(&stmt.to_string());
         }
 
-        let outcome = self.execute_inner(stmt, params).await;
+        let outcome = self.execute_routed(stmt, params).await;
         if outcome.is_err() {
             // Any error inside an explicit transaction aborts it (PostgreSQL);
             // an autocommit statement releases the locks it took.
@@ -197,6 +201,212 @@ impl<S: RelationalStorage> Session<S> {
             }
         }
         outcome
+    }
+
+    /// Sidecar-aware execution wrapper. Routing rules (see
+    /// `docs/postgres-compat.md`):
+    ///
+    /// 1. `CREATE EXTENSION` of a sidecar-strategy extension is forwarded to
+    ///    the configured sidecar and recorded in the local catalog with the
+    ///    version the sidecar reports.
+    /// 2. `DROP EXTENSION` naming a sidecar-bound extension forwards the drop
+    ///    before removing the local record.
+    /// 3. A statement that fails locally with undefined function/type/table
+    ///    is forwarded verbatim when a sidecar DSN is configured — autocommit
+    ///    only: inside an explicit transaction the local error is kept with a
+    ///    hint, because the sidecar cannot join a local transaction.
+    async fn execute_routed(
+        &mut self,
+        stmt: &Statement,
+        params: &[SqlValue],
+    ) -> Result<ExecResult> {
+        use crate::sql::ext::RuntimeStrategy;
+        if let Statement::CreateExtension(ce) = stmt {
+            let name = crate::sql::names::ident_name(&ce.name).to_lowercase();
+            if let Some(def) = crate::sql::ext::find(&name)
+                && def.strategy == RuntimeStrategy::SidecarPostgres
+            {
+                return self.sidecar_create_extension(stmt, ce, def).await;
+            }
+        }
+        if let Statement::DropExtension(de) = stmt {
+            let catalog = match &self.txn {
+                Some(txn) => txn.catalog.clone(),
+                None => self.load_catalog().await?,
+            };
+            let any_sidecar = de.names.iter().any(|ident| {
+                catalog.extension_is_sidecar(&crate::sql::names::ident_name(ident).to_lowercase())
+            });
+            if any_sidecar {
+                return self.sidecar_drop_extension(de, catalog).await;
+            }
+        }
+        match self.execute_inner(stmt, params).await {
+            Err(e) if sidecar_routable(&e) && self.sidecar_dsn().is_some() => {
+                if self.in_transaction() {
+                    Err(with_sidecar_txn_hint(e))
+                } else if params.is_empty() {
+                    // The failed statement's autocommit locks are still held.
+                    self.db.locks.release_transaction(self.session_id);
+                    let mut results = self.sidecar_exec(&stmt.to_string()).await?;
+                    results
+                        .pop()
+                        .ok_or_else(|| SqlError::Storage("sidecar returned no result".into()))
+                } else {
+                    // Bound parameters cannot be forwarded as verbatim text.
+                    Err(e)
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// `CREATE EXTENSION` of a sidecar-strategy extension: forward verbatim,
+    /// then record the install locally with the version the sidecar reports.
+    async fn sidecar_create_extension(
+        &mut self,
+        stmt: &Statement,
+        ce: &sqlparser::ast::CreateExtension,
+        def: &'static crate::sql::ext::ExtensionDef,
+    ) -> Result<ExecResult> {
+        let mut catalog = match &self.txn {
+            Some(txn) => txn.catalog.clone(),
+            None => self.load_catalog().await?,
+        };
+        if catalog.extension_installed(def.name) {
+            if ce.if_not_exists {
+                return Ok(ExecResult::empty_command("CREATE EXTENSION"));
+            }
+            return Err(SqlError::DuplicateObject(format!(
+                "extension \"{}\"",
+                def.name
+            )));
+        }
+        if self.in_transaction() {
+            return Err(SqlError::FeatureNotSupported(format!(
+                "CREATE EXTENSION {} cannot run inside a transaction block — the \
+                 PostgreSQL sidecar cannot join a local transaction",
+                def.name
+            )));
+        }
+        if self.sidecar_dsn().is_none() {
+            return Err(crate::sql::ext::sidecar_unconfigured(def.name));
+        }
+        self.sidecar_exec(&stmt.to_string()).await?;
+        let version = self
+            .sidecar_scalar(&format!(
+                "SELECT extversion FROM pg_extension WHERE extname = '{}'",
+                def.name
+            ))
+            .await?
+            .unwrap_or_else(|| def.default_version.to_string());
+        catalog.install_sidecar_extension(def.name, &version);
+        self.persist_catalog(catalog).await?;
+        Ok(ExecResult::empty_command("CREATE EXTENSION"))
+    }
+
+    /// `DROP EXTENSION` where at least one name is sidecar-bound: forward each
+    /// sidecar drop, apply native semantics to the rest, then persist.
+    async fn sidecar_drop_extension(
+        &mut self,
+        de: &sqlparser::ast::DropExtension,
+        mut catalog: Catalog,
+    ) -> Result<ExecResult> {
+        use sqlparser::ast::ReferentialAction as RA;
+        if self.in_transaction() {
+            return Err(SqlError::FeatureNotSupported(
+                "DROP EXTENSION of a sidecar-bound extension cannot run inside a \
+                 transaction block — the PostgreSQL sidecar cannot join a local \
+                 transaction"
+                    .into(),
+            ));
+        }
+        for ident in &de.names {
+            let name = crate::sql::names::ident_name(ident).to_lowercase();
+            if catalog.extension_is_sidecar(&name) {
+                if self.sidecar_dsn().is_none() {
+                    return Err(crate::sql::ext::sidecar_unconfigured(&name));
+                }
+                let mut forward = String::from("DROP EXTENSION ");
+                if de.if_exists {
+                    forward.push_str("IF EXISTS ");
+                }
+                forward.push('"');
+                forward.push_str(&name);
+                forward.push('"');
+                match de.cascade_or_restrict {
+                    Some(RA::Cascade) => forward.push_str(" CASCADE"),
+                    Some(RA::Restrict) => forward.push_str(" RESTRICT"),
+                    _ => {}
+                }
+                self.sidecar_exec(&forward).await?;
+                catalog.uninstall_extension(&name);
+            } else {
+                crate::sql::ext::drop_native_extension(
+                    &mut catalog,
+                    &name,
+                    de.if_exists,
+                    de.cascade_or_restrict,
+                )?;
+            }
+        }
+        self.persist_catalog(catalog).await?;
+        Ok(ExecResult::empty_command("DROP EXTENSION"))
+    }
+
+    /// The configured sidecar DSN: the `guardian.sidecar_dsn` session variable
+    /// wins; the `GUARDIAN_PG_SIDECAR_DSN` environment variable is the
+    /// fallback. Empty values mean "not configured".
+    fn sidecar_dsn(&self) -> Option<String> {
+        if let Some(v) = self.vars.get("guardian.sidecar_dsn") {
+            let v = v.trim();
+            if v.is_empty() {
+                return None; // SET guardian.sidecar_dsn = '' disables routing
+            }
+            return Some(v.to_string());
+        }
+        std::env::var("GUARDIAN_PG_SIDECAR_DSN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// Run `sql` on the pinned sidecar connection, connecting lazily and
+    /// reconnecting when the DSN changed or the previous connection broke.
+    async fn sidecar_exec(&mut self, sql: &str) -> Result<Vec<ExecResult>> {
+        let dsn = self
+            .sidecar_dsn()
+            .ok_or_else(|| crate::sql::ext::sidecar_unconfigured("(sidecar)"))?;
+        let reusable = self
+            .sidecar
+            .as_ref()
+            .map(|c| c.dsn() == dsn && !c.is_broken())
+            .unwrap_or(false);
+        if !reusable {
+            self.sidecar = Some(crate::sql::ext::sidecar::SidecarConn::connect(&dsn).await?);
+        }
+        let conn = self
+            .sidecar
+            .as_mut()
+            .expect("sidecar connection just pinned");
+        let result = conn.simple_query(sql).await;
+        if conn.is_broken() {
+            self.sidecar = None;
+        }
+        result
+    }
+
+    /// First column of the first row of a sidecar query, as text.
+    async fn sidecar_scalar(&mut self, sql: &str) -> Result<Option<String>> {
+        for result in self.sidecar_exec(sql).await? {
+            if let ExecResult::Rows { rows, .. } = result {
+                return Ok(rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(|v| v.to_text()));
+            }
+        }
+        Ok(None)
     }
 
     async fn execute_inner(&mut self, stmt: &Statement, params: &[SqlValue]) -> Result<ExecResult> {
@@ -699,6 +909,28 @@ impl<S: RelationalStorage> Session<S> {
             }
         }
         Ok(())
+    }
+}
+
+/// Errors eligible for sidecar fallback-forwarding: the statement referenced
+/// a function, type or relation the local engine does not have (typically
+/// objects provided by a sidecar-routed extension).
+fn sidecar_routable(e: &SqlError) -> bool {
+    matches!(
+        e,
+        SqlError::UndefinedFunction(_) | SqlError::UndefinedType(_) | SqlError::UndefinedTable(_)
+    )
+}
+
+/// Keep the local error (same SQLSTATE, same message) but explain why it was
+/// not forwarded to the sidecar.
+fn with_sidecar_txn_hint(e: SqlError) -> SqlError {
+    SqlError::Sidecar {
+        sqlstate: e.sqlstate().to_string(),
+        message: format!(
+            "{e} — hint: statements are not forwarded to the PostgreSQL sidecar inside a \
+             transaction block (sidecar routing is autocommit-only)"
+        ),
     }
 }
 

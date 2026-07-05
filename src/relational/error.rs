@@ -120,11 +120,19 @@ pub enum RelError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// An error carrying an explicit SQLSTATE: either reported verbatim by
+    /// the PostgreSQL sidecar runtime, or a local error re-tagged during
+    /// sidecar routing (e.g. to append a routing hint without changing the
+    /// code). `sqlstate` is validated to be 5 alphanumeric ASCII characters
+    /// at construction.
+    #[error("{message}")]
+    Sidecar { sqlstate: String, message: String },
 }
 
 impl RelError {
     /// The 5-character SQLSTATE code for this error.
-    pub fn sqlstate(&self) -> &'static str {
+    pub fn sqlstate(&self) -> &str {
         match self {
             RelError::UndefinedTable(_) => "42P01",
             RelError::DuplicateTable(_) => "42P07",
@@ -157,6 +165,7 @@ impl RelError {
             RelError::InFailedTransaction => "25P02",
             RelError::Storage(_) => "58030",
             RelError::Internal(_) => "XX000",
+            RelError::Sidecar { sqlstate, .. } => sqlstate,
         }
     }
 

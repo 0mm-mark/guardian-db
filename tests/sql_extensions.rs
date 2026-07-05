@@ -548,6 +548,219 @@ async fn fuzzystrmatch_and_unaccent_functions() {
 }
 
 // ---------------------------------------------------------------------------
+// Sidecar runtime: DSN validation and transaction-scoped routing rules that
+// need no live sidecar. The wire-level tests live in `sidecar_wire` below.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sidecar_dsn_rejects_non_disable_sslmode() {
+    let mut s = session().await;
+    ok(
+        &mut s,
+        "SET guardian.sidecar_dsn = 'postgres://u:p@127.0.0.1:5432/db?sslmode=require'",
+    )
+    .await;
+    // The client is plaintext-only, so the DSN is rejected before any I/O.
+    let err = s.execute("CREATE EXTENSION postgis").await.unwrap_err();
+    assert_eq!(err.sqlstate(), "0A000");
+    assert!(err.to_string().contains("sslmode"), "{err}");
+}
+
+#[tokio::test]
+async fn sidecar_routing_is_autocommit_only() {
+    let mut s = session().await;
+    ok(
+        &mut s,
+        "SET guardian.sidecar_dsn = 'postgres://u@127.0.0.1:1/db?sslmode=disable'",
+    )
+    .await;
+    // Inside an explicit transaction the local error is kept (same SQLSTATE)
+    // with a hint explaining why nothing was forwarded — no connection is
+    // even attempted, so the unreachable DSN above is never dialed.
+    ok(&mut s, "BEGIN").await;
+    let err = s
+        .execute("SELECT this_function_does_not_exist(1)")
+        .await
+        .unwrap_err();
+    assert_eq!(err.sqlstate(), "42883");
+    assert!(err.to_string().contains("sidecar"), "{err}");
+    assert!(err.to_string().contains("transaction"), "{err}");
+    ok(&mut s, "ROLLBACK").await;
+    // Sidecar extension DDL is refused inside transaction blocks too.
+    ok(&mut s, "BEGIN").await;
+    let err = s.execute("CREATE EXTENSION postgis").await.unwrap_err();
+    assert_eq!(err.sqlstate(), "0A000");
+    assert!(err.to_string().contains("transaction block"), "{err}");
+    ok(&mut s, "ROLLBACK").await;
+}
+
+// ---------------------------------------------------------------------------
+// Sidecar runtime over the real wire protocol. The mock sidecar is a second
+// GuardianDB pgwire server (same protocol, same SQLSTATE-tagged errors), so
+// these tests exercise the client, the forwarding rules and the error
+// mapping end to end over TCP.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "pgwire")]
+mod sidecar_wire {
+    use super::*;
+    use guardian_db::sql::{Catalog, RelationalStorage};
+    use tokio::net::TcpListener;
+
+    /// Start a GuardianDB pgwire server over `storage` on an ephemeral port;
+    /// returns its DSN and the served database (for direct seeding).
+    async fn mock_sidecar(storage: Arc<MemoryStorage>) -> (String, Arc<Database<MemoryStorage>>) {
+        let db = Arc::new(Database::new(storage, "sidecar"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = db.clone();
+        tokio::spawn(async move {
+            let _ = guardian_db::pgwire::serve_on(listener, served, "guardian").await;
+        });
+        (
+            format!("postgres://guardian:guardian@127.0.0.1:{port}/sidecar?sslmode=disable"),
+            db,
+        )
+    }
+
+    async fn set_dsn(s: &mut Session<MemoryStorage>, dsn: &str) {
+        ok(s, &format!("SET guardian.sidecar_dsn = '{dsn}'")).await;
+    }
+
+    #[tokio::test]
+    async fn create_extension_forwarding_propagates_sidecar_errors() {
+        // The mock (a GuardianDB engine with no sidecar of its own) rejects
+        // CREATE EXTENSION pg_stat_statements with 0A000. That SQLSTATE must
+        // arrive typed at the main session — proving the statement was
+        // forwarded and the wire ErrorResponse was mapped faithfully.
+        let (dsn, _mock_db) = mock_sidecar(Arc::new(MemoryStorage::new())).await;
+        let mut s = session().await;
+        set_dsn(&mut s, &dsn).await;
+        let err = s
+            .execute("CREATE EXTENSION pg_stat_statements")
+            .await
+            .unwrap_err();
+        assert_eq!(err.sqlstate(), "0A000");
+        // The failed install left no local record.
+        let n = scalar(
+            &mut s,
+            "SELECT count(*) FROM pg_extension WHERE extname = 'pg_stat_statements'",
+        )
+        .await;
+        assert_eq!(n.as_deref(), Some("0"));
+    }
+
+    #[tokio::test]
+    async fn query_fallback_routes_to_sidecar_over_the_wire() {
+        // pg_trgm is installed on the MOCK only. Locally, similarity() fails
+        // with 42883; once a DSN is configured the statement is forwarded
+        // verbatim and the mock's answer comes back decoded.
+        let (dsn, mock_db) = mock_sidecar(Arc::new(MemoryStorage::new())).await;
+        let mut mock_session = Session::new(mock_db, "guardian");
+        ok(&mut mock_session, "CREATE EXTENSION pg_trgm").await;
+        ok(
+            &mut mock_session,
+            "CREATE TABLE sidecar_only (n INT); INSERT INTO sidecar_only VALUES (7)",
+        )
+        .await;
+        drop(mock_session);
+
+        let mut s = session().await;
+        // Without a DSN the local error stands.
+        assert_eq!(
+            &err_code(&mut s, "SELECT similarity('a','a')").await,
+            "42883"
+        );
+        set_dsn(&mut s, &dsn).await;
+        assert_eq!(
+            scalar(&mut s, "SELECT similarity('a','a')")
+                .await
+                .as_deref(),
+            Some("1")
+        );
+        // Undefined-table fallback works the same way: the relation exists
+        // only on the sidecar, so the local 42P01 forwards the query.
+        assert_eq!(
+            scalar(&mut s, "SELECT n FROM sidecar_only")
+                .await
+                .as_deref(),
+            Some("7")
+        );
+        // A statement that is undefined on both sides keeps the sidecar's
+        // typed error.
+        assert_eq!(
+            &err_code(&mut s, "SELECT nowhere_function(1)").await,
+            "42883"
+        );
+    }
+
+    #[tokio::test]
+    async fn sidecar_binding_installs_records_and_persists() {
+        // Seed the mock as a sidecar that already provides
+        // pg_stat_statements (as a real PostgreSQL would), so the forwarded
+        // CREATE EXTENSION IF NOT EXISTS succeeds and reports a version.
+        let mock_storage = Arc::new(MemoryStorage::new());
+        let mut seeded = Catalog::new("sidecar");
+        seeded.install_extension("pg_stat_statements", "1.11");
+        mock_storage
+            .save_catalog(&serde_json::to_value(&seeded).unwrap())
+            .await
+            .unwrap();
+        let (dsn, _mock_db) = mock_sidecar(mock_storage).await;
+
+        let storage = Arc::new(MemoryStorage::new());
+        let database = Arc::new(Database::new(storage.clone(), "app"));
+        let mut s1 = Session::new(database, "guardian");
+        set_dsn(&mut s1, &dsn).await;
+        ok(&mut s1, "CREATE EXTENSION IF NOT EXISTS pg_stat_statements").await;
+        // Recorded locally with the version the sidecar reported (not the
+        // registry default), suffix-free in every view.
+        assert_eq!(
+            scalar(
+                &mut s1,
+                "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements'"
+            )
+            .await
+            .as_deref(),
+            Some("1.11")
+        );
+        drop(s1);
+
+        // Restart: a fresh session over the same storage still sees the
+        // binding — no DSN is needed just to read the catalog.
+        let database2 = Arc::new(Database::new(storage, "app"));
+        let mut s2 = Session::new(database2, "guardian");
+        assert_eq!(
+            scalar(
+                &mut s2,
+                "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements'"
+            )
+            .await
+            .as_deref(),
+            Some("1.11")
+        );
+        // Dropping a sidecar-bound extension without a sidecar configured is
+        // refused with the actionable message; with the DSN it forwards the
+        // drop and removes the local record.
+        assert_eq!(
+            &err_code(&mut s2, "DROP EXTENSION pg_stat_statements").await,
+            "0A000"
+        );
+        set_dsn(&mut s2, &dsn).await;
+        ok(&mut s2, "DROP EXTENSION pg_stat_statements").await;
+        assert_eq!(
+            scalar(
+                &mut s2,
+                "SELECT count(*) FROM pg_extension WHERE extname = 'pg_stat_statements'"
+            )
+            .await
+            .as_deref(),
+            Some("0")
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session configuration (SHOW / current_setting)
 // ---------------------------------------------------------------------------
 
@@ -579,4 +792,157 @@ async fn show_and_current_setting() {
         scalar(&mut s, "SELECT current_setting('nope', true)").await,
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sidecar runtime against a REAL PostgreSQL (ignored by default: requires a
+// local PostgreSQL 16 installation). Run with:
+//   cargo test --features sql --test sql_extensions -- --ignored
+// ---------------------------------------------------------------------------
+
+/// Kills the postgres child and removes its data directory on drop, so a
+/// failing assertion cannot leak the server process.
+struct PgGuard {
+    child: std::process::Child,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for PgGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Numeric output of an `id` invocation (e.g. `id -u postgres`).
+fn id_of(args: &[&str]) -> Option<u32> {
+    let out = std::process::Command::new("id").args(args).output().ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL 16 installation (initdb/postgres)"]
+async fn sidecar_real_postgres() {
+    let bin = std::path::Path::new("/usr/lib/postgresql/16/bin");
+    assert!(
+        bin.join("initdb").exists(),
+        "PostgreSQL 16 not found at {}",
+        bin.display()
+    );
+    let dir = std::env::temp_dir().join(format!("gdb_sidecar_pg_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let data = dir.join("data");
+    let sockets = dir.join("sock");
+    std::fs::create_dir_all(&sockets).unwrap();
+    // initdb refuses to run as root: when the test runs as root (containers,
+    // sandboxes), hand the server to the unprivileged `postgres` user.
+    let run_as: Option<(u32, u32)> = if id_of(&["-u"]) == Some(0) {
+        let uid = id_of(&["-u", "postgres"]).expect("running as root and no `postgres` user");
+        let gid = id_of(&["-g", "postgres"]).expect("no `postgres` group");
+        let chown = std::process::Command::new("chown")
+            .arg("-R")
+            .arg("postgres")
+            .arg(&dir)
+            .status()
+            .unwrap();
+        assert!(chown.success(), "chown of {} failed", dir.display());
+        Some((uid, gid))
+    } else {
+        None
+    };
+    let demote = |cmd: &mut std::process::Command| {
+        if let Some((uid, gid)) = run_as {
+            use std::os::unix::process::CommandExt;
+            cmd.uid(uid).gid(gid);
+        }
+    };
+    let mut initdb = std::process::Command::new(bin.join("initdb"));
+    initdb.args([
+        "-D",
+        data.to_str().unwrap(),
+        "-U",
+        "postgres",
+        "-A",
+        "trust",
+    ]);
+    demote(&mut initdb);
+    let out = initdb.output().unwrap();
+    assert!(
+        out.status.success(),
+        "initdb failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // An ephemeral port: bind, remember, release.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let mut server = std::process::Command::new(bin.join("postgres"));
+    server
+        .args([
+            "-D",
+            data.to_str().unwrap(),
+            "-p",
+            &port.to_string(),
+            "-c",
+            "listen_addresses=127.0.0.1",
+            // pg_stat_statements needs its shared library preloaded for the
+            // stats view to be readable.
+            "-c",
+            "shared_preload_libraries=pg_stat_statements",
+            "-k",
+            sockets.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    demote(&mut server);
+    let child = server.spawn().unwrap();
+    let _guard = PgGuard { child, dir };
+    // Wait for readiness.
+    let mut ready = false;
+    for _ in 0..100 {
+        let ok = std::process::Command::new(bin.join("pg_isready"))
+            .args(["-h", "127.0.0.1", "-p", &port.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ready, "postgres did not become ready on port {port}");
+
+    let mut s = session().await;
+    ok(
+        &mut s,
+        &format!(
+            "SET guardian.sidecar_dsn = \
+             'postgres://postgres@127.0.0.1:{port}/postgres?sslmode=disable'"
+        ),
+    )
+    .await;
+    // CREATE EXTENSION forwards to the real PostgreSQL, and the recorded
+    // version is what the sidecar reports (PostgreSQL 16 ships 1.10).
+    ok(&mut s, "CREATE EXTENSION pg_stat_statements").await;
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT extversion FROM pg_extension WHERE extname = 'pg_stat_statements'"
+        )
+        .await
+        .as_deref(),
+        Some("1.10")
+    );
+    // The stats view exists only on the sidecar: the local 42P01 triggers
+    // fallback-forwarding and real rows come back over the wire.
+    let calls = scalar(&mut s, "SELECT count(*) FROM pg_stat_statements").await;
+    assert!(
+        calls.as_deref().map(|n| n.parse::<i64>().is_ok()) == Some(true),
+        "expected a numeric count from pg_stat_statements, got {calls:?}"
+    );
+    // Clean up the binding (forwards DROP EXTENSION to the sidecar).
+    ok(&mut s, "DROP EXTENSION pg_stat_statements").await;
 }

@@ -14,6 +14,16 @@ use std::collections::BTreeMap;
 /// First OID handed out to user objects (mirrors PostgreSQL's `FirstNormalObjectId`).
 pub const FIRST_USER_OID: u32 = 16384;
 
+/// Suffix marking a catalog extension entry as bound to the PostgreSQL
+/// sidecar runtime. Stored inside the version string (`"1.10@sidecar"`) so
+/// the serialized catalog shape is unchanged and old documents keep loading.
+/// Native version strings never contain `@` (they come from the registry).
+const SIDECAR_MARKER: &str = "@sidecar";
+
+fn strip_sidecar_marker(version: &str) -> &str {
+    version.strip_suffix(SIDECAR_MARKER).unwrap_or(version)
+}
+
 /// A `(schema, name)` key used throughout the catalog.
 ///
 /// Because it is used as a `BTreeMap` key and serialized to JSON (where map keys
@@ -257,16 +267,25 @@ impl Catalog {
     pub fn extensions(&self) -> impl Iterator<Item = (&str, &str)> {
         self.extensions
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .map(|(k, v)| (k.as_str(), strip_sidecar_marker(v)))
     }
 
     /// The installed version of `name`, if installed.
     pub fn extension_version(&self, name: &str) -> Option<&str> {
-        self.extensions.get(name).map(String::as_str)
+        self.extensions.get(name).map(|v| strip_sidecar_marker(v))
     }
 
     pub fn extension_installed(&self, name: &str) -> bool {
         self.extensions.contains_key(name)
+    }
+
+    /// Whether `name` is installed *and* bound to the PostgreSQL sidecar
+    /// runtime (see [`Catalog::install_sidecar_extension`]).
+    pub fn extension_is_sidecar(&self, name: &str) -> bool {
+        self.extensions
+            .get(name)
+            .map(|v| v.ends_with(SIDECAR_MARKER))
+            .unwrap_or(false)
     }
 
     /// Record an extension as installed. Returns `false` if it already was.
@@ -276,17 +295,32 @@ impl Catalog {
             .is_none()
     }
 
+    /// Record an extension as installed on the PostgreSQL sidecar runtime.
+    /// The binding is encoded as a `@sidecar` suffix inside the stored version
+    /// string, so old catalog documents (plain version strings) keep loading
+    /// unchanged. Returns `false` if the extension was already installed.
+    pub fn install_sidecar_extension(&mut self, name: &str, version: &str) -> bool {
+        self.extensions
+            .insert(name.to_string(), format!("{version}{SIDECAR_MARKER}"))
+            .is_none()
+    }
+
     /// Remove an installed extension. Returns `false` if it was not installed.
     pub fn uninstall_extension(&mut self, name: &str) -> bool {
         self.extensions.remove(name).is_some()
     }
 
     /// Update the stored version of an installed extension (`ALTER EXTENSION
-    /// ... UPDATE`). Returns `false` if the extension is not installed.
+    /// ... UPDATE`), preserving a sidecar binding. Returns `false` if the
+    /// extension is not installed.
     pub fn set_extension_version(&mut self, name: &str, version: &str) -> bool {
         match self.extensions.get_mut(name) {
             Some(v) => {
-                *v = version.to_string();
+                *v = if v.ends_with(SIDECAR_MARKER) {
+                    format!("{version}{SIDECAR_MARKER}")
+                } else {
+                    version.to_string()
+                };
                 true
             }
             None => false,
@@ -674,6 +708,30 @@ mod tests {
         cat.insert_table(t).unwrap();
         assert!(cat.drop_schema("app", false, false).is_err());
         assert!(cat.drop_schema("app", false, true).is_ok());
+    }
+
+    #[test]
+    fn sidecar_extension_marker_round_trips() {
+        let mut cat = Catalog::new("app");
+        cat.install_sidecar_extension("pg_stat_statements", "1.10");
+        assert!(cat.extension_installed("pg_stat_statements"));
+        assert!(cat.extension_is_sidecar("pg_stat_statements"));
+        // Readers never see the marker.
+        assert_eq!(cat.extension_version("pg_stat_statements"), Some("1.10"));
+        assert!(
+            cat.extensions()
+                .any(|(n, v)| n == "pg_stat_statements" && v == "1.10")
+        );
+        // Version updates preserve the binding; native installs never carry it.
+        cat.set_extension_version("pg_stat_statements", "1.11");
+        assert!(cat.extension_is_sidecar("pg_stat_statements"));
+        assert_eq!(cat.extension_version("pg_stat_statements"), Some("1.11"));
+        assert!(!cat.extension_is_sidecar("plpgsql"));
+        // The serialized shape is still a plain name -> string map.
+        let json = serde_json::to_value(&cat).unwrap();
+        let back: Catalog = serde_json::from_value(json).unwrap();
+        assert!(back.extension_is_sidecar("pg_stat_statements"));
+        assert_eq!(back.extension_version("plpgsql"), Some("1.0"));
     }
 
     #[test]

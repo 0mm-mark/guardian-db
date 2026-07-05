@@ -852,33 +852,20 @@ impl Exec {
     ///
     /// Tables with columns of an extension-provided type block the drop under
     /// RESTRICT (the default). CASCADE-dropping dependent columns is refused
-    /// explicitly rather than destroying data implicitly.
+    /// explicitly rather than destroying data implicitly. Statements naming a
+    /// sidecar-bound extension are handled by the session (which forwards the
+    /// drop to the sidecar) before dispatch reaches here.
     pub fn exec_drop_extension(&mut self, de: &DropExtension) -> Result<ExecResult> {
-        use sqlparser::ast::ReferentialAction as RA;
         for ident in &de.names {
             let name = ident_name(ident).to_lowercase();
-            if !self.catalog.extension_installed(&name) {
-                if de.if_exists {
-                    continue;
-                }
-                return Err(SqlError::UndefinedObject(format!("extension \"{name}\"")));
+            if crate::sql::ext::drop_native_extension(
+                &mut self.catalog,
+                &name,
+                de.if_exists,
+                de.cascade_or_restrict,
+            )? {
+                self.catalog_dirty = true;
             }
-            let dependents = crate::sql::ext::dependent_tables(&self.catalog, &name);
-            if !dependents.is_empty() {
-                if matches!(de.cascade_or_restrict, Some(RA::Cascade)) {
-                    return Err(SqlError::FeatureNotSupported(format!(
-                        "DROP EXTENSION {name} CASCADE would drop columns of: {} — \
-                         drop or alter those tables first",
-                        dependents.join(", ")
-                    )));
-                }
-                return Err(SqlError::FeatureNotSupported(format!(
-                    "cannot drop extension {name} because other objects depend on it: {}",
-                    dependents.join(", ")
-                )));
-            }
-            self.catalog.uninstall_extension(&name);
-            self.catalog_dirty = true;
         }
         Ok(ExecResult::empty_command("DROP EXTENSION"))
     }
