@@ -201,6 +201,8 @@ await ds.initialize();
 - `DROP TABLE` / `DROP TABLE IF EXISTS`, `TRUNCATE`
 - `CREATE INDEX`, `CREATE UNIQUE INDEX`, `DROP INDEX`
 - `CREATE VIEW`, `DROP VIEW`
+- `CREATE [OR REPLACE] FUNCTION`, `DROP FUNCTION` (see §5 "User-defined functions")
+- `CREATE [OR REPLACE] TRIGGER`, `DROP TRIGGER`, `ALTER TABLE ... ENABLE/DISABLE TRIGGER` (see §5 "Triggers")
 
 ### DML
 - `INSERT`, multi-row `INSERT`, `INSERT ... RETURNING`, `DEFAULT VALUES`
@@ -335,7 +337,7 @@ Queryable `information_schema` (`tables`, `columns`, `schemata`,
 `referential_constraints`, `views`) and `pg_catalog` (`pg_class`,
 `pg_attribute`, `pg_type`, `pg_namespace`, `pg_index`, `pg_constraint`,
 `pg_database`, `pg_indexes`, `pg_attrdef`, `pg_am`, `pg_roles`, `pg_tables`
-(with `rowsecurity`), `pg_policies`, and empty
+(with `rowsecurity`), `pg_policies`, `pg_proc`, `pg_trigger`, and empty
 `pg_description`/`pg_enum`/`pg_collation`/`pg_settings`). This is enough for
 TypeORM schema sync, migrations and QueryRunner inspection, and for
 node-postgres metadata.
@@ -409,9 +411,9 @@ Supabase gateway injects them automatically per request.
 
 `CREATE [OR REPLACE] FUNCTION` / `DROP FUNCTION` are implemented for two
 languages (see `src/sql/udf.rs`; behavioral tests in `tests/sql_functions.rs`).
-Trigger functions (`RETURNS trigger`) are out of scope for now — `CREATE
-TRIGGER` itself is not implemented — and are rejected at `CREATE FUNCTION`
-time with `0A000`.
+Trigger functions (`RETURNS trigger`, `LANGUAGE plpgsql` only, zero declared
+arguments) are supported and callable exclusively through trigger firings —
+see the "Triggers" section below.
 
 **`LANGUAGE SQL`**: the body is one or more `;`-separated plain SQL
 statements (`SELECT`/`INSERT`/`UPDATE`/`DELETE`). Arguments bind both
@@ -426,7 +428,7 @@ PostgreSQL, including running the earlier statements purely for their side
 effects.
 
 **`LANGUAGE plpgsql`**: a deliberately small, explicitly-bounded subset —
-enough for a non-trivial function or (later) trigger body, not full
+enough for a non-trivial function or trigger body, not full
 PL/pgSQL:
 
 | Supported | Rejected (typed `0A000`, naming the construct) |
@@ -500,11 +502,131 @@ stack) rather than to mirror PostgreSQL's own
 
 **`pg_proc`** reflects every created function: `proname`, `pronamespace`,
 `prolang` (`sql`/`plpgsql`), `provolatile` (`i`/`s`/`v`), `proisstrict`,
-`prorettype`, `pronargs`, `proargtypes` (space-separated type OIDs), `prosrc`
+`prorettype` (2279 — PostgreSQL's `trigger` pseudo-type — for trigger
+functions), `pronargs`, `proargtypes` (space-separated type OIDs), `prosrc`
 (the raw body text). `IMMUTABLE`/`STABLE`/`VOLATILE` are parsed, stored and
 introspectable, but — like the rest of this engine — nothing plans or
 caches differently based on volatility; it is truthfully reported, not
 acted on.
+
+### Triggers (`CREATE TRIGGER`)
+
+`CREATE [OR REPLACE] TRIGGER`, `DROP TRIGGER [IF EXISTS] ... ON table` and
+`ALTER TABLE ... ENABLE|DISABLE TRIGGER {name | ALL | USER}` are implemented
+(see `src/sql/trigger.rs`; behavioral tests in `tests/sql_triggers.rs`).
+
+**Supported surface**
+
+- `BEFORE` / `AFTER` × `INSERT` / `UPDATE [OF col, ...]` / `DELETE`, with
+  `OR`-combined events; `FOR EACH ROW` / `FOR EACH STATEMENT` (omitting the
+  clause defaults to `STATEMENT`, as in PostgreSQL).
+- `WHEN (condition)` on row triggers, referencing `NEW.col` / `OLD.col` —
+  validated at DDL time: unqualified or unknown columns are `42703`, `OLD`
+  on an INSERT trigger / `NEW` on a DELETE trigger are `42P17`, subqueries
+  are `0A000`. Fires iff the condition is TRUE (`NULL` skips, like
+  PostgreSQL); a skipped BEFORE ROW trigger does not suppress the row.
+- `EXECUTE FUNCTION|PROCEDURE fn()` naming a zero-argument
+  `LANGUAGE plpgsql` function declared `RETURNS trigger`. Trigger bodies
+  bind the `NEW`/`OLD` records (readable as `NEW.col`, assignable as
+  `NEW.col := expr`) and the scalars `TG_OP`, `TG_NAME`, `TG_TABLE_NAME`,
+  `TG_TABLE_SCHEMA`, `TG_WHEN`, `TG_LEVEL`. `RETURN NEW`, `RETURN OLD` and
+  `RETURN NULL` are the trigger return forms — returning any other
+  expression is a named `0A000`; `RETURN NEW`/`OLD` with that record unbound
+  (e.g. `RETURN NEW` in a DELETE trigger) is PostgreSQL's `55000`
+  (`record "new" is not assigned yet`).
+- Calling a trigger function as a scalar (`SELECT trgfn()`) is `0A000`
+  (`trigger functions can only be called as triggers`, PostgreSQL's message
+  and code); `DROP FUNCTION` on — or `CREATE OR REPLACE` away from `RETURNS
+  trigger` of — a function a trigger still uses is `2BP01`. `DROP TABLE`
+  drops the table's triggers with it.
+
+**Firing semantics** (PostgreSQL unless noted)
+
+- Same-event triggers fire in alphabetical name order; each BEFORE ROW
+  trigger's returned `NEW` feeds the next in the chain.
+- A BEFORE ROW trigger returning `NULL` suppresses the row and skips the
+  rest of the chain: the row is not written, not counted in the command tag,
+  and absent from `RETURNING`.
+- Column defaults and serial sequences apply *before* BEFORE ROW triggers;
+  NOT NULL / CHECK, row security and unique/FK checks apply *after* them,
+  to the trigger-final values; the stored row id derives from the
+  post-trigger primary key (a PK-rewriting BEFORE INSERT trigger relocates
+  the row).
+- AFTER ROW triggers fire after the statement's writes *and* its referential
+  actions, observing final state (a parent's AFTER DELETE trigger sees
+  cascaded child deletions); their return value is ignored; `WHEN` still
+  applies.
+- Statement-level triggers fire exactly once per statement — including
+  statements affecting zero rows. A BEFORE STATEMENT trigger's writes are
+  visible to the statement's own scan.
+- `UPDATE OF col, ...` matches the UPDATE statement's assignment-target list
+  (the SET list), not value diffs — `SET a = a` fires.
+- `INSERT ... ON CONFLICT DO UPDATE` fires BEFORE INSERT row triggers for
+  the attempted row and BEFORE/AFTER UPDATE row triggers for the conflicting
+  row, plus both INSERT and UPDATE statement-level triggers (like
+  PostgreSQL); `DO NOTHING` fires only the BEFORE INSERT attempt's triggers.
+- An error raised in a trigger body aborts the whole statement with none of
+  its work persisted (the trigger's own earlier writes included); inside an
+  explicit transaction the block is aborted (`25P02` until it ends, `COMMIT`
+  rolls back).
+- Trigger recursion (a trigger whose body writes its own table) is bounded
+  by a firing-depth guard of 25 shared across the statement — exceeding it
+  is `54001`, the same design as the UDF call-depth guard.
+- Trigger side effects are folded back into the executing statement's
+  context after each firing, so later firings and the rest of the statement
+  observe them (two audit inserts in one statement draw distinct serial
+  values).
+
+**Typed exclusions** — each rejected at `CREATE TRIGGER` time with a stable
+`0A000` naming the construct:
+
+| Construct | `0A000` message names |
+| --- | --- |
+| `INSTEAD OF` triggers (views are SELECT-only macros here) | `INSTEAD OF triggers` |
+| `TRUNCATE` events (TRUNCATE bypasses the row pipeline) | `TRUNCATE triggers` |
+| `CREATE CONSTRAINT TRIGGER` | `CONSTRAINT TRIGGER` |
+| constraint-trigger `FROM reftable` | `constraint-trigger FROM clause` |
+| `DEFERRABLE` / `INITIALLY ...` characteristics | `DEFERRABLE trigger characteristics` |
+| `REFERENCING OLD/NEW TABLE` transition tables | `REFERENCING transition tables` |
+| `CREATE TEMPORARY TRIGGER` | `CREATE TEMPORARY TRIGGER` |
+| `WHEN` on statement-level triggers | `WHEN conditions on statement-level triggers` |
+| subqueries in `WHEN` (PostgreSQL forbids these too) | `subqueries in trigger WHEN conditions` |
+| declared trigger arguments (`EXECUTE FUNCTION f(int)`) | `trigger arguments (TG_ARGV)` |
+| `ALTER TABLE ... ENABLE ALWAYS/REPLICA TRIGGER` | `ENABLE ALWAYS TRIGGER` / `ENABLE REPLICA TRIGGER` |
+| assignment to `OLD.col` (or any non-`NEW` record field) in a body | `assignment to OLD / non-NEW record fields` |
+| arbitrary `RETURN` expressions in a trigger body | `returning arbitrary expressions from trigger functions` |
+
+`RETURNS trigger LANGUAGE sql` and trigger functions with declared
+parameters are PostgreSQL's own `42P13`. PG-style *literal* trigger
+arguments (`EXECUTE FUNCTION f('arg')`) do not parse in sqlparser 0.62 at
+all and fail with `42601` — a documented parser-level gap (the same
+precedent as `CREATE MATERIALIZED VIEW`), since no AST ever reaches the
+executor to reject typedly.
+
+**Documented divergences from PostgreSQL**
+
+- **Cascaded referential actions do not fire the child table's triggers.**
+  Rows removed or rewritten by `ON DELETE/UPDATE CASCADE`, `SET NULL` or
+  `SET DEFAULT` bypass the child table's own row triggers (PostgreSQL fires
+  them). Direct DML on the child fires them normally, and AFTER triggers on
+  the *parent* observe the cascade's effects. Firing child triggers inside
+  the cascade queue would let a `RETURN NULL` suppress a cascade row and
+  dangle the reference — making that correct needs re-entrant RI-queue
+  plumbing (the stage-2 path documented in `src/sql/trigger.rs`). Pinned by
+  `tests/sql_triggers.rs::fk_cascade_does_not_fire_child_triggers`.
+- Unbound `TG_*` variables (`TG_ARGV`, `TG_NARGS`, `TG_RELID`, ...) and
+  `NEW`/`OLD` *field reads* in firings that do not bind the record (e.g.
+  `NEW.x` in a DELETE trigger, or any record reference in a statement-level
+  firing) fail at run time as `42703` (undefined column) rather than
+  PostgreSQL's 55000-class errors.
+- `information_schema.triggers` is not implemented — use `pg_trigger`.
+
+**`pg_trigger`** reflects every trigger: `tgname`, `tgrelid` (joins
+`pg_class`), `tgfoid` (joins `pg_proc`), `tgtype` (PostgreSQL's bitmask:
+ROW=1, BEFORE=2, INSERT=4, DELETE=8, UPDATE=16), `tgenabled` (`'O'`
+enabled / `'D'` disabled), `tgattr` (space-separated 1-based ordinals of the
+`UPDATE OF` columns), `tgqual` (the raw `WHEN` text or NULL), plus constant
+`tgisinternal`/`tgconstraint`/`tgdeferrable`/`tginitdeferred`/`tgnargs`.
 
 ---
 
@@ -708,7 +830,8 @@ Each gap has a conformance test in `tests/sql_conformance.rs`
 | `COPY` (bulk load)                   | ✗      | error `0A000` (no CopyIn/Out framing)  |
 | Materialized views                   | ✗      | error `0A000`                          |
 | `CREATE FUNCTION` (`LANGUAGE SQL` / `plpgsql` subset) | ✓ | see §5 "User-defined functions" for the exact PL/pgSQL subset and its typed `0A000` exclusions |
-| `CREATE PROCEDURE` / `CREATE TRIGGER` / `DROP TRIGGER` | ✗ | error `0A000` for **every** spelling — detected by keyword prefix before the parser, since sqlparser 0.62 parses only some forms (which would otherwise leak `42601`); `CREATE FUNCTION ... RETURNS trigger` is rejected the same way |
+| `CREATE PROCEDURE`                   | ✗      | error `0A000` for **every** spelling — detected by keyword prefix before the parser, since sqlparser 0.62 parses only some forms (which would otherwise leak `42601`) |
+| Triggers (`CREATE TRIGGER`)          | ✓      | `BEFORE`/`AFTER` × `INSERT`/`UPDATE [OF cols]`/`DELETE` × `FOR EACH ROW`/`STATEMENT`, `WHEN` on row triggers, `OR REPLACE`, `DROP TRIGGER`, `ALTER TABLE ... ENABLE/DISABLE TRIGGER`, `pg_trigger` — see §5 "Triggers". Typed `0A000` exclusions: `INSTEAD OF`, `TRUNCATE` events, `CONSTRAINT TRIGGER`/`DEFERRABLE`, `REFERENCING` transition tables, trigger arguments (`TG_ARGV`), statement-level `WHEN`, `ENABLE ALWAYS/REPLICA`. Documented divergence: cascaded FK actions do not fire the child table's triggers |
 | Full-text search                     | ✗      | error `0A000` — the function family (`to_tsvector`, `to_tsquery`, `plainto_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery`, `ts_rank`, `ts_rank_cd`, `ts_headline`, `setweight`, `ts_delete`, `tsvector_to_array`) is *named*-unsupported (never `42883`, so it is never sidecar-routed), and `@@` is an unsupported operator; the `tsvector`/`tsquery` types are `42704` |
 | Generated/computed columns           | ✗      | ignored test                           |
 | `SAVEPOINT` partial rollback         | partial| `SAVEPOINT`/`RELEASE` no-op; `ROLLBACK TO` collapses to full rollback |

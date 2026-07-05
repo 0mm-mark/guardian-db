@@ -703,18 +703,25 @@ async fn create_function_basic_forms_now_supported() {
 }
 
 #[tokio::test]
-async fn create_function_trigger_return_type_unsupported() {
-    // Trigger functions (`RETURNS trigger`) are out of scope: `CREATE
-    // TRIGGER` itself is not implemented (see `create_trigger_unsupported`),
-    // and PL/pgSQL's `NEW`/`OLD` magic variables are not modeled.
+async fn create_function_trigger_return_type_supported() {
+    // Trigger functions (`RETURNS trigger`, PL/pgSQL) are implemented — see
+    // `tests/sql_triggers.rs` for the full behavioral suite. The SQL-language
+    // form stays rejected with PostgreSQL's own 42P13, and calling a trigger
+    // function as a scalar is PostgreSQL's 0A000.
     let mut s = session().await;
+    ok(
+        &mut s,
+        "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .await;
+    assert_eq!(err_code(&mut s, "SELECT f()").await, "0A000");
     assert_eq!(
         err_code(
             &mut s,
-            "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql"
+            "CREATE FUNCTION g() RETURNS trigger AS $$ SELECT 1 $$ LANGUAGE sql"
         )
         .await,
-        "0A000"
+        "42P13"
     );
 }
 
@@ -734,15 +741,32 @@ async fn create_procedure_unsupported() {
 }
 
 #[tokio::test]
-async fn create_trigger_unsupported() {
+async fn create_trigger_supported_with_typed_exclusions() {
+    // Triggers are implemented (see `tests/sql_triggers.rs` for the full
+    // behavioral suite); only the documented out-of-subset forms stay 0A000.
     let mut s = session().await;
     ok(&mut s, "CREATE TABLE t (id INT)").await;
-    for sql in [
+    ok(
+        &mut s,
+        "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .await;
+    ok(
+        &mut s,
         "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-        "CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+    )
+    .await;
+    ok(
+        &mut s,
+        "CREATE OR REPLACE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW \
+         WHEN (NEW.id IS DISTINCT FROM OLD.id) EXECUTE PROCEDURE f()",
+    )
+    .await;
+    ok(&mut s, "DROP TRIGGER trg ON t").await;
+    for sql in [
         "CREATE CONSTRAINT TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-        "CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW WHEN (1 = 1) EXECUTE PROCEDURE f()",
-        "DROP TRIGGER trg ON t",
+        "CREATE TRIGGER trg INSTEAD OF INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+        "CREATE TRIGGER trg AFTER TRUNCATE ON t FOR EACH STATEMENT EXECUTE FUNCTION f()",
     ] {
         assert_eq!(err_code(&mut s, sql).await, "0A000", "for `{sql}`");
     }

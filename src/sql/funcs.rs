@@ -299,6 +299,12 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
             // PostgreSQL's full per-argument-type resolution; see
             // `Catalog::insert_function`).
             if let Some(def) = exec.catalog.find_function(None, other, args.len()) {
+                if def.returns_trigger {
+                    // PostgreSQL's message and SQLSTATE (0A000).
+                    return Err(SqlError::FeatureNotSupported(
+                        "trigger functions can only be called as triggers".into(),
+                    ));
+                }
                 return crate::sql::udf::call_function(exec, def, args);
             }
             // Unknown function: 42883, like PostgreSQL. This is also what

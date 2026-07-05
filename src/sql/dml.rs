@@ -1,6 +1,6 @@
 //! DML execution: INSERT / UPDATE / DELETE with RETURNING and ON CONFLICT.
 
-use crate::relational::catalog::{QualifiedName, Table};
+use crate::relational::catalog::{QualifiedName, Table, TriggerTiming};
 use crate::relational::{SqlType, SqlValue, composite_key, ordered_key};
 use crate::sql::error::{Result, SqlError};
 use crate::sql::exec::{Exec, Frame};
@@ -8,11 +8,20 @@ use crate::sql::names::{ident_name, object_name_parts, split_schema_table};
 use crate::sql::result::{ExecResult, OutField};
 use crate::sql::row::{FieldRef, RowSchema, Tuple};
 use crate::sql::store::{Mutation, RowValues, derive_row_id, encode_row, index_values};
+use crate::sql::trigger::TriggerOp;
 use sqlparser::ast::{
     AssignmentTarget, Delete, FromTable, Insert, OnConflictAction, OnInsert, SelectItem, Statement,
     TableFactor,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// An AFTER ROW event queued during a statement's write phase, fired — in
+/// row order — after the statement's own writes and referential actions have
+/// been applied (PostgreSQL's queued-events ordering, approximated).
+enum AfterRowEvent {
+    Insert(RowValues),
+    Update(RowValues, RowValues),
+}
 
 impl Exec {
     // ---- INSERT --------------------------------------------------------
@@ -32,6 +41,43 @@ impl Exec {
             .resolve_table_name(schema.as_deref(), &n)
             .ok_or_else(|| SqlError::UndefinedTable(n.clone()))?;
         let table = self.catalog.require_table(&q)?.clone();
+
+        // Triggers. `UPDATE OF` matching for the ON CONFLICT DO UPDATE path
+        // uses the DO UPDATE SET list's target columns.
+        let has_triggers = !table.triggers.is_empty();
+        let is_do_update = matches!(
+            &insert.on,
+            Some(OnInsert::OnConflict(oc)) if matches!(oc.action, OnConflictAction::DoUpdate(_))
+        );
+        let conflict_set_cols: Option<BTreeSet<String>> = match &insert.on {
+            Some(OnInsert::OnConflict(oc)) if has_triggers => match &oc.action {
+                OnConflictAction::DoUpdate(du) => {
+                    let mut cols = BTreeSet::new();
+                    for a in &du.assignments {
+                        cols.insert(assignment_column(&a.target)?);
+                    }
+                    Some(cols)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if has_triggers {
+            // BEFORE STATEMENT triggers fire exactly once, before the source
+            // rows are even evaluated (so they fire for zero-row sources
+            // too), and their writes are visible to the statement.
+            // PostgreSQL fires UPDATE statement triggers as well when the
+            // statement carries ON CONFLICT DO UPDATE.
+            self.fire_statement_triggers(&table, TriggerTiming::Before, TriggerOp::Insert, None)?;
+            if is_do_update {
+                self.fire_statement_triggers(
+                    &table,
+                    TriggerTiming::Before,
+                    TriggerOp::Update,
+                    conflict_set_cols.as_ref(),
+                )?;
+            }
+        }
 
         // Target columns.
         let target_cols: Vec<String> = if insert.columns.is_empty() {
@@ -97,7 +143,22 @@ impl Exec {
 
         let mut prepared: Vec<(String, RowValues)> = Vec::new();
         for provided in provided_rows {
-            let values = self.prepare_row(&table, provided)?;
+            // PostgreSQL's ordering: defaults/serials apply *before* BEFORE
+            // ROW triggers; NOT NULL/CHECK run *after* them, on the
+            // trigger-final values; and the row id derives last (a trigger
+            // may rewrite primary-key columns).
+            let values = self.build_row(&table, provided)?;
+            let values = if has_triggers {
+                match self.fire_before_row(&table, TriggerOp::Insert, None, Some(values), None)? {
+                    Some(v) => v,
+                    // Suppressed (`RETURN NULL`): not inserted, not counted,
+                    // not in RETURNING.
+                    None => continue,
+                }
+            } else {
+                values
+            };
+            self.check_row_constraints(&table, &values)?;
             let row_id =
                 derive_row_id(&table, &values).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             prepared.push((row_id, values));
@@ -119,6 +180,7 @@ impl Exec {
         // rewrites a row of a table that other tables reference.
         let table_is_referenced = !self.catalog.referencing_foreign_keys(&q).is_empty();
         let mut inserted_rows: Vec<RowValues> = Vec::new();
+        let mut after_rows: Vec<AfterRowEvent> = Vec::new();
         let mut count = 0usize;
 
         for (mut row_id, values) in prepared {
@@ -161,6 +223,28 @@ impl Exec {
                                 do_update.selection.as_ref(),
                             )?;
                             let Some(new_vals) = new_vals else { continue };
+                            // The conflict update is an UPDATE for trigger
+                            // purposes: BEFORE UPDATE row triggers fire on
+                            // (existing → new), suppression skips the update
+                            // (PostgreSQL), and constraints re-run on the
+                            // trigger-final values.
+                            let new_vals = if has_triggers {
+                                match self.fire_before_row(
+                                    &table,
+                                    TriggerOp::Update,
+                                    Some(&existing),
+                                    Some(new_vals),
+                                    conflict_set_cols.as_ref(),
+                                )? {
+                                    Some(v) => v,
+                                    None => continue,
+                                }
+                            } else {
+                                new_vals
+                            };
+                            if has_triggers {
+                                self.check_row_constraints(&table, &new_vals)?;
+                            }
                             self.rls_check_new_row(
                                 &q,
                                 &table,
@@ -183,10 +267,13 @@ impl Exec {
                                 self.fk_apply_referential_actions(vec![
                                     crate::sql::fk::RiWork::Updated {
                                         table: q.clone(),
-                                        old: existing,
+                                        old: existing.clone(),
                                         new: new_vals.clone(),
                                     },
                                 ])?;
+                            }
+                            if has_triggers {
+                                after_rows.push(AfterRowEvent::Update(existing, new_vals.clone()));
                             }
                             inserted_rows.push(new_vals);
                             count += 1;
@@ -212,8 +299,44 @@ impl Exec {
                 row_id: std::mem::take(&mut row_id),
                 doc,
             });
+            if has_triggers {
+                after_rows.push(AfterRowEvent::Insert(values.clone()));
+            }
             inserted_rows.push(values);
             count += 1;
+        }
+
+        if has_triggers {
+            // AFTER ROW events fire once the statement's full effect —
+            // including referential actions — has been applied, in row
+            // order; AFTER STATEMENT triggers fire last (UPDATE before
+            // INSERT for upserts, mirroring PostgreSQL), even when zero
+            // rows were affected.
+            for event in &after_rows {
+                match event {
+                    AfterRowEvent::Insert(values) => {
+                        self.fire_after_row(&table, TriggerOp::Insert, None, Some(values), None)?;
+                    }
+                    AfterRowEvent::Update(old, new) => {
+                        self.fire_after_row(
+                            &table,
+                            TriggerOp::Update,
+                            Some(old),
+                            Some(new),
+                            conflict_set_cols.as_ref(),
+                        )?;
+                    }
+                }
+            }
+            if is_do_update {
+                self.fire_statement_triggers(
+                    &table,
+                    TriggerTiming::After,
+                    TriggerOp::Update,
+                    conflict_set_cols.as_ref(),
+                )?;
+            }
+            self.fire_statement_triggers(&table, TriggerTiming::After, TriggerOp::Insert, None)?;
         }
 
         if let Some(returning) = &insert.returning {
@@ -223,8 +346,10 @@ impl Exec {
     }
 
     /// Build a complete row from provided values, applying defaults, serial
-    /// sequences, coercion, and NOT NULL enforcement.
-    fn prepare_row(
+    /// sequences, and coercion — everything PostgreSQL applies *before*
+    /// BEFORE ROW triggers run. NOT NULL / CHECK enforcement runs afterwards,
+    /// on the trigger-final values (see [`Exec::check_row_constraints`]).
+    fn build_row(
         &mut self,
         table: &Table,
         provided: BTreeMap<String, SqlValue>,
@@ -251,16 +376,23 @@ impl Exec {
             } else {
                 SqlValue::Null
             };
-            if value.is_null() && !col.nullable {
+            values.insert(col.name.clone(), value);
+        }
+        Ok(values)
+    }
+
+    /// NOT NULL + CHECK enforcement for a fully-built row (after any BEFORE
+    /// ROW triggers have run, matching PostgreSQL's ordering).
+    pub(crate) fn check_row_constraints(&self, table: &Table, values: &RowValues) -> Result<()> {
+        for col in &table.columns {
+            if !col.nullable && values.get(&col.name).map(SqlValue::is_null).unwrap_or(true) {
                 return Err(SqlError::NotNullViolation {
                     column: col.name.clone(),
                     table: table.name.clone(),
                 });
             }
-            values.insert(col.name.clone(), value);
         }
-        self.check_constraints(table, &values)?;
-        Ok(values)
+        self.check_constraints(table, values)
     }
 
     pub(crate) fn eval_default(&self, default_sql: &str) -> Result<SqlValue> {
@@ -422,6 +554,31 @@ impl Exec {
         let collection = table.storage_collection.clone();
         let schema = table_schema(&table, &alias);
 
+        // Triggers. `UPDATE OF` matches on the statement's assignment-target
+        // columns (the SET list, not value diffs — PostgreSQL semantics).
+        let has_triggers = !table.triggers.is_empty();
+        let set_cols: Option<BTreeSet<String>> = if has_triggers {
+            let mut cols = BTreeSet::new();
+            for a in &update.assignments {
+                cols.insert(assignment_column(&a.target)?);
+            }
+            Some(cols)
+        } else {
+            None
+        };
+        if has_triggers {
+            // BEFORE STATEMENT fires before the snapshot below, so its
+            // writes to the target table are visible to this statement's own
+            // scan (PostgreSQL command-counter semantics); it also fires for
+            // statements that end up matching zero rows.
+            self.fire_statement_triggers(
+                &table,
+                TriggerTiming::Before,
+                TriggerOp::Update,
+                set_cols.as_ref(),
+            )?;
+        }
+
         // Snapshot the rows so we can evaluate predicates with &self. Rows the
         // current role may not update (row security, UPDATE USING) are skipped.
         let snapshot: Vec<(String, RowValues)> = self
@@ -465,21 +622,24 @@ impl Exec {
                 let coerced = coerce_to_col(value, &table, &col)?;
                 new_values.insert(col, coerced);
             }
-            // NOT NULL.
-            for c in &table.columns {
-                if !c.nullable
-                    && new_values
-                        .get(&c.name)
-                        .map(SqlValue::is_null)
-                        .unwrap_or(true)
-                {
-                    return Err(SqlError::NotNullViolation {
-                        column: c.name.clone(),
-                        table: table.name.clone(),
-                    });
+            // BEFORE ROW triggers run on the assignment result, before
+            // NOT NULL/CHECK/row security (which then apply to the
+            // trigger-final values) — PostgreSQL's ordering.
+            if has_triggers {
+                match self.fire_before_row(
+                    &table,
+                    TriggerOp::Update,
+                    Some(values),
+                    Some(new_values),
+                    set_cols.as_ref(),
+                )? {
+                    Some(v) => new_values = v,
+                    // Suppressed: the row keeps its old values and is
+                    // excluded from the count and RETURNING.
+                    None => continue,
                 }
             }
-            self.check_constraints(&table, &new_values)?;
+            self.check_row_constraints(&table, &new_values)?;
             // Row security: the updated row must pass UPDATE WITH CHECK
             // (falling back to USING), like PostgreSQL.
             self.rls_check_new_row(
@@ -493,6 +653,7 @@ impl Exec {
 
         let table_is_referenced = !self.catalog.referencing_foreign_keys(&q).is_empty();
         let mut updated: Vec<RowValues> = Vec::new();
+        let mut after_rows: Vec<(RowValues, RowValues)> = Vec::new();
         let mut ri_work: Vec<crate::sql::fk::RiWork> = Vec::new();
         let mut count = 0;
         for (rid, old_values, new_values) in targets {
@@ -508,6 +669,9 @@ impl Exec {
             self.fk_check_child(&table, &new_values, Some(&old_values))?;
             self.observe_serials(&table, &new_values);
             self.write_update(&q, &collection, &table, &rid, new_values.clone())?;
+            if has_triggers {
+                after_rows.push((old_values.clone(), new_values.clone()));
+            }
             if table_is_referenced {
                 ri_work.push(crate::sql::fk::RiWork::Updated {
                     table: q.clone(),
@@ -521,6 +685,27 @@ impl Exec {
         // Parent-side referential actions (per statement, after all target
         // rows are rewritten).
         self.fk_apply_referential_actions(ri_work)?;
+
+        if has_triggers {
+            // AFTER ROW triggers observe the statement's full effect,
+            // referential actions included; AFTER STATEMENT fires last,
+            // even for zero matched rows.
+            for (old, new) in &after_rows {
+                self.fire_after_row(
+                    &table,
+                    TriggerOp::Update,
+                    Some(old),
+                    Some(new),
+                    set_cols.as_ref(),
+                )?;
+            }
+            self.fire_statement_triggers(
+                &table,
+                TriggerTiming::After,
+                TriggerOp::Update,
+                set_cols.as_ref(),
+            )?;
+        }
 
         if let Some(returning) = &update.returning {
             return self.returning_result(&table, updated, returning);
@@ -580,6 +765,14 @@ impl Exec {
         let collection = table.storage_collection.clone();
         let schema = table_schema(&table, &alias);
 
+        let has_triggers = !table.triggers.is_empty();
+        if has_triggers {
+            // BEFORE STATEMENT fires before the snapshot below (its writes
+            // are visible to this statement's own scan) and fires even for
+            // zero matched rows.
+            self.fire_statement_triggers(&table, TriggerTiming::Before, TriggerOp::Delete, None)?;
+        }
+
         // Rows the current role may not delete (row security, DELETE USING)
         // are excluded from the snapshot, so they are silently skipped.
         let snapshot: Vec<(String, RowValues)> = self
@@ -610,6 +803,16 @@ impl Exec {
                 None => true,
             };
             if matched {
+                // BEFORE DELETE row triggers: `RETURN NULL` suppresses the
+                // deletion — the row survives and is excluded from the count
+                // and RETURNING.
+                if has_triggers
+                    && self
+                        .fire_before_row(&table, TriggerOp::Delete, Some(values), None, None)?
+                        .is_none()
+                {
+                    continue;
+                }
                 to_delete.push(rid.clone());
                 deleted.push(values.clone());
             }
@@ -643,6 +846,17 @@ impl Exec {
                 })
                 .collect();
             self.fk_apply_referential_actions(work)?;
+        }
+
+        if has_triggers {
+            // AFTER DELETE row triggers fire once referential actions have
+            // applied, so a parent-table trigger observes cascaded child
+            // deletions; AFTER STATEMENT fires last, zero-row statements
+            // included.
+            for values in &deleted {
+                self.fire_after_row(&table, TriggerOp::Delete, Some(values), None, None)?;
+            }
+            self.fire_statement_triggers(&table, TriggerTiming::After, TriggerOp::Delete, None)?;
         }
 
         if let Some(returning) = &delete.returning {

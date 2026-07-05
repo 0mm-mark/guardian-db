@@ -111,6 +111,18 @@ pub enum RelError {
     #[error("{0}")]
     InvalidFunctionDefinition(String),
 
+    /// Structurally invalid non-function object definition (SQLSTATE 42P17),
+    /// e.g. a trigger naming a function that does not return `trigger`, or a
+    /// trigger `WHEN` condition referencing `OLD` on an INSERT trigger.
+    #[error("{0}")]
+    InvalidObjectDefinition(String),
+
+    /// A referenced object is not in the state the operation requires
+    /// (SQLSTATE 55000), e.g. `RETURN NEW` in a DELETE trigger, where the
+    /// `NEW` record is not assigned (PostgreSQL raises the same code there).
+    #[error("{0}")]
+    ObjectNotInPrerequisiteState(String),
+
     #[error("syntax error: {0}")]
     Syntax(String),
 
@@ -207,6 +219,8 @@ impl RelError {
             RelError::DuplicateFunction(_) => "42723",
             RelError::AmbiguousFunction(_) => "42725",
             RelError::InvalidFunctionDefinition(_) => "42P13",
+            RelError::InvalidObjectDefinition(_) => "42P17",
+            RelError::ObjectNotInPrerequisiteState(_) => "55000",
             RelError::Syntax(_) => "42601",
             RelError::FeatureNotSupported(_) => "0A000",
             RelError::WindowingError(_) => "42P20",

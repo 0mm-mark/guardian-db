@@ -174,6 +174,88 @@ pub struct Policy {
     pub permissive: bool,
 }
 
+/// When a trigger fires relative to the triggering event (`BEFORE`/`AFTER`).
+/// `INSTEAD OF` is deliberately absent: views are SELECT-only here, so it is
+/// rejected at `CREATE TRIGGER` time with `0A000`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+impl TriggerTiming {
+    /// The `TG_WHEN` spelling.
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            TriggerTiming::Before => "BEFORE",
+            TriggerTiming::After => "AFTER",
+        }
+    }
+}
+
+/// `FOR EACH ROW` vs `FOR EACH STATEMENT` (PostgreSQL's default when the
+/// clause is omitted is `STATEMENT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerLevel {
+    Row,
+    Statement,
+}
+
+impl TriggerLevel {
+    /// The `TG_LEVEL` spelling.
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            TriggerLevel::Row => "ROW",
+            TriggerLevel::Statement => "STATEMENT",
+        }
+    }
+}
+
+/// One triggering event of a trigger definition (`INSERT OR UPDATE OF a, b OR
+/// DELETE`). `TRUNCATE` is deliberately absent (rejected `0A000`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerEventDef {
+    Insert,
+    /// UPDATE, with the optional `OF col, ...` list (empty = every UPDATE).
+    /// Matching is on the UPDATE statement's assignment-target column names,
+    /// NOT on value changes — PostgreSQL's `UPDATE OF` semantics.
+    Update {
+        columns: Vec<String>,
+    },
+    Delete,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A trigger (`CREATE TRIGGER`). Stored on its [`Table`] — like [`Policy`] —
+/// so `DROP TABLE` cleanup is implicit. The `WHEN` condition is stored as raw
+/// SQL text and re-parsed at fire time, the exact pattern `Policy.using_expr`
+/// follows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerDef {
+    pub oid: u32,
+    /// Case-folded trigger name, unique per table.
+    pub name: String,
+    pub timing: TriggerTiming,
+    /// At least one event; `INSERT OR UPDATE` etc. store several.
+    pub events: Vec<TriggerEventDef>,
+    pub level: TriggerLevel,
+    /// Raw SQL text of the `WHEN` condition (row triggers only).
+    pub when_expr: Option<String>,
+    /// The trigger function, resolved to (schema, name) at `CREATE TRIGGER`
+    /// time (search path applied once, like `ForeignKey.ref_schema`). Trigger
+    /// functions always have arity 0.
+    pub function_schema: String,
+    pub function_name: String,
+    /// `ALTER TABLE ... ENABLE/DISABLE TRIGGER` (`pg_trigger.tgenabled`
+    /// `'O'`/`'D'`). Defaults to `true` so catalog documents written without
+    /// the field deserialize as enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
     pub oid: u32,
@@ -199,6 +281,11 @@ pub struct Table {
     /// serde default as `rls_enabled`.
     #[serde(default)]
     pub policies: Vec<Policy>,
+    /// Triggers (`CREATE TRIGGER`). Same backward-compatible serde default as
+    /// `rls_enabled`/`policies`: catalogs written before this field existed
+    /// keep loading unchanged.
+    #[serde(default)]
+    pub triggers: Vec<TriggerDef>,
 }
 
 impl Table {
@@ -208,6 +295,10 @@ impl Table {
 
     pub fn policy(&self, name: &str) -> Option<&Policy> {
         self.policies.iter().find(|p| p.name == name)
+    }
+
+    pub fn trigger(&self, name: &str) -> Option<&TriggerDef> {
+        self.triggers.iter().find(|t| t.name == name)
     }
 
     pub fn column_mut(&mut self, name: &str) -> Option<&mut Column> {
@@ -326,6 +417,15 @@ pub struct FunctionDef {
     pub strict: bool,
     /// Raw body text between `AS $$ ... $$` (`prosrc`).
     pub body: String,
+    /// `RETURNS trigger` (PL/pgSQL only): callable exclusively through a
+    /// trigger firing, never as a scalar function. `return_type` stays
+    /// [`SqlType::Unknown`] (there is deliberately no `SqlType::Trigger`
+    /// variant — that would make `CREATE TABLE t (x trigger)` representable);
+    /// `pg_proc.prorettype` special-cases this flag to OID 2279 (PostgreSQL's
+    /// `trigger` pseudo-type). Defaults to `false` so catalogs written before
+    /// this field existed keep loading unchanged.
+    #[serde(default)]
+    pub returns_trigger: bool,
 }
 
 impl FunctionDef {
@@ -941,6 +1041,7 @@ mod tests {
             rls_enabled: false,
             rls_forced: false,
             policies: vec![],
+            triggers: vec![],
         }
     }
 
