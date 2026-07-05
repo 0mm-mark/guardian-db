@@ -96,17 +96,55 @@ impl<S: RelationalStorage> Session<S> {
     }
 
     /// Parse and execute a (possibly multi-statement) SQL string.
+    ///
+    /// The input is split into top-level statements first (quote- and
+    /// comment-aware, see [`crate::sql::parser::split_statements`]) so that
+    /// `ALTER EXTENSION` — which sqlparser 0.62 has no AST for — can be routed
+    /// to its hand parser; every other segment goes through [`parse_sql`]
+    /// unchanged and all statements execute in their original order. Parsing
+    /// happens up front, so a syntax error anywhere executes nothing.
     pub async fn execute(&mut self, sql: &str) -> Result<Vec<ExecResult>> {
-        let statements = crate::sql::parser::parse_sql(sql)?;
-        let mut results = Vec::with_capacity(statements.len());
-        for stmt in statements {
-            results.push(self.execute_one(&stmt, &[]).await?);
+        enum Piece {
+            Statements(Vec<Statement>),
+            AlterExtension(crate::sql::ext::alter::AlterExtension),
+        }
+        let mut pieces = Vec::new();
+        for segment in crate::sql::parser::split_statements(sql) {
+            if crate::sql::ext::alter::is_alter_extension(&segment) {
+                pieces.push(Piece::AlterExtension(
+                    crate::sql::ext::alter::parse_alter_extension(&segment)?,
+                ));
+            } else {
+                pieces.push(Piece::Statements(crate::sql::parser::parse_sql(&segment)?));
+            }
+        }
+        let mut results = Vec::new();
+        for piece in pieces {
+            match piece {
+                Piece::Statements(stmts) => {
+                    for stmt in stmts {
+                        results.push(self.execute_one(&stmt, &[]).await?);
+                    }
+                }
+                Piece::AlterExtension(cmd) => {
+                    results.push(self.execute_alter_extension(&cmd).await?);
+                }
+            }
         }
         Ok(results)
     }
 
     /// Prepare a statement for the extended query protocol.
     pub fn prepare(&self, sql: &str) -> Result<Prepared> {
+        // sqlparser has no ALTER EXTENSION AST, so it cannot be carried through
+        // the extended protocol's parse/bind/execute pipeline.
+        if crate::sql::ext::alter::is_alter_extension(sql) {
+            return Err(SqlError::Syntax(
+                "ALTER EXTENSION is only supported over the simple query protocol — \
+                 send it as an unprepared statement"
+                    .into(),
+            ));
+        }
         let mut statements = crate::sql::parser::parse_sql(sql)?;
         let statement = match statements.len() {
             0 => Statement::Query(Box::new(empty_query())),
@@ -329,6 +367,94 @@ impl<S: RelationalStorage> Session<S> {
             };
         }
         self.vars.insert(name, raw);
+    }
+
+    /// Execute a hand-parsed `ALTER EXTENSION`, mirroring `execute_one`'s
+    /// transaction semantics (ignored while aborted; an error aborts an open
+    /// block or releases autocommit locks).
+    async fn execute_alter_extension(
+        &mut self,
+        cmd: &crate::sql::ext::alter::AlterExtension,
+    ) -> Result<ExecResult> {
+        if self.txn.as_ref().map(|t| t.aborted).unwrap_or(false) {
+            return Err(SqlError::InFailedTransaction);
+        }
+        let outcome = self.alter_extension_inner(cmd).await;
+        if outcome.is_err() {
+            match &mut self.txn {
+                Some(txn) => txn.aborted = true,
+                None => self.db.locks.release_transaction(self.session_id),
+            }
+        }
+        outcome
+    }
+
+    async fn alter_extension_inner(
+        &mut self,
+        cmd: &crate::sql::ext::alter::AlterExtension,
+    ) -> Result<ExecResult> {
+        use crate::sql::ext::alter::AlterExtensionAction as Action;
+        let mut catalog = match &self.txn {
+            Some(txn) => txn.catalog.clone(),
+            None => self.load_catalog().await?,
+        };
+        // Every form requires the extension to be installed (PostgreSQL's
+        // `extension "x" does not exist`, SQLSTATE 42704).
+        if !catalog.extension_installed(&cmd.name) {
+            return Err(SqlError::UndefinedObject(format!(
+                "extension \"{}\"",
+                cmd.name
+            )));
+        }
+        match &cmd.action {
+            Action::Update { to } => {
+                let def = crate::sql::ext::find(&cmd.name).ok_or_else(|| {
+                    SqlError::UndefinedObject(format!("extension \"{}\"", cmd.name))
+                })?;
+                if let Some(v) = to
+                    && v != def.default_version
+                {
+                    return Err(SqlError::UndefinedObject(format!(
+                        "extension \"{}\" has no update path to version \"{v}\" \
+                         (available version: \"{}\")",
+                        def.name, def.default_version
+                    )));
+                }
+                catalog.set_extension_version(def.name, def.default_version);
+                self.persist_catalog(catalog).await?;
+                Ok(ExecResult::empty_command("ALTER EXTENSION"))
+            }
+            Action::SetSchema(_) => Err(SqlError::FeatureNotSupported(format!(
+                "extension \"{}\" is not relocatable",
+                cmd.name
+            ))),
+            Action::Add(obj) | Action::Drop(obj) => Err(SqlError::FeatureNotSupported(format!(
+                "ALTER EXTENSION {} {} {obj}: PostgreSQL reserves extension membership \
+                 changes for extension scripts, and GuardianDB extension contents are fixed",
+                cmd.name,
+                if matches!(cmd.action, Action::Add(_)) {
+                    "ADD"
+                } else {
+                    "DROP"
+                },
+            ))),
+        }
+    }
+
+    /// Persist a modified catalog the way `execute_inner`'s tail does: stage
+    /// it on the open transaction, or save it and release autocommit locks.
+    async fn persist_catalog(&mut self, catalog: Catalog) -> Result<()> {
+        match &mut self.txn {
+            Some(txn) => {
+                txn.catalog = catalog;
+                txn.catalog_dirty = true;
+            }
+            None => {
+                self.save_catalog(&catalog).await?;
+                self.db.locks.release_transaction(self.session_id);
+            }
+        }
+        Ok(())
     }
 
     fn dispatch(&self, exec: &mut Exec, stmt: &Statement) -> Result<ExecResult> {

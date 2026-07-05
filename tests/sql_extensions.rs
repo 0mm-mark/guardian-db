@@ -126,6 +126,134 @@ async fn drop_extension_with_dependent_table_is_blocked() {
 }
 
 // ---------------------------------------------------------------------------
+// ALTER EXTENSION (hand-parsed: sqlparser 0.62 has no AST for it)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn alter_extension_update() {
+    let mut s = session().await;
+    // Not installed: typed undefined-object error.
+    assert_eq!(
+        &err_code(&mut s, "ALTER EXTENSION pg_trgm UPDATE").await,
+        "42704"
+    );
+    ok(&mut s, "CREATE EXTENSION pg_trgm").await;
+    // UPDATE and UPDATE TO the available version succeed with the right tag.
+    let r = ok(&mut s, "ALTER EXTENSION pg_trgm UPDATE").await;
+    assert_eq!(r[0].command_tag(), "ALTER EXTENSION");
+    ok(&mut s, "ALTER EXTENSION pg_trgm UPDATE TO '1.6'").await;
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm'"
+        )
+        .await
+        .as_deref(),
+        Some("1.6")
+    );
+    // Unknown target version: 42704 naming the available version.
+    let err = s
+        .execute("ALTER EXTENSION pg_trgm UPDATE TO '9.9'")
+        .await
+        .unwrap_err();
+    assert_eq!(err.sqlstate(), "42704");
+    assert!(err.to_string().contains("1.6"), "should name 1.6: {err}");
+}
+
+#[tokio::test]
+async fn alter_extension_set_schema_and_membership_are_refused() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE EXTENSION citext").await;
+    // None of the registry extensions are relocatable.
+    let err = s
+        .execute("ALTER EXTENSION citext SET SCHEMA util")
+        .await
+        .unwrap_err();
+    assert_eq!(err.sqlstate(), "0A000");
+    assert!(err.to_string().contains("not relocatable"), "{err}");
+    // Membership changes are reserved for extension scripts in PostgreSQL.
+    assert_eq!(
+        &err_code(&mut s, "ALTER EXTENSION citext ADD FUNCTION f(text)").await,
+        "0A000"
+    );
+    assert_eq!(
+        &err_code(&mut s, "ALTER EXTENSION citext DROP TYPE citext").await,
+        "0A000"
+    );
+    // Malformed ALTER EXTENSION is a syntax error.
+    assert_eq!(
+        &err_code(&mut s, "ALTER EXTENSION citext FROBNICATE").await,
+        "42601"
+    );
+}
+
+#[tokio::test]
+async fn alter_extension_mixes_with_other_statements_in_order() {
+    let mut s = session().await;
+    let results = ok(
+        &mut s,
+        "CREATE EXTENSION pg_trgm; \
+         ALTER EXTENSION pg_trgm UPDATE; \
+         SELECT similarity('abc', 'abc')",
+    )
+    .await;
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].command_tag(), "CREATE EXTENSION");
+    assert_eq!(results[1].command_tag(), "ALTER EXTENSION");
+    match &results[2] {
+        ExecResult::Rows { rows, .. } => {
+            assert_eq!(rows[0][0].to_text().as_deref(), Some("1"));
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // A `;` inside a string literal does not split the ALTER EXTENSION route.
+    let results = ok(&mut s, "SELECT 'ALTER EXTENSION x; UPDATE'").await;
+    assert_eq!(results.len(), 1);
+}
+
+#[tokio::test]
+async fn alter_extension_transaction_semantics() {
+    let mut s = session().await;
+    // Inside an explicit transaction the version change is staged and commits.
+    ok(
+        &mut s,
+        "BEGIN; CREATE EXTENSION pg_trgm; ALTER EXTENSION pg_trgm UPDATE TO '1.6'; COMMIT",
+    )
+    .await;
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT extversion FROM pg_extension WHERE extname = 'pg_trgm'"
+        )
+        .await
+        .as_deref(),
+        Some("1.6")
+    );
+    // A failing ALTER EXTENSION aborts an open block, like any other error.
+    ok(&mut s, "BEGIN").await;
+    assert_eq!(
+        &err_code(&mut s, "ALTER EXTENSION nope UPDATE").await,
+        "42704"
+    );
+    assert_eq!(&err_code(&mut s, "SELECT 1").await, "25P02");
+    ok(&mut s, "ROLLBACK").await;
+}
+
+#[tokio::test]
+async fn alter_extension_extended_protocol_is_rejected() {
+    let s = session().await;
+    let err = match s.prepare("ALTER EXTENSION pg_trgm UPDATE") {
+        Err(e) => e,
+        Ok(_) => panic!("preparing ALTER EXTENSION should fail"),
+    };
+    assert_eq!(err.sqlstate(), "42601");
+    assert!(
+        err.to_string().contains("simple query protocol"),
+        "error should point at simple-protocol support: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Catalog views
 // ---------------------------------------------------------------------------
 

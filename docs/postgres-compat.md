@@ -269,7 +269,61 @@ node-postgres metadata.
 
 ---
 
-## 6. Unsupported SQL (documented gaps)
+## 6. Extensions
+
+GuardianDB's SQL engine is a from-scratch Rust engine, so PostgreSQL's binary
+extension ABI (C shared libraries loaded into the server) cannot apply.
+`CREATE EXTENSION` is still fully supported, through a **fixed registry** of
+extensions (`src/sql/ext/`): installing one flips a per-database flag in the
+replicated catalog document (so installs replicate like any other DDL) and
+gates that extension's functions, operators, types and GUCs. Anything outside
+the registry fails with a typed `0A000` error pointing at
+`pg_available_extensions` — never silently.
+
+### Native registry
+
+| Extension        | Version | Provides                                                        |
+| ---------------- | ------- | --------------------------------------------------------------- |
+| `btree_gin`      | 1.3     | no-op shim (GuardianDB indexes are engine-native)                |
+| `btree_gist`     | 1.7     | no-op shim                                                       |
+| `citext`         | 1.6     | case-insensitive `CITEXT` type (comparison, UNIQUE, output case) |
+| `fuzzystrmatch`  | 1.2     | `levenshtein`, `soundex`, `difference`, `metaphone`, `dmetaphone`|
+| `pg_trgm`        | 1.6     | `similarity`, `%`/`<->` operators, `pg_trgm.similarity_threshold`|
+| `pgcrypto`       | 1.3     | `digest`, `hmac`, `crypt`/`gen_salt`, `encode`/`decode`, ...     |
+| `plpgsql`        | 1.0     | pre-installed shim (function bodies are not executable)          |
+| `unaccent`       | 1.1     | `unaccent()` accent stripping                                    |
+| `uuid-ossp`      | 1.1     | `uuid_generate_v1/v3/v4/v5`, namespace constants                 |
+| `vector`         | 0.8.1   | pgvector: `VECTOR(n)` type, `<->`/`<#>`/`<=>`/`<+>`, distances   |
+
+Introspection matches PostgreSQL: `pg_extension`, `pg_available_extensions`,
+and `pg_available_extension_versions` are queryable; functions of a
+not-installed extension fail with `42883` naming the extension to install, and
+extension-owned types fail DDL with `42704` until installed. `DROP EXTENSION`
+honours RESTRICT when table columns depend on an extension type (and refuses
+CASCADE explicitly rather than destroying data).
+
+### ALTER EXTENSION
+
+sqlparser (0.62) has no `ALTER EXTENSION` AST, so the session recognizes it
+*before* the general parser: input is split into top-level statements with a
+quote-/comment-aware splitter, `ALTER EXTENSION` segments are hand-parsed, and
+everything else flows through the normal parser unchanged, in order.
+
+| Form                                   | Behaviour                                                        |
+| -------------------------------------- | ---------------------------------------------------------------- |
+| `ALTER EXTENSION x UPDATE`             | updates the stored version to the registry version (`ALTER EXTENSION` tag) |
+| `ALTER EXTENSION x UPDATE TO 'v'`      | same if `v` is the available version; otherwise `42704` naming it |
+| on a not-installed extension           | `42704` (`extension "x" does not exist`)                          |
+| `ALTER EXTENSION x SET SCHEMA s`       | `0A000` — no registry extension is relocatable                    |
+| `ALTER EXTENSION x ADD/DROP object`    | `0A000` — PostgreSQL reserves membership changes for extension scripts |
+
+`ALTER EXTENSION` participates in transactions like any DDL (staged on the
+open block, aborts it on error). It is **simple-protocol only**: preparing it
+through the extended query protocol fails with a `42601` error saying so.
+
+---
+
+## 7. Unsupported SQL (documented gaps)
 
 Each gap has a conformance test in `tests/sql_conformance.rs`
 (clean-failure tests pass; intended-future features are `#[ignore]`d).
@@ -294,7 +348,7 @@ Each gap has a conformance test in `tests/sql_conformance.rs`
 
 ---
 
-## 7. Consistency modes
+## 8. Consistency modes
 
 GuardianDB is local-first; SQL does not change that. Two modes are defined.
 
@@ -323,7 +377,7 @@ GuardianDB is local-first; SQL does not change that. Two modes are defined.
   conformance test describing the target (one transaction aborts with `40001`
   on write-skew).
 
-## 8. Transaction semantics
+## 9. Transaction semantics
 
 - `BEGIN` / `COMMIT` / `ROLLBACK` are supported. Within a transaction, writes
   buffer in an overlay; reads merge the overlay over storage; `COMMIT` flushes
@@ -372,7 +426,7 @@ NOWAIT, SKIP LOCKED, advisory, LOCK TABLE, pg_locks, release-on-rollback).
 > blocked writer can still overwrite based on its original snapshot once it
 > proceeds. `SERIALIZABLE` is not implemented.
 
-## 9. Replication semantics
+## 10. Replication semantics
 
 - Each table maps to a GuardianDB document collection; each row is a JSON
   document with a stable id (`__gdb_sql_rows_<oid>`), carrying internal fields
@@ -395,7 +449,7 @@ NOWAIT, SKIP LOCKED, advisory, LOCK TABLE, pg_locks, release-on-rollback).
   `#[ignore]`d `tests/sql_replication.rs` conformance target (raw document
   replication between peers already works — see `tests/integration_replication.rs`).
 
-## 10. Index behaviour
+## 11. Index behaviour
 
 - Indexes are real ordered (BTree) structures built from live rows and
   maintained incrementally within a statement/transaction.
@@ -406,7 +460,7 @@ NOWAIT, SKIP LOCKED, advisory, LOCK TABLE, pg_locks, release-on-rollback).
   test asserts indexed lookups return the same rows as a full scan.
 - `REINDEX` is implicit: indexes are rebuilt from storage on load.
 
-## 11. Error codes
+## 12. Error codes
 
 Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 `code` field:
@@ -431,7 +485,7 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 | `25P02`  | in failed SQL transaction       |
 | `0A000`  | feature not supported           |
 
-## 12. Examples
+## 13. Examples
 
 - `examples/postgres-typeorm` — a complete TypeORM app (entities, migration,
   seed, queries, transactions). Run `npm run demo`.
@@ -439,7 +493,7 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 - `tests/pgwire_wire.rs` — a `tokio-postgres` client driving the
   gateway over TCP.
 
-## 13. Testing summary
+## 14. Testing summary
 
 | Layer                | Tests                                                  |
 | -------------------- | ------------------------------------------------------ |
