@@ -210,3 +210,5 @@ impl RelError {
 }
 
 pub type Result<T> = std::result::Result<T, RelError>;
+
+// Maintenance note 12: documents compatibility expectations without changing runtime behavior.
