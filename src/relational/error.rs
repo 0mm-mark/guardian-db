@@ -103,6 +103,26 @@ pub enum RelError {
     #[error("{0}")]
     FeatureNotSupported(String),
 
+    /// Misplaced or malformed window-function usage (SQLSTATE 42P20), e.g.
+    /// `OVER` in `WHERE`, or an invalid frame clause.
+    #[error("{0}")]
+    WindowingError(String),
+
+    /// Invalid recursive-CTE structure (SQLSTATE 42P19), e.g. the recursive
+    /// self-reference appearing more than once or inside a subquery.
+    #[error("{0}")]
+    InvalidRecursion(String),
+
+    /// `OVER` attached to a function that is neither a window function nor an
+    /// aggregate (SQLSTATE 42809).
+    #[error("{0}")]
+    WrongObjectType(String),
+
+    /// A statement exceeded an execution limit (SQLSTATE 54001), e.g. the
+    /// `WITH RECURSIVE` iteration guard.
+    #[error("{0}")]
+    StatementTooComplex(String),
+
     #[error("invalid parameter: {0}")]
     InvalidParameter(String),
 
@@ -167,6 +187,10 @@ impl RelError {
             RelError::UndefinedFunction(_) => "42883",
             RelError::Syntax(_) => "42601",
             RelError::FeatureNotSupported(_) => "0A000",
+            RelError::WindowingError(_) => "42P20",
+            RelError::InvalidRecursion(_) => "42P19",
+            RelError::WrongObjectType(_) => "42809",
+            RelError::StatementTooComplex(_) => "54001",
             RelError::InvalidParameter(_) => "22023",
             RelError::InvalidConstraint(_) => "42P10",
             RelError::InsufficientPrivilege(_) => "42501",

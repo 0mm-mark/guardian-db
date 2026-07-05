@@ -510,3 +510,100 @@ async fn unsupported_surfaces_clear_error() {
     assert!(code == "0A000" || code == "42P01", "got {code}");
     let _ = SqlError::FeatureNotSupported("x".into());
 }
+
+#[tokio::test]
+async fn window_edge_positions_fail_typed() {
+    let mut s = session().await;
+    run(&mut s, "CREATE TABLE w1 (v INT)").await;
+    run(&mut s, "CREATE TABLE w2 (v INT)").await;
+    run(&mut s, "INSERT INTO w1 VALUES (1), (2)").await;
+    run(&mut s, "INSERT INTO w2 VALUES (1), (2)").await;
+    // Frame EXCLUDE is not parseable by sqlparser 0.62 — a syntax error, so
+    // it can never be silently ignored.
+    assert_eq!(
+        err(
+            &mut s,
+            "SELECT sum(v) OVER (ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW \
+             EXCLUDE CURRENT ROW) FROM w1",
+        )
+        .await,
+        "42601"
+    );
+    // Window calls outside the SELECT list / ORDER BY fail typed (42P20):
+    // JOIN conditions and LIMIT.
+    assert_eq!(
+        err(
+            &mut s,
+            "SELECT w1.v FROM w1 JOIN w2 ON row_number() OVER () = w2.v",
+        )
+        .await,
+        "42P20"
+    );
+    assert_eq!(
+        err(&mut s, "SELECT v FROM w1 LIMIT row_number() OVER ()").await,
+        "42P20"
+    );
+    // Negative frame offsets are rejected, not clamped.
+    assert_eq!(
+        err(
+            &mut s,
+            "SELECT sum(v) OVER (ORDER BY v ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM w1",
+        )
+        .await,
+        "22023"
+    );
+}
+
+#[tokio::test]
+async fn distinct_dedups_after_window_evaluation() {
+    let mut s = session().await;
+    run(&mut s, "CREATE TABLE wd (v INT)").await;
+    run(&mut s, "INSERT INTO wd VALUES (1), (1), (2)").await;
+    // Window values are computed before DISTINCT (PostgreSQL order), so the
+    // duplicate v=1 rows carry distinct row_numbers and all rows survive.
+    let g = q(
+        &mut s,
+        "SELECT DISTINCT v, row_number() OVER (ORDER BY v) FROM wd ORDER BY 2",
+    )
+    .await;
+    assert_eq!(g.len(), 3);
+    // Whereas count over an identical partition collapses them.
+    let g = q(
+        &mut s,
+        "SELECT DISTINCT v, count(*) OVER (PARTITION BY v) FROM wd ORDER BY v",
+    )
+    .await;
+    assert_eq!(g.len(), 2);
+    assert_eq!(cell(&g, 0, 1), "2");
+    assert_eq!(cell(&g, 1, 1), "1");
+}
+
+#[tokio::test]
+async fn recursive_cte_string_paths_and_multiple_recursive_members() {
+    let mut s = session().await;
+    // Text columns iterate fine (types fixed by the base term).
+    let g = q(
+        &mut s,
+        "WITH RECURSIVE p(s) AS (SELECT 'x' UNION ALL SELECT s || 'x' FROM p \
+         WHERE length(s) < 3) SELECT s FROM p ORDER BY length(s)",
+    )
+    .await;
+    assert_eq!(
+        g,
+        vec![
+            vec![Some("x".to_string())],
+            vec![Some("xx".to_string())],
+            vec![Some("xxx".to_string())],
+        ]
+    );
+    // Two recursive members in one WITH, each self-contained; the second may
+    // read the first (already materialized).
+    let g = q(
+        &mut s,
+        "WITH RECURSIVE a(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM a WHERE n < 3), \
+         b(m) AS (SELECT max(n) FROM a UNION ALL SELECT m + 1 FROM b WHERE m < 5) \
+         SELECT sum(m) FROM b",
+    )
+    .await;
+    assert_eq!(cell(&g, 0, 0), "12");
+}
