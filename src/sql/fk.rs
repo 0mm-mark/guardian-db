@@ -438,10 +438,13 @@ impl Exec {
         );
         let loaded = self.tables.get_mut(child_q).unwrap();
         loaded.apply_delete(rid);
-        self.mutations.push(crate::sql::store::Mutation::Delete {
-            collection,
-            row_id: rid.to_string(),
-        });
+        self.mutations
+            .lock()
+            .unwrap()
+            .push(crate::sql::store::Mutation::Delete {
+                collection,
+                row_id: rid.to_string(),
+            });
         Ok(())
     }
 

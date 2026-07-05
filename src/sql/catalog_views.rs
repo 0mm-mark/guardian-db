@@ -68,6 +68,7 @@ pub fn view_rows(
         (true, "pg_extension") => Some(pg_extension(catalog)),
         (true, "pg_available_extensions") => Some(pg_available_extensions(catalog)),
         (true, "pg_available_extension_versions") => Some(pg_available_extension_versions(catalog)),
+        (true, "pg_proc") => Some(pg_proc(catalog)),
         (true, "pg_depend") => Some(pg_depend(catalog)),
         (true, "pg_am") => Some(pg_am()),
         (true, "pg_settings") => Some(empty(&[
@@ -975,6 +976,48 @@ fn pg_roles() -> RowSet {
         ("rolcanlogin", SqlType::Boolean),
     ];
     rs(cols, vec![vec![i4(10), t("guardian"), b(true), b(true)]])
+}
+
+/// `pg_proc`: user-defined functions (`CREATE FUNCTION`). Builtins and
+/// extension functions are not cataloged here — like the rest of this
+/// module, only what `CREATE ...` actually recorded is reflected.
+fn pg_proc(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("oid", SqlType::Integer),
+        ("proname", SqlType::Text),
+        ("pronamespace", SqlType::Integer),
+        ("proowner", SqlType::Integer),
+        ("prolang", SqlType::Text),
+        ("provolatile", SqlType::Char(Some(1))),
+        ("proisstrict", SqlType::Boolean),
+        ("prorettype", SqlType::Integer),
+        ("pronargs", SqlType::SmallInt),
+        ("proargtypes", SqlType::Text),
+        ("prosrc", SqlType::Text),
+    ];
+    let rows = catalog
+        .functions()
+        .map(|f| {
+            vec![
+                i4(f.oid as i32),
+                t(&f.name),
+                i4(schema_oid(catalog, &f.schema)),
+                i4(10),
+                t(f.language.as_sql()),
+                t(&f.volatility.as_char().to_string()),
+                b(f.strict),
+                i4(f.return_type.oid() as i32),
+                i2(f.args.len() as i16),
+                t(&f.args
+                    .iter()
+                    .map(|a| a.ty.oid().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")),
+                t(&f.body),
+            ]
+        })
+        .collect();
+    rs(cols, rows)
 }
 
 fn pg_extension(catalog: &Catalog) -> RowSet {

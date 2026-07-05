@@ -488,7 +488,7 @@ impl Exec {
                             }
                         }
                         let table = self.catalog.drop_table_qualified(&q)?;
-                        self.mutations.push(Mutation::Truncate {
+                        self.mutations.lock().unwrap().push(Mutation::Truncate {
                             collection: table.storage_collection,
                         });
                     }
@@ -554,7 +554,10 @@ impl Exec {
             }
             for q in &targets {
                 let collection = self.catalog.require_table(q)?.storage_collection.clone();
-                self.mutations.push(Mutation::Truncate { collection });
+                self.mutations
+                    .lock()
+                    .unwrap()
+                    .push(Mutation::Truncate { collection });
                 if let Some(loaded) = self.tables.get_mut(q) {
                     loaded.rows.clear();
                     loaded.rebuild_indexes();
@@ -992,7 +995,7 @@ impl Exec {
             for (rid, values) in renamed_rows {
                 let version = loaded.version_of(&rid) + 1;
                 let doc = encode_row(&table_meta, &rid, &values, version);
-                self.mutations.push(Mutation::Put {
+                self.mutations.lock().unwrap().push(Mutation::Put {
                     collection: collection.clone(),
                     row_id: rid,
                     doc,

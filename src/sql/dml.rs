@@ -207,7 +207,7 @@ impl Exec {
             let version = loaded.version_of(&row_id);
             loaded.apply_insert(row_id.clone(), values.clone());
             let doc = encode_row(&table, &row_id, &values, version);
-            self.mutations.push(Mutation::Put {
+            self.mutations.lock().unwrap().push(Mutation::Put {
                 collection: collection.clone(),
                 row_id: std::mem::take(&mut row_id),
                 doc,
@@ -541,14 +541,14 @@ impl Exec {
         let loaded = self.tables.get_mut(q).unwrap();
         if new_id != row_id {
             loaded.apply_delete(row_id);
-            self.mutations.push(Mutation::Delete {
+            self.mutations.lock().unwrap().push(Mutation::Delete {
                 collection: collection.to_string(),
                 row_id: row_id.to_string(),
             });
             let version = loaded.version_of(&new_id);
             loaded.apply_insert(new_id.clone(), new_values.clone());
             let doc = encode_row(table, &new_id, &new_values, version);
-            self.mutations.push(Mutation::Put {
+            self.mutations.lock().unwrap().push(Mutation::Put {
                 collection: collection.to_string(),
                 row_id: new_id,
                 doc,
@@ -557,7 +557,7 @@ impl Exec {
             loaded.apply_update(row_id, new_values.clone());
             let version = loaded.version_of(row_id);
             let doc = encode_row(table, row_id, &new_values, version);
-            self.mutations.push(Mutation::Put {
+            self.mutations.lock().unwrap().push(Mutation::Put {
                 collection: collection.to_string(),
                 row_id: row_id.to_string(),
                 doc,
@@ -626,7 +626,7 @@ impl Exec {
         let loaded = self.tables.get_mut(&q).unwrap();
         for rid in &to_delete {
             loaded.apply_delete(rid);
-            self.mutations.push(Mutation::Delete {
+            self.mutations.lock().unwrap().push(Mutation::Delete {
                 collection: collection.clone(),
                 row_id: rid.clone(),
             });

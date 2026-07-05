@@ -262,6 +262,92 @@ pub struct View {
     pub columns: Vec<String>,
 }
 
+/// The implementation language of a user-defined function body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FunctionLanguage {
+    Sql,
+    PlPgSql,
+}
+
+impl FunctionLanguage {
+    /// The `pg_proc.prolang`-ish spelling (GuardianDB has no `pg_language`
+    /// OID table, so the language name is stored directly as text).
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            FunctionLanguage::Sql => "sql",
+            FunctionLanguage::PlPgSql => "plpgsql",
+        }
+    }
+}
+
+/// `IMMUTABLE | STABLE | VOLATILE`, stored and reported truthfully but not
+/// acted on by the optimizer (GuardianDB has no plan cache keyed on
+/// volatility) — see `docs/postgres-compat.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FunctionVolatility {
+    Immutable,
+    Stable,
+    Volatile,
+}
+
+impl FunctionVolatility {
+    /// The `pg_proc.provolatile` character (`i`/`s`/`v`).
+    pub fn as_char(&self) -> char {
+        match self {
+            FunctionVolatility::Immutable => 'i',
+            FunctionVolatility::Stable => 's',
+            FunctionVolatility::Volatile => 'v',
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionArgDef {
+    /// Declared parameter name (PL/pgSQL binds by this; SQL-language bodies
+    /// use `$1`/`$2` regardless). Synthesized as `$N` for unnamed arguments.
+    pub name: String,
+    pub ty: SqlType,
+}
+
+/// A user-defined function (`CREATE FUNCTION`). Bodies are stored as raw
+/// source text (`prosrc`) and re-parsed on use, the same pattern
+/// [`Policy`]'s `using_expr`/`check_expr` already follows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDef {
+    pub oid: u32,
+    pub schema: String,
+    pub name: String,
+    pub args: Vec<FunctionArgDef>,
+    pub return_type: SqlType,
+    pub language: FunctionLanguage,
+    pub volatility: FunctionVolatility,
+    /// `STRICT` / `RETURNS NULL ON NULL INPUT`: any `NULL` argument short-circuits
+    /// to a `NULL` result without invoking the body.
+    pub strict: bool,
+    /// Raw body text between `AS $$ ... $$` (`prosrc`).
+    pub body: String,
+}
+
+impl FunctionDef {
+    pub fn arity(&self) -> usize {
+        self.args.len()
+    }
+
+    pub fn qualified(&self) -> QualifiedName {
+        QualifiedName::new(self.schema.clone(), self.name.clone())
+    }
+}
+
+/// Outcome of resolving an unqualified `DROP FUNCTION name` (no argument
+/// list) against the catalog.
+pub enum DropFunctionByName {
+    Removed,
+    NotFound,
+    /// More than one signature shares the name; PostgreSQL requires the
+    /// argument list to disambiguate (SQLSTATE 42725).
+    Ambiguous,
+}
+
 /// The authoritative, serializable relational catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Catalog {
@@ -277,6 +363,11 @@ pub struct Catalog {
     /// catalog document, so installs replicate like any other DDL.
     #[serde(default)]
     extensions: BTreeMap<String, String>,
+    /// User-defined functions (`CREATE FUNCTION`). Defaults to empty so
+    /// catalogs written before this field existed keep loading unchanged,
+    /// the same backward-compatible pattern as `rls_enabled`.
+    #[serde(default)]
+    functions: Vec<FunctionDef>,
 }
 
 impl Catalog {
@@ -292,6 +383,7 @@ impl Catalog {
             next_oid: FIRST_USER_OID,
             search_path: vec!["public".to_string()],
             extensions: BTreeMap::new(),
+            functions: Vec::new(),
         };
         // PostgreSQL databases have plpgsql installed by default.
         catalog
@@ -688,6 +780,125 @@ impl Catalog {
             return Err(RelError::UndefinedTable(q.to_string_qualified()));
         }
         Ok(())
+    }
+
+    // ---- functions -------------------------------------------------------
+    //
+    // Signatures are matched by (schema, name, arity) — arity only, not
+    // per-argument types. PostgreSQL allows overloading two functions with
+    // the same name and arity but different argument types; GuardianDB's
+    // call dispatch resolves by name+arity alone (see `funcs::call_scalar`),
+    // so two `CREATE FUNCTION`s with the same name+arity are treated as the
+    // same signature regardless of declared argument types — a deliberate,
+    // documented simplification (see `docs/postgres-compat.md`).
+
+    pub fn functions(&self) -> impl Iterator<Item = &FunctionDef> {
+        self.functions.iter()
+    }
+
+    fn resolve_function_index(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        arity: usize,
+    ) -> Option<usize> {
+        if let Some(s) = schema {
+            return self
+                .functions
+                .iter()
+                .position(|f| f.schema == s && f.name == name && f.arity() == arity);
+        }
+        for s in &self.search_path {
+            if let Some(i) = self
+                .functions
+                .iter()
+                .position(|f| &f.schema == s && f.name == name && f.arity() == arity)
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Resolve `name(arity args)` via `schema` (or the search path when
+    /// `None`), the same rule [`Catalog::resolve_table_name`] uses for tables.
+    pub fn find_function(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+        arity: usize,
+    ) -> Option<&FunctionDef> {
+        self.resolve_function_index(schema, name, arity)
+            .map(|i| &self.functions[i])
+    }
+
+    /// `CREATE FUNCTION` (without `OR REPLACE`): errors with `42723` if a
+    /// same-schema, same-name, same-arity function already exists.
+    pub fn insert_function(&mut self, def: FunctionDef) -> Result<()> {
+        if self
+            .functions
+            .iter()
+            .any(|f| f.schema == def.schema && f.name == def.name && f.arity() == def.arity())
+        {
+            return Err(RelError::DuplicateFunction(format!(
+                "function \"{}\" already exists with same argument count",
+                def.name
+            )));
+        }
+        self.functions.push(def);
+        Ok(())
+    }
+
+    /// `CREATE OR REPLACE FUNCTION`: overwrites the same-signature function
+    /// in place (preserving its OID), or inserts a new one.
+    pub fn replace_function(&mut self, mut def: FunctionDef) {
+        match self
+            .functions
+            .iter()
+            .position(|f| f.schema == def.schema && f.name == def.name && f.arity() == def.arity())
+        {
+            Some(i) => {
+                def.oid = self.functions[i].oid;
+                self.functions[i] = def;
+            }
+            None => self.functions.push(def),
+        }
+    }
+
+    /// `DROP FUNCTION name(arg types)`. Returns `false` if no such signature
+    /// exists (the caller decides whether that is an error, i.e. `IF EXISTS`).
+    pub fn drop_function(&mut self, schema: Option<&str>, name: &str, arity: usize) -> bool {
+        match self.resolve_function_index(schema, name, arity) {
+            Some(i) => {
+                self.functions.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `DROP FUNCTION name` with no argument list: only valid when the name
+    /// is not overloaded.
+    pub fn drop_function_by_name(
+        &mut self,
+        schema: Option<&str>,
+        name: &str,
+    ) -> DropFunctionByName {
+        let matches: Vec<usize> = self
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.name == name && schema.map(|s| f.schema == s).unwrap_or(true))
+            .map(|(i, _)| i)
+            .collect();
+        match matches.len() {
+            0 => DropFunctionByName::NotFound,
+            1 => {
+                self.functions.remove(matches[0]);
+                DropFunctionByName::Removed
+            }
+            _ => DropFunctionByName::Ambiguous,
+        }
     }
 }
 
