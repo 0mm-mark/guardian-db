@@ -9,9 +9,10 @@
 //! Implemented end-to-end: **REST** (PostgREST-compatible), **Auth**
 //! (GoTrue-compatible), **Storage** (storage-api-compatible, bytes in a
 //! replicated `bytea` table), **postgres-meta** (what Supabase Studio talks
-//! to) and **Realtime** (Phoenix-protocol websocket). The remaining Kong
-//! services (functions, graphql) return typed `501 Not Implemented` errors —
-//! never a bare 404 and never fake success.
+//! to), **Realtime** (Phoenix-protocol websocket) and **GraphQL**
+//! (pg_graphql-compatible schema reflection over the `public` schema). The
+//! remaining Kong service (functions) returns a typed `501 Not Implemented`
+//! error — never a bare 404 and never fake success.
 //!
 //! ## Scouted seams (Stage 0)
 //!
@@ -64,11 +65,12 @@
 //!     │                                attach AuthContext extension)
 //!     │
 //!     ├─ /rest/v1/*    → rest.rs     → Session(role) → SQL → PostgREST JSON
+//!     ├─ /graphql/v1   → graphql.rs  → Session(role) → SQL → GraphQL JSON
 //!     ├─ /auth/v1/*    → auth.rs     → Session(service_role) → auth.* tables
 //!     ├─ /storage/v1/* → storage.rs  → Session(role) → storage.* tables (RLS)
 //!     ├─ /pg-meta/*    → pg_meta.rs  → catalog + pg_catalog views (service_role)
 //!     ├─ /realtime/v1/websocket → realtime.rs → Phoenix ws + change hook
-//!     └─ /functions|/graphql → 501 typed
+//!     └─ /functions    → 501 typed
 //! ```
 //!
 //! Each request opens a fresh [`Session`] bound to the resolved role. A single
@@ -78,6 +80,7 @@
 pub mod auth;
 pub mod error;
 pub mod gateway;
+pub mod graphql;
 pub mod jwt;
 pub mod pg_meta;
 pub mod project;

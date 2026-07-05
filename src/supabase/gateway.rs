@@ -127,6 +127,9 @@ pub fn build_router<S: RelationalStorage + 'static>(state: AppState<S>) -> Route
     let protected = Router::new()
         .nest("/rest/v1", crate::supabase::rest::router::<S>())
         .nest("/auth/v1", crate::supabase::auth::router::<S>())
+        // pg_graphql-compatible GraphQL: apikey-verified like /rest/v1; the
+        // resolved role + JWT claims govern row security inside.
+        .nest("/graphql/v1", crate::supabase::graphql::router::<S>())
         // postgres-meta (Studio): apikey-verified here, service_role-gated in
         // the handlers.
         .nest("/pg-meta", crate::supabase::pg_meta::router::<S>())
@@ -157,10 +160,7 @@ pub fn build_router<S: RelationalStorage + 'static>(state: AppState<S>) -> Route
 /// bare 404 and never fake success). These sit outside the apikey layer so the
 /// answer is a clear "not implemented" regardless of credentials.
 fn stub_router<S: RelationalStorage + 'static>() -> Router<AppState<S>> {
-    Router::new()
-        .route("/functions/v1/{*rest}", any(|| not_impl("FUNCTIONS")))
-        .route("/graphql/v1", any(|| not_impl("GRAPHQL")))
-        .route("/graphql/v1/{*rest}", any(|| not_impl("GRAPHQL")))
+    Router::new().route("/functions/v1/{*rest}", any(|| not_impl("FUNCTIONS")))
 }
 
 async fn not_impl(service: &'static str) -> Response {

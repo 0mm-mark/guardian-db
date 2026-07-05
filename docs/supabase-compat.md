@@ -7,9 +7,10 @@ GuardianDB-specific code. It lives entirely behind the `supabase` Cargo feature
 
 Implemented end-to-end: **REST** (PostgREST-compatible), **Auth**
 (GoTrue-compatible), **Storage** (storage-api-compatible), **postgres-meta**
-(the API Supabase Studio talks to), and **Realtime** (Phoenix-protocol
-websocket: postgres_changes + broadcast). The remaining Kong services
-(**functions**, **graphql**) return a typed `501` — never a bare 404 and never
+(the API Supabase Studio talks to), **Realtime** (Phoenix-protocol
+websocket: postgres_changes + broadcast), and **GraphQL**
+(pg_graphql-compatible reflection of the `public` schema). The remaining Kong
+service (**functions**) returns a typed `501` — never a bare 404 and never
 fake success.
 
 ---
@@ -55,13 +56,14 @@ HTTP request
   │     • attach AuthContext{ role, api_key_role, claims, request_id }
   │
   ├─ /rest/v1/*        → rest.rs     → Session(role)          → SQL → PostgREST JSON
+  ├─ /graphql/v1       → graphql.rs  → Session(role)          → SQL → GraphQL JSON
   ├─ /auth/v1/*        → auth.rs     → Session(service_role)  → auth.* tables → GoTrue JSON
   ├─ /storage/v1/*     → storage.rs  → Session(role)          → storage.* tables (RLS-governed)
   │     (public/signed downloads sit outside the apikey layer)
   ├─ /pg-meta/*        → pg_meta.rs  → catalog + pg_catalog views (service_role-gated)
   ├─ /platform/pg-meta → alias of /pg-meta
   ├─ /realtime/v1/websocket → realtime.rs → Phoenix ws (apikey via query param)
-  └─ /functions | /graphql → 501 typed
+  └─ /functions → 501 typed
 ```
 
 Files (all under `src/supabase/`, behind `#[cfg(feature = "supabase")]`):
@@ -71,6 +73,7 @@ Files (all under `src/supabase/`, behind `#[cfg(feature = "supabase")]`):
 - `error.rs` — `SupaError` taxonomy + PostgREST/GoTrue error rendering.
 - `gateway.rs` — axum `Router`, middleware, `AuthContext`, shared exec helpers.
 - `rest.rs` — PostgREST translation and handlers.
+- `graphql.rs` — pg_graphql-compatible schema reflection + executor.
 - `auth.rs` — GoTrue schema bootstrap and handlers.
 - `storage.rs` — storage-api bucket/object handlers over the `storage` schema.
 - `pg_meta.rs` — postgres-meta endpoints (what Studio needs).
@@ -242,13 +245,136 @@ cannot be re-checked, so they are **withheld** from non-bypass roles.
 arriving via Iroh replication from another node do not flow into this node's
 realtime stream (a replication-changefeed slice can lift this later).
 
+### GraphQL (`/graphql/v1`)
+
+A pg_graphql-compatible endpoint (`graphql.rs`): `POST /graphql/v1` with
+`{"query","variables","operationName"}` (plus `GET ?query=` for GraphiQL;
+mutations over GET are rejected). It sits under the apikey layer like
+`/rest/v1`; every top-level field compiles to parameterised SQL run through a
+session bound to the caller's role with `request.jwt.claims` injected, so
+**RLS governs GraphQL exactly like REST** (anon default-deny, `service_role`
+bypass — all covered by tests).
+
+**Error contract.** GraphQL-level problems (unknown field, unsupported
+feature, SQL errors, `atMost` violations) return
+`{"errors":[{"message": …}]}` with HTTP **200** (GraphQL-over-HTTP
+convention); execution errors carry `"data": null`. Any field error aborts
+the whole operation — no partial silent results. Malformed *HTTP* requests
+(bad JSON body, missing `query`) return the usual `SupaError` 4xx shapes, and
+`/graphql/v1/<subpath>` returns a typed 404 with a GraphQL-shaped body —
+never a bare 404.
+
+**Reflection** (rebuilt per request from the catalog snapshot, so DDL is
+picked up immediately). Only schema `public` user tables **with a primary
+key** are reflected (pg_graphql's own rule). **Inflection is off** —
+pg_graphql's default — so names are used exactly as-is: table `blog_posts`
+becomes:
+
+| Piece | Name |
+| --- | --- |
+| Object type (implements `Node`) | `blog_posts` — one field per column plus `nodeId: ID!` |
+| Query field | `blog_postsCollection(first, last, before, after, offset, filter, orderBy)` → `blog_postsConnection` |
+| Connection shape | `{ edges { cursor node } pageInfo { hasNextPage hasPreviousPage startCursor endCursor } totalCount }` |
+| Filter / order inputs | `blog_postsFilter` (per-column comparators + `and`/`or`/`not`), `blog_postsOrderBy` with enum `OrderByDirection {AscNullsFirst, AscNullsLast, DescNullsFirst, DescNullsLast}` |
+| Mutations | `insertIntoblog_postsCollection(objects: [blog_postsInsertInput!]!)`, `updateblog_postsCollection(set, filter, atMost: Int! = 1)`, `deleteFromblog_postsCollection(filter, atMost: Int! = 1)` — responses `{ affectedCount, records }` |
+| Node lookup | `node(nodeId: ID!): Node`; `nodeId` is base64 of `[schema, table, pk values…]` JSON |
+
+Filter comparators: every filterable scalar gets `eq, neq, in, is`
+(`is` takes `FilterIs { NULL, NOT_NULL }`); ordered scalars add
+`gt, gte, lt, lte`; `String` adds `like, ilike, startsWith` (SQL wildcard
+semantics for like/ilike; `startsWith` escapes its argument).
+
+**Scalar mapping** (pg_graphql shapes):
+
+| PostgreSQL | GraphQL | JSON form |
+| --- | --- | --- |
+| `int2`, `int4` | `Int` | number |
+| `int8` | `BigInt` | **string** |
+| `float4`, `float8` | `Float` | number |
+| `numeric` | `BigFloat` | **string** |
+| `bool` | `Boolean` | bool |
+| `text`, `varchar`, `char`, `citext` | `String` | string |
+| `uuid` | `UUID` | string |
+| `json`, `jsonb` | `JSON` | **string of serialized JSON** (opaque, in and out) |
+| `timestamp`, `timestamptz` | `Datetime` | ISO-8601 string |
+| `date` / `time` | `Date` / `Time` | string |
+| `bytea` | `Opaque` | base64 string |
+| arrays | list of the element scalar | array |
+| anything exotic (`vector`, `hstore`, `ltree`, `cube`, …) | `String` (PostgreSQL text form) | string — reflection never fails on a type |
+
+`JSON`/`Opaque` columns and array columns are **not filterable/orderable**
+(absent from the Filter/OrderBy inputs — visible via introspection, so
+nothing is silently ignored).
+
+**Relationships** (single level in each direction, from the catalog's foreign
+keys; constraint-name independent). For an FK `blog_posts.author_id →
+authors.id`:
+
+- child → parent object field on `blog_posts`, named **after the referenced
+  table**: `authors` (nullable; a NULL FK or an RLS-hidden parent resolves to
+  `null`);
+- parent → child collection field on `authors`, named
+  `blog_postsCollection`, with the full collection argument set (`filter`,
+  `first`, `after`, …) applied on top of the implicit FK restriction
+  (`totalCount` respects both).
+
+When the plain name collides (several FKs to the same table, or a column of
+the same name) the field is named `<table>_by_<fkcol1>[_<fkcolN>]`
+(child side: `…Collection`); a still-colliding field is omitted from the
+schema. Relationship traversal deeper than **8** levels is a GraphQL error.
+
+**Pagination.** Cursors are opaque base64 of the row's primary-key values
+(JSON array); keyset pagination runs on the primary key (lexicographic for
+composite keys). `first`/`after` page forward, `last`/`before` page backward
+(rows always return in ascending-PK base order); `offset` is supported for
+forward pagination. A user `orderBy` (each list element sets **exactly one**
+column — GraphQL input-object field order is not otherwise preservable) sorts
+with an automatic PK tiebreak, but **combining `before`/`after` cursors with
+`orderBy` is rejected with a GraphQL error**: cursors are PK-based and a
+truthful error beats a wrong page. When neither `first` nor `last` is given
+the page size defaults to 30.
+
+**Mutations & transactions.** `atMost` semantics match pg_graphql: the
+mutation runs in a transaction, the affected rows are counted, and if the
+count exceeds `atMost` the transaction **rolls back** and the field errors
+(`update impacts too many records` / `delete impacts too many records`).
+Each mutation field runs in **its own transaction**, sequentially in document
+order; the first error aborts the remaining mutation fields (divergence:
+pg_graphql wraps the whole request in one transaction).
+
+**Introspection.** `__schema`, `__type(name:)` and `__typename` implement
+enough of the introspection spec for GraphiQL / graphql-js clients: types,
+fields, args, enums, input objects, `NON_NULL`/`LIST` wrappers, interfaces
+(`Node`), `queryType`/`mutationType`, and `subscriptionType: null`
+(truthfully — no subscriptions). Directives exposed and executed: `@skip`
+and `@include` only. Variables, aliases, named + inline fragments (including
+fragments on introspection types), and default argument values all work.
+
+**Deliberate divergences from pg_graphql** (everything else out of subset is
+an in-band GraphQL error):
+
+- `totalCount` is always present (pg_graphql requires the
+  `@graphql({"totalCount": {"enabled": true}})` comment directive);
+- cursors + `orderBy` rejected (pg_graphql encodes order values in cursors);
+- one column per `orderBy` list element;
+- each mutation field is its own transaction (see above);
+- `first`/`last` are not clamped to a `max_rows` (pg_graphql clamps to 30);
+- no comment-directive support (`@graphql` renames/inflection), no `nodeId`
+  pseudo-column in filters;
+- **views, functions-as-queries (pg_graphql's function support), computed
+  columns and subscriptions are not reflected/supported** — reaching for
+  them yields "Unknown field" / "subscriptions are not supported" errors;
+- tables without a primary key, with GraphQL-invalid names, or with a column
+  named `nodeId` are not reflected;
+- engine note: insert coercion routes integers through `f64`, so `bigint`
+  values beyond 2⁵³ lose precision engine-wide (REST and GraphQL alike).
+
 ### Not implemented in this slice → typed `501`
 
-`/functions/v1/*` and `/graphql/v1` return
-`{"code":"SUPA_COMPAT_<SERVICE>_NOT_IMPLEMENTED","message":"…","hint":"tracked for a later slice"}`
-with HTTP `501` — functions would need a Deno/edge runtime and graphql a
-pg_graphql-equivalent schema reflection, neither of which the engine provides
-yet. `/health` returns `200 {"status":"ok"}`.
+`/functions/v1/*` returns
+`{"code":"SUPA_COMPAT_FUNCTIONS_NOT_IMPLEMENTED","message":"…","hint":"tracked for a later slice"}`
+with HTTP `501` — functions would need a Deno/edge runtime. `/health` returns
+`200 {"status":"ok"}`.
 
 ---
 
@@ -406,7 +532,10 @@ bad password/refresh token). OAuth/SSO grants (`id_token`, `authorization_code`,
 
 ## 7. Deferred to later slices
 
-- **Edge Functions, GraphQL.** Routed and returning typed `501`; not implemented.
+- **Edge Functions.** Routed and returning typed `501`; not implemented.
+- **GraphQL**: views, pg_graphql function support, computed columns,
+  subscriptions, comment-directive configuration (inflection/renames),
+  order-aware cursors (see §3 GraphQL divergences).
 - **REST**: embedded resources / joins (`select=author(name)`), the full operator
   set (`cs`, `cd`, `ov`, `fts`, `wfts`, …), logical `and`/`or` trees, computed
   columns, true named-argument RPC binding, vertical filtering on embeds.
@@ -503,6 +632,7 @@ curl -s -X POST "http://127.0.0.1:54321/auth/v1/signup" \
 cargo test --features supabase                       # everything
 cargo test --features supabase --test supabase_gateway   # in-process gateway tests
 cargo test --features supabase --test supabase_storage_realtime # storage + pg-meta + realtime
+cargo test --features supabase --test supabase_graphql   # pg_graphql-compatible endpoint
 cargo test --features supabase --lib supabase::          # unit tests
 ```
 

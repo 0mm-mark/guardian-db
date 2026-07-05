@@ -1586,11 +1586,11 @@ async fn realtime_broadcast_between_subscribers() {
 }
 
 // ===========================================================================
-// Gateway: remaining 501 services keep their precise codes
+// Gateway: functions keeps its typed 501; graphql is live
 // ===========================================================================
 
 #[tokio::test]
-async fn functions_and_graphql_remain_typed_501() {
+async fn functions_remains_typed_501_and_graphql_is_live() {
     let h = harness().await;
     let (status, body) = call(
         &h.app,
@@ -1604,7 +1604,17 @@ async fn functions_and_graphql_remain_typed_501() {
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(body["code"], "SUPA_COMPAT_FUNCTIONS_NOT_IMPLEMENTED");
 
-    let (status, body) = call(&h.app, "POST", "/graphql/v1", Some(&h.anon), None, None).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["code"], "SUPA_COMPAT_GRAPHQL_NOT_IMPLEMENTED");
+    // GraphQL is implemented (see tests/supabase_graphql.rs): a real request
+    // executes and returns GraphQL-shaped JSON with HTTP 200.
+    let (status, body) = call(
+        &h.app,
+        "POST",
+        "/graphql/v1",
+        Some(&h.anon),
+        None,
+        Some(json!({"query": "{ __typename }"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["__typename"], "Query");
 }
