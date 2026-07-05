@@ -292,6 +292,49 @@ async fn pg_extension_reflects_installs() {
 }
 
 #[tokio::test]
+async fn runtime_column_reports_extension_strategy() {
+    let mut s = session().await;
+    // `runtime` is a GuardianDB extension column on pg_available_extensions.
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT runtime FROM pg_available_extensions WHERE name = 'pg_trgm'"
+        )
+        .await
+        .as_deref(),
+        Some("native")
+    );
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT runtime FROM pg_available_extensions WHERE name = 'postgis'"
+        )
+        .await
+        .as_deref(),
+        Some("sidecar")
+    );
+    // The sidecar-routed registry entries.
+    let n = scalar(
+        &mut s,
+        "SELECT count(*) FROM pg_available_extensions WHERE runtime = 'sidecar'",
+    )
+    .await;
+    assert_eq!(n.as_deref(), Some("3"));
+    // Without a configured sidecar, installing any of them fails typed, with
+    // an actionable message naming both configuration channels.
+    for name in ["postgis", "timescaledb", "pg_stat_statements"] {
+        let err = s
+            .execute(&format!("CREATE EXTENSION {name}"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.sqlstate(), "0A000", "{name}");
+        let msg = err.to_string();
+        assert!(msg.contains("guardian.sidecar_dsn"), "{msg}");
+        assert!(msg.contains("GUARDIAN_PG_SIDECAR_DSN"), "{msg}");
+    }
+}
+
+#[tokio::test]
 async fn pg_depend_tracks_extension_dependencies() {
     let mut s = session().await;
     ok(&mut s, "CREATE EXTENSION citext").await;

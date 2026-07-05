@@ -18,7 +18,7 @@
 //!
 //! All functions are STRICT: any SQL NULL argument yields NULL.
 
-use super::{ExtCtx, ExtensionDef, any_null, arg_i64, arg_text, no_such};
+use super::{ExtCtx, ExtensionDef, RuntimeStrategy, any_null, arg_i64, arg_text, no_such};
 use crate::relational::SqlValue;
 use crate::sql::error::{Result, SqlError};
 
@@ -41,6 +41,7 @@ pub static DEF: ExtensionDef = ExtensionDef {
     gucs: &[],
     trusted: true,
     call: Some(call),
+    strategy: RuntimeStrategy::Native,
 };
 
 /// Scalar-function entry point. Every function is STRICT, so a NULL anywhere

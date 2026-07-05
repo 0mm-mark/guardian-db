@@ -16,7 +16,7 @@
 //! compare those measures against the extension's three threshold GUCs, and
 //! `<->` is the similarity distance `1 - similarity`.
 
-use super::{ExtCtx, ExtensionDef, GucSpec, any_null, arg_f64, arg_text, no_such};
+use super::{ExtCtx, ExtensionDef, GucSpec, RuntimeStrategy, any_null, arg_f64, arg_text, no_such};
 use crate::relational::SqlValue;
 use crate::sql::error::{Result, SqlError};
 use std::collections::HashSet;
@@ -58,6 +58,7 @@ pub static DEF: ExtensionDef = ExtensionDef {
     ],
     trusted: true,
     call: Some(call),
+    strategy: RuntimeStrategy::Native,
 };
 
 /// Function-call entry point registered in [`DEF`]. All six functions are

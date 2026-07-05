@@ -810,6 +810,12 @@ impl Exec {
                 def.name
             )));
         }
+        // Sidecar-routed extensions are installed by the session (which owns
+        // the async sidecar connection) before dispatch ever reaches here;
+        // reaching this point means no sidecar is configured.
+        if def.strategy == crate::sql::ext::RuntimeStrategy::SidecarPostgres {
+            return Err(crate::sql::ext::sidecar_unconfigured(def.name));
+        }
         if let Some(v) = &ce.version {
             let requested = ident_name(v);
             if requested != def.default_version {

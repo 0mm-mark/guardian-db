@@ -70,7 +70,19 @@ impl ExtCtx<'_> {
 
 type CallFn = fn(&ExtCtx, &str, &[SqlValue]) -> Result<SqlValue>;
 
-/// A natively implemented (or accepted no-op) extension.
+/// How an extension's objects are executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeStrategy {
+    /// Implemented natively inside the GuardianDB engine.
+    Native,
+    /// Delegated to a managed PostgreSQL sidecar process: `CREATE EXTENSION`
+    /// and the statements that use the extension's objects are forwarded over
+    /// the wire protocol.
+    SidecarPostgres,
+}
+
+/// A registry extension: natively implemented, an accepted no-op shim, or a
+/// sidecar-routed PostgreSQL extension.
 pub struct ExtensionDef {
     pub name: &'static str,
     pub default_version: &'static str,
@@ -86,8 +98,12 @@ pub struct ExtensionDef {
     /// `pg_available_extension_versions.trusted`.
     pub trusted: bool,
     /// Function-call entry point; `None` for extensions that contribute no
-    /// callable objects (index-method shims, procedural languages).
+    /// callable objects (index-method shims, procedural languages, and every
+    /// sidecar-routed extension).
     pub call: Option<CallFn>,
+    /// Where the extension runs (surfaced as the GuardianDB-specific
+    /// `pg_available_extensions.runtime` column).
+    pub strategy: RuntimeStrategy,
 }
 
 /// The `plpgsql` shim: PostgreSQL ships every database with it installed. Our
@@ -105,6 +121,7 @@ static PLPGSQL: ExtensionDef = ExtensionDef {
     gucs: &[],
     trusted: true,
     call: None,
+    strategy: RuntimeStrategy::Native,
 };
 
 /// Index-method shims: GuardianDB indexes are engine-native, so GIN/GiST
@@ -120,6 +137,7 @@ static BTREE_GIN: ExtensionDef = ExtensionDef {
     gucs: &[],
     trusted: true,
     call: None,
+    strategy: RuntimeStrategy::Native,
 };
 
 static BTREE_GIST: ExtensionDef = ExtensionDef {
@@ -132,18 +150,69 @@ static BTREE_GIST: ExtensionDef = ExtensionDef {
     gucs: &[],
     trusted: true,
     call: None,
+    strategy: RuntimeStrategy::Native,
+};
+
+/// Sidecar-routed extensions: these cannot be reimplemented natively (C code,
+/// planner hooks, background workers), so GuardianDB delegates them to a
+/// managed PostgreSQL sidecar. They contribute no local functions or types;
+/// the statements that use them reach the sidecar through the routing rules
+/// in [`crate::sql::engine::Session`].
+static PG_STAT_STATEMENTS: ExtensionDef = ExtensionDef {
+    name: "pg_stat_statements",
+    default_version: "1.10",
+    comment: "track planning and execution statistics of all SQL statements executed \
+              (runs on the PostgreSQL sidecar runtime)",
+    requires: &[],
+    functions: &[],
+    types: &[],
+    gucs: &[],
+    trusted: false,
+    call: None,
+    strategy: RuntimeStrategy::SidecarPostgres,
+};
+
+static POSTGIS: ExtensionDef = ExtensionDef {
+    name: "postgis",
+    default_version: "3.4.2",
+    comment: "PostGIS geometry and geography spatial types and functions \
+              (runs on the PostgreSQL sidecar runtime)",
+    requires: &[],
+    functions: &[],
+    types: &[],
+    gucs: &[],
+    trusted: true,
+    call: None,
+    strategy: RuntimeStrategy::SidecarPostgres,
+};
+
+static TIMESCALEDB: ExtensionDef = ExtensionDef {
+    name: "timescaledb",
+    default_version: "2.15.2",
+    comment: "Enables scalable inserts and complex queries for time-series data \
+              (runs on the PostgreSQL sidecar runtime)",
+    requires: &[],
+    functions: &[],
+    types: &[],
+    gucs: &[],
+    trusted: false,
+    call: None,
+    strategy: RuntimeStrategy::SidecarPostgres,
 };
 
 /// Every extension that `CREATE EXTENSION` accepts, in `pg_available_extensions`
 /// order. Names not in this list are rejected with a typed error.
-static AVAILABLE: [&ExtensionDef; 10] = [
+static AVAILABLE: [&ExtensionDef; 13] = [
     &BTREE_GIN,
     &BTREE_GIST,
     &citext::DEF,
     &fuzzystrmatch::DEF,
+    &PG_STAT_STATEMENTS,
     &pg_trgm::DEF,
     &pgcrypto::DEF,
     &PLPGSQL,
+    &POSTGIS,
+    &TIMESCALEDB,
     &unaccent::DEF,
     &uuid_ossp::DEF,
     &vector::DEF,
@@ -151,6 +220,17 @@ static AVAILABLE: [&ExtensionDef; 10] = [
 
 pub fn available() -> &'static [&'static ExtensionDef] {
     &AVAILABLE
+}
+
+/// The error for installing or using a sidecar-routed extension while no
+/// sidecar DSN is configured, naming both configuration channels.
+pub fn sidecar_unconfigured(name: &str) -> SqlError {
+    SqlError::FeatureNotSupported(format!(
+        "extension \"{name}\" runs on the PostgreSQL sidecar runtime and no sidecar is \
+         configured — SET guardian.sidecar_dsn = \
+         'postgres://user:pass@host:port/db?sslmode=disable' for this session, or set the \
+         GUARDIAN_PG_SIDECAR_DSN environment variable"
+    ))
 }
 
 pub fn find(name: &str) -> Option<&'static ExtensionDef> {
