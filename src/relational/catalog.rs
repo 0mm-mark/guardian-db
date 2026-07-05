@@ -14,6 +14,16 @@ use std::collections::BTreeMap;
 /// First OID handed out to user objects (mirrors PostgreSQL's `FirstNormalObjectId`).
 pub const FIRST_USER_OID: u32 = 16384;
 
+/// Suffix marking a catalog extension entry as bound to the PostgreSQL
+/// sidecar runtime. Stored inside the version string (`"1.10@sidecar"`) so
+/// the serialized catalog shape is unchanged and old documents keep loading.
+/// Native version strings never contain `@` (they come from the registry).
+const SIDECAR_MARKER: &str = "@sidecar";
+
+fn strip_sidecar_marker(version: &str) -> &str {
+    version.strip_suffix(SIDECAR_MARKER).unwrap_or(version)
+}
+
 /// A `(schema, name)` key used throughout the catalog.
 ///
 /// Because it is used as a `BTreeMap` key and serialized to JSON (where map keys
@@ -123,6 +133,47 @@ pub struct CheckConstraint {
     pub expr: String,
 }
 
+/// The command class a row-security policy applies to (`FOR ALL | SELECT |
+/// INSERT | UPDATE | DELETE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyCmd {
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl PolicyCmd {
+    /// The `pg_policies.cmd` spelling.
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            PolicyCmd::All => "ALL",
+            PolicyCmd::Select => "SELECT",
+            PolicyCmd::Insert => "INSERT",
+            PolicyCmd::Update => "UPDATE",
+            PolicyCmd::Delete => "DELETE",
+        }
+    }
+}
+
+/// A row-level security policy (`CREATE POLICY`). Expressions are stored as
+/// raw SQL text (validated to parse at CREATE time) and evaluated per row at
+/// execution time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Policy {
+    pub name: String,
+    pub cmd: PolicyCmd,
+    /// Roles the policy applies to; empty means PUBLIC (every role).
+    pub roles: Vec<String>,
+    /// Raw SQL text of the `USING` expression (visibility of existing rows).
+    pub using_expr: Option<String>,
+    /// Raw SQL text of the `WITH CHECK` expression (validity of new rows).
+    pub check_expr: Option<String>,
+    /// `AS PERMISSIVE` (ORed) vs `AS RESTRICTIVE` (ANDed).
+    pub permissive: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Table {
     pub oid: u32,
@@ -135,11 +186,28 @@ pub struct Table {
     pub checks: Vec<CheckConstraint>,
     /// Opaque storage collection name for this table's rows.
     pub storage_collection: String,
+    /// `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`. Defaults to `false` so
+    /// catalogs written before this field existed keep loading unchanged.
+    #[serde(default)]
+    pub rls_enabled: bool,
+    /// `ALTER TABLE ... FORCE ROW LEVEL SECURITY`: owner roles lose their
+    /// row-security exemption on this table. Same backward-compatible serde
+    /// default as `rls_enabled`.
+    #[serde(default)]
+    pub rls_forced: bool,
+    /// Row-security policies (`CREATE POLICY`). Same backward-compatible
+    /// serde default as `rls_enabled`.
+    #[serde(default)]
+    pub policies: Vec<Policy>,
 }
 
 impl Table {
     pub fn column(&self, name: &str) -> Option<&Column> {
         self.columns.iter().find(|c| c.name == name)
+    }
+
+    pub fn policy(&self, name: &str) -> Option<&Policy> {
+        self.policies.iter().find(|p| p.name == name)
     }
 
     pub fn column_mut(&mut self, name: &str) -> Option<&mut Column> {
@@ -205,6 +273,10 @@ pub struct Catalog {
     views: BTreeMap<QualifiedName, View>,
     next_oid: u32,
     pub search_path: Vec<String>,
+    /// Installed extensions: name -> installed version. Persisted with the
+    /// catalog document, so installs replicate like any other DDL.
+    #[serde(default)]
+    extensions: BTreeMap<String, String>,
 }
 
 impl Catalog {
@@ -219,7 +291,12 @@ impl Catalog {
             views: BTreeMap::new(),
             next_oid: FIRST_USER_OID,
             search_path: vec!["public".to_string()],
+            extensions: BTreeMap::new(),
         };
+        // PostgreSQL databases have plpgsql installed by default.
+        catalog
+            .extensions
+            .insert("plpgsql".to_string(), "1.0".to_string());
         // System schemas always present.
         for sys in ["pg_catalog", "information_schema"] {
             let oid = catalog.allocate_oid();
@@ -242,6 +319,70 @@ impl Catalog {
             },
         );
         catalog
+    }
+
+    /// Installed extensions as (name, version) pairs, sorted by name.
+    pub fn extensions(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.extensions
+            .iter()
+            .map(|(k, v)| (k.as_str(), strip_sidecar_marker(v)))
+    }
+
+    /// The installed version of `name`, if installed.
+    pub fn extension_version(&self, name: &str) -> Option<&str> {
+        self.extensions.get(name).map(|v| strip_sidecar_marker(v))
+    }
+
+    pub fn extension_installed(&self, name: &str) -> bool {
+        self.extensions.contains_key(name)
+    }
+
+    /// Whether `name` is installed *and* bound to the PostgreSQL sidecar
+    /// runtime (see [`Catalog::install_sidecar_extension`]).
+    pub fn extension_is_sidecar(&self, name: &str) -> bool {
+        self.extensions
+            .get(name)
+            .map(|v| v.ends_with(SIDECAR_MARKER))
+            .unwrap_or(false)
+    }
+
+    /// Record an extension as installed. Returns `false` if it already was.
+    pub fn install_extension(&mut self, name: &str, version: &str) -> bool {
+        self.extensions
+            .insert(name.to_string(), version.to_string())
+            .is_none()
+    }
+
+    /// Record an extension as installed on the PostgreSQL sidecar runtime.
+    /// The binding is encoded as a `@sidecar` suffix inside the stored version
+    /// string, so old catalog documents (plain version strings) keep loading
+    /// unchanged. Returns `false` if the extension was already installed.
+    pub fn install_sidecar_extension(&mut self, name: &str, version: &str) -> bool {
+        self.extensions
+            .insert(name.to_string(), format!("{version}{SIDECAR_MARKER}"))
+            .is_none()
+    }
+
+    /// Remove an installed extension. Returns `false` if it was not installed.
+    pub fn uninstall_extension(&mut self, name: &str) -> bool {
+        self.extensions.remove(name).is_some()
+    }
+
+    /// Update the stored version of an installed extension (`ALTER EXTENSION
+    /// ... UPDATE`), preserving a sidecar binding. Returns `false` if the
+    /// extension is not installed.
+    pub fn set_extension_version(&mut self, name: &str, version: &str) -> bool {
+        match self.extensions.get_mut(name) {
+            Some(v) => {
+                *v = if v.ends_with(SIDECAR_MARKER) {
+                    format!("{version}{SIDECAR_MARKER}")
+                } else {
+                    version.to_string()
+                };
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn allocate_oid(&mut self) -> u32 {
@@ -381,11 +522,32 @@ impl Catalog {
         Ok(())
     }
 
+    /// Foreign keys on *other* tables whose referenced table is `q` (the
+    /// constraint's declaring table plus the constraint itself).
+    pub fn referencing_foreign_keys(&self, q: &QualifiedName) -> Vec<(QualifiedName, ForeignKey)> {
+        let mut out = Vec::new();
+        for table in self.tables.values() {
+            for fk in &table.foreign_keys {
+                if fk.ref_schema == q.schema && fk.ref_table == q.name {
+                    out.push((table.qualified(), fk.clone()));
+                }
+            }
+        }
+        out
+    }
+
     pub fn drop_table_qualified(&mut self, q: &QualifiedName) -> Result<Table> {
         let table = self
             .tables
             .remove(q)
             .ok_or_else(|| RelError::UndefinedTable(q.to_string_qualified()))?;
+        // Foreign keys on other tables referencing the dropped table go with it
+        // (DROP ... CASCADE drops the dependent constraint in PostgreSQL; the
+        // executor guards the non-CASCADE path with 2BP01 before calling this).
+        for t in self.tables.values_mut() {
+            t.foreign_keys
+                .retain(|fk| !(fk.ref_schema == q.schema && fk.ref_table == q.name));
+        }
         // Drop dependent indexes and sequences.
         let idx_keys: Vec<QualifiedName> = self
             .indexes
@@ -565,6 +727,9 @@ mod tests {
             foreign_keys: vec![],
             checks: vec![],
             storage_collection: String::new(),
+            rls_enabled: false,
+            rls_forced: false,
+            policies: vec![],
         }
     }
 
@@ -625,6 +790,30 @@ mod tests {
         cat.insert_table(t).unwrap();
         assert!(cat.drop_schema("app", false, false).is_err());
         assert!(cat.drop_schema("app", false, true).is_ok());
+    }
+
+    #[test]
+    fn sidecar_extension_marker_round_trips() {
+        let mut cat = Catalog::new("app");
+        cat.install_sidecar_extension("pg_stat_statements", "1.10");
+        assert!(cat.extension_installed("pg_stat_statements"));
+        assert!(cat.extension_is_sidecar("pg_stat_statements"));
+        // Readers never see the marker.
+        assert_eq!(cat.extension_version("pg_stat_statements"), Some("1.10"));
+        assert!(
+            cat.extensions()
+                .any(|(n, v)| n == "pg_stat_statements" && v == "1.10")
+        );
+        // Version updates preserve the binding; native installs never carry it.
+        cat.set_extension_version("pg_stat_statements", "1.11");
+        assert!(cat.extension_is_sidecar("pg_stat_statements"));
+        assert_eq!(cat.extension_version("pg_stat_statements"), Some("1.11"));
+        assert!(!cat.extension_is_sidecar("plpgsql"));
+        // The serialized shape is still a plain name -> string map.
+        let json = serde_json::to_value(&cat).unwrap();
+        let back: Catalog = serde_json::from_value(json).unwrap();
+        assert!(back.extension_is_sidecar("pg_stat_statements"));
+        assert_eq!(back.extension_version("plpgsql"), Some("1.0"));
     }
 
     #[test]

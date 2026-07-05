@@ -91,16 +91,46 @@ gateway **exactly** as to the in-memory one — same wire protocol, same SQL, no
 GuardianDB-specific code. The full runnable source is
 [`examples/postgres_iroh_gateway.rs`](../examples/postgres_iroh_gateway.rs).
 
-## 2. Connecting with `psql`
+## 2. Connection strings
+
+Every standard client connects with an ordinary PostgreSQL connection string
+(URI). With the default gateway flags the canonical string is:
+
+```
+postgres://guardian:guardian@127.0.0.1:15432/app?sslmode=disable
+```
+
+- **user/password** — `guardian`/`guardian` by default (`--username` to change;
+  the gateway accepts the password without enforcing it).
+- **database** — `app` by default (`--database`).
+- **`sslmode=disable`** — the gateway is a plaintext loopback TCP socket and
+  does not negotiate TLS. libpq-based clients (`psql`, DBeaver, Python's
+  `psycopg`) may try SSL first, so pass `sslmode=disable` explicitly;
+  node-postgres and TypeORM default to no-SSL and work without it.
+
+### `psql`
 
 ```bash
-psql 'postgres://guardian:guardian@127.0.0.1:15432/app'
+psql 'postgres://guardian:guardian@127.0.0.1:15432/app?sslmode=disable'
 ```
 
 ```sql
 CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT UNIQUE NOT NULL, data JSONB);
 INSERT INTO users (email, data) VALUES ('a@x.com', '{"plan":"pro"}') RETURNING id;
 SELECT count(*) FROM users;
+```
+
+### node-postgres (`pg`)
+
+```ts
+import pg from "pg";
+
+const client = new pg.Client({
+  connectionString: "postgres://guardian:guardian@127.0.0.1:15432/app?sslmode=disable",
+});
+await client.connect();
+const { rows } = await client.query("SELECT count(*) FROM users");
+await client.end();
 ```
 
 ## 3. Connecting with TypeORM (`type: "postgres"`)
@@ -121,6 +151,18 @@ const ds = new DataSource({
   entities: [User, Post, Org],
 });
 await ds.initialize();
+```
+
+Or equivalently with a single connection string via `url`:
+
+```ts
+const ds = new DataSource({
+  type: "postgres",
+  url: process.env.DATABASE_URL ?? "postgres://guardian:guardian@127.0.0.1:15432/app",
+  ssl: false,
+  synchronize: true,
+  entities: [User, Post, Org],
+});
 ```
 
 `synchronize`, schema **re-introspection**, migrations (`QueryRunner`),
@@ -208,43 +250,361 @@ exposes them as strings — use `pg.types` parsers if you need `BigInt`).
 
 ### Constraints & indexes
 - `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`
-- `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` actions (metadata + parsing;
-  **local enforcement of cascade/restrict is a documented gap**, see below)
+- `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` actions — declared,
+  introspectable **and enforced** (`MATCH SIMPLE`), see the "Foreign keys"
+  subsection below
 - real BTree indexes: primary-key, unique, secondary, composite; maintained on
   insert/update/delete; used for equality index scans (the planner chooses an
   index scan when a single base table is filtered by `col = const` on an indexed
   column, and falls back to a full scan otherwise — results are identical).
+
+#### Foreign keys: enforced (`MATCH SIMPLE`)
+
+Foreign-key constraints are parsed (column-level `REFERENCES` and table-level
+`FOREIGN KEY`, including `ON DELETE` / `ON UPDATE` actions), stored in the
+replicated catalog, fully introspectable, **and enforced at runtime** with
+PostgreSQL's default `MATCH SIMPLE` semantics (`src/sql/fk.rs`):
+
+- `INSERT` into the referencing table — and any `UPDATE` that changes an FK
+  column's value — requires a parent row matching **all** referenced columns,
+  else SQLSTATE `23503`
+  (`insert or update on table "child" violates foreign key constraint "..."`,
+  with a PG-style `Key (...)=(...) is not present` detail). If **any** FK
+  column is NULL the constraint is satisfied (`MATCH SIMPLE`).
+- `DELETE` of a referenced row, or an `UPDATE` that actually changes a
+  referenced key column's value, executes the declared action:
+
+  | action | behaviour |
+  | ------ | --------- |
+  | `NO ACTION` (default), `RESTRICT` | `23503` (`update or delete on table "parent" violates foreign key constraint "..." on table "child"`) if a referencing row remains |
+  | `CASCADE` | deletes the referencing rows (or rewrites their FK columns to the new key), recursively applying *their* declared FK actions; self-referential chains terminate |
+  | `SET NULL` | sets the FK columns to NULL (a NOT NULL column surfaces the usual `23502`) |
+  | `SET DEFAULT` | sets the FK columns to their column defaults, then re-checks the constraint against the remaining parent rows (`23503` if the defaults reference nothing; all-NULL defaults satisfy `MATCH SIMPLE`) |
+
+- `NO ACTION` and `RESTRICT` are both checked **per statement** — after the
+  statement's own writes and cascades have applied — never deferred to
+  commit. Accordingly, `DEFERRABLE` / `INITIALLY DEFERRED` constraints are
+  rejected with `0A000` (`DEFERRABLE constraints are not supported`), as are
+  `MATCH FULL` / `MATCH PARTIAL` (only `MATCH SIMPLE` is implemented) and
+  `NOT ENFORCED`.
+- Referential actions run through the normal write path (row locks, staged
+  storage mutations), so a failing statement leaves nothing behind and
+  `ROLLBACK` undoes cascades atomically. Like PostgreSQL — which runs
+  referential actions with the table owner's privileges — the internal
+  child-row reads and writes **bypass row-level security**.
+- `TRUNCATE` of a referenced table is rejected (`0A000`, as in PostgreSQL)
+  unless every referencing table is truncated in the same statement. A plain
+  `DROP TABLE` of a referenced table fails with `2BP01` (dependent objects
+  still exist); `DROP TABLE ... CASCADE` drops the dependent constraints
+  instead. Because enforcement needs a resolvable parent, a foreign key
+  referencing a missing table or column is rejected at DDL time
+  (`42P01`/`42703`), and `REFERENCES parent` without a column list binds to
+  the parent's primary key.
+
+Like uniqueness (§8), this is **local-replica** enforcement: checks and
+actions see the locally materialized state, and cross-replica convergence
+follows the same eventual rules as all other writes.
+
+Deliberate simplifications vs PostgreSQL, kept honest here: the referenced
+columns are not required to carry a `UNIQUE`/`PRIMARY KEY` constraint at DDL
+time (PostgreSQL's `42830`) — if duplicate parent keys exist, a key counts as
+still-present while any duplicate survives; and there is no deferral of any
+kind (see the `0A000` rejections above).
+
+Introspection is unchanged: `pg_constraint` reports `contype = 'f'` with
+`confupdtype`/`confdeltype` reflecting the declared actions
+(`a`/`r`/`c`/`n`/`d`), and `information_schema.table_constraints`,
+`key_column_usage`, `constraint_column_usage` and `referential_constraints`
+(with `update_rule`/`delete_rule`) all show them. `tests/sql_conformance.rs`
+pins the enforcement matrix (`foreign_keys_enforced_on_insert_and_child_update`,
+`foreign_keys_restrict_and_no_action_block_parent_delete`,
+`foreign_key_on_delete_*`, `foreign_key_on_update_actions`,
+`foreign_key_cascade_is_atomic_and_rolls_back`,
+`composite_foreign_key_match_simple`,
+`referenced_parent_guarded_on_drop_and_truncate`).
 
 ### Catalog / introspection
 Queryable `information_schema` (`tables`, `columns`, `schemata`,
 `table_constraints`, `key_column_usage`, `constraint_column_usage`,
 `referential_constraints`, `views`) and `pg_catalog` (`pg_class`,
 `pg_attribute`, `pg_type`, `pg_namespace`, `pg_index`, `pg_constraint`,
-`pg_database`, `pg_indexes`, `pg_attrdef`, `pg_am`, `pg_roles`, and empty
+`pg_database`, `pg_indexes`, `pg_attrdef`, `pg_am`, `pg_roles`, `pg_tables`
+(with `rowsecurity`), `pg_policies`, and empty
 `pg_description`/`pg_enum`/`pg_collation`/`pg_settings`). This is enough for
 TypeORM schema sync, migrations and QueryRunner inspection, and for
 node-postgres metadata.
 
+### Row-Level Security
+
+Row security is implemented with PostgreSQL semantics (`src/sql/rls.rs`).
+
+**Syntax**
+
+```sql
+ALTER TABLE t ENABLE ROW LEVEL SECURITY;   -- and DISABLE
+ALTER TABLE t FORCE ROW LEVEL SECURITY;    -- and NO FORCE
+CREATE POLICY name ON t
+  [ AS { PERMISSIVE | RESTRICTIVE } ]
+  [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
+  [ TO role [, ...] ]                       -- omitted / PUBLIC = every role
+  [ USING (expression) ]
+  [ WITH CHECK (expression) ];
+DROP POLICY [ IF EXISTS ] name ON t;
+```
+
+Policies live in the replicated catalog document, so they replicate (and
+persist) like any other DDL. Expressions are stored as SQL text and validated
+at `CREATE POLICY` time (unparseable expressions are rejected with `42601`);
+PostgreSQL's clause rules are enforced (`USING` is not allowed `FOR INSERT`;
+`WITH CHECK` is not allowed `FOR SELECT`/`FOR DELETE`). A duplicate policy
+name on the same table is `42710`; dropping a missing policy is `42704`.
+
+**Semantics** (matching PostgreSQL)
+
+- A row is visible/allowed iff **any** applicable PERMISSIVE policy passes
+  **and all** applicable RESTRICTIVE policies pass. Expressions evaluating to
+  false **or NULL** deny.
+- `rls_enabled` with **no** applicable policy is **default-deny**: `SELECT`
+  returns nothing, `UPDATE`/`DELETE` affect nothing, `INSERT` fails.
+- Per command: `SELECT` and `DELETE` filter with `USING`; `UPDATE` filters
+  old rows with `USING` and checks new rows with `WITH CHECK` (falling back
+  to `USING`); `INSERT` checks `WITH CHECK`. `FOR ALL` matches every command.
+  `INSERT ... ON CONFLICT DO UPDATE` additionally requires the conflicting
+  row to pass the UPDATE policies' `USING`.
+- Enforcement happens where table rows become visible to execution, so
+  joins, subqueries, CTEs, index scans and `SELECT ... FOR UPDATE` all
+  inherit the filtering. A denied new row raises
+  `new row violates row-level security policy for table "t"` (SQLSTATE
+  `42501`).
+- **Bypass and FORCE**: the role `service_role` (the `BYPASSRLS` equivalent)
+  bypasses row security entirely; `postgres` and `guardian` (the engine's
+  owner names) bypass it like PostgreSQL table owners — until a table
+  declares `ALTER TABLE t FORCE ROW LEVEL SECURITY`, which subjects the owner
+  roles to its policies too (`NO FORCE` restores the exemption, and
+  `BYPASSRLS` beats `FORCE`, as in PostgreSQL). FORCE only matters while row
+  security is enabled, and the flag is introspectable as
+  `pg_class.relforcerowsecurity`. Tables with row security disabled are never
+  filtered.
+
+**Policy helpers.** Supabase's `auth.*` helpers are built in:
+
+- `auth.uid()` — the caller's user id: the `sub` claim of
+  `request.jwt.claims` (or the `request.jwt.claim.sub` variable), as `uuid`;
+  `NULL` when unset.
+- `auth.role()` — the `role` claim, as `text`.
+- `auth.jwt()` — the whole claims document, as `jsonb`.
+
+Claims are ordinary session variables: `SET request.jwt.claims = '{"sub":
+"...", "role": "authenticated"}'` (or `set_config(...)`) makes them visible
+to `current_setting('request.jwt.claims')` and the helpers above. The
+Supabase gateway injects them automatically per request.
+
 ---
 
-## 6. Unsupported SQL (documented gaps)
+## 6. Extensions
+
+GuardianDB's SQL engine is a from-scratch Rust engine, so PostgreSQL's binary
+extension ABI (C shared libraries loaded into the server) cannot apply.
+`CREATE EXTENSION` is still fully supported, through a **fixed registry** of
+extensions (`src/sql/ext/`): installing one flips a per-database flag in the
+replicated catalog document (so installs replicate like any other DDL) and
+gates that extension's functions, operators, types and GUCs. Anything outside
+the registry fails with a typed `0A000` error pointing at
+`pg_available_extensions` — never silently.
+
+### Registry
+
+Every registry entry declares a **runtime strategy**: `native` (implemented
+inside the engine) or `sidecar` (delegated to a managed PostgreSQL sidecar
+process, see below). The strategy is surfaced as the `runtime` column of
+`pg_available_extensions` — a GuardianDB extension column that PostgreSQL does
+not have.
+
+| Extension             | Version | Runtime | Provides                                                        |
+| --------------------- | ------- | ------- | --------------------------------------------------------------- |
+| `btree_gin`           | 1.3     | native  | no-op shim (GuardianDB indexes are engine-native)                |
+| `btree_gist`          | 1.7     | native  | no-op shim                                                       |
+| `citext`              | 1.6     | native  | case-insensitive `CITEXT` type (comparison, UNIQUE, output case) |
+| `cube`                | 1.5     | native  | `CUBE` type, `cube_*` functions, `@>`/`<@`/`&&`/`<->` operators  |
+| `earthdistance`       | 1.2     | native  | `ll_to_earth`, `earth_distance`, `earth_box` (requires `cube`)   |
+| `fuzzystrmatch`       | 1.2     | native  | `levenshtein`, `soundex`, `difference`, `metaphone`, `dmetaphone`|
+| `hstore`              | 1.8     | native  | `HSTORE` type, `->`/`\|\|`/`?`/`-`/`@>`/`<@` operators, functions|
+| `intarray`            | 1.5     | native  | int[] functions + `&&`/`@>`/`<@`/`+`/`-`/`\|`/`&`/`#` operators  |
+| `ltree`               | 1.3     | native  | `LTREE` type, lquery `~` matching, `@>`/`<@`, path functions     |
+| `pg_stat_statements`  | 1.10    | sidecar | statement planning/execution statistics                          |
+| `pg_trgm`             | 1.6     | native  | `similarity`, `%`/`<->` operators, `pg_trgm.similarity_threshold`|
+| `pgcrypto`            | 1.3     | native  | `digest`, `hmac`, `crypt`/`gen_salt`, `encode`/`decode`, ...     |
+| `plpgsql`             | 1.0     | native  | pre-installed shim (function bodies are not executable)          |
+| `postgis`             | 3.4.2   | sidecar | spatial types and functions                                      |
+| `timescaledb`         | 2.15.2  | sidecar | time-series hypertables and queries                              |
+| `unaccent`            | 1.1     | native  | `unaccent()` accent stripping                                    |
+| `uuid-ossp`           | 1.1     | native  | `uuid_generate_v1/v3/v4/v5`, namespace constants                 |
+| `vector`              | 0.8.1   | native  | pgvector: `VECTOR(n)` type, `<->`/`<#>`/`<=>`/`<+>`, distances   |
+
+The tier-2 contrib set (`hstore`, `intarray`, `ltree`, `cube`,
+`earthdistance`) is implemented natively with semantics verified against live
+PostgreSQL 16.13 contrib output (text formats, key ordering, operator truth
+tables, function edge cases — the exact vectors live in the modules' unit
+tests). Notes and deliberate deviations:
+
+* **hstore** — full text syntax (quoting, escapes, `NULL` values, first
+  duplicate key wins) and contrib's internal (length, bytes) key order in
+  output and `akeys`/`avals`. Set-returning members (`each`, setof
+  `skeys`/`svals`) need SRF machinery the engine lacks; `akeys`/`avals`
+  return the same data as arrays. `?&`/`?|` and the record functions are not
+  implemented. `hstore_to_json` output is compact JSON (PostgreSQL prints
+  `{"a": "1"}` with spaces; the content is identical).
+* **intarray** — no new types; functions reject non-integer arrays with
+  `42846` and NULL elements with a typed error (PostgreSQL uses `22004`;
+  GuardianDB reports `22023`). All binary operators route (`&&`, `@>`, `<@`,
+  `+`, `-`, `|`, `&`, `#`); the `query_int` type with `@@`/`~~` is not
+  implemented, and the *prefix* `#` count operator is function-only
+  (`icount`).
+* **ltree** — labels of alphanumerics/`_`/`-` (hyphens per PostgreSQL 16),
+  the empty zero-level path, label-wise ordering (also in index keys). `~`
+  implements the documented lquery language: `@`/`*`/`%` modifiers, `|`
+  alternation, `!` negation, and `{n}`/`{n,}`/`{,m}`/`{n,m}` quantifiers on
+  star and non-star items. The `lquery`/`ltxtquery` named types are not
+  registered — write patterns as plain string literals (`path ~ 'a.*'`), not
+  `::lquery` casts; `@@` full-text matching and the ltree[] array operators
+  are not implemented.
+* **cube** — exact contrib text forms (corner order preserved, coincident
+  corners print as points), normalized accessors and predicates, inverted
+  `cube_inter` results for disjoint inputs (like PostgreSQL). The
+  `cube(cube, ...)` dimension-appending constructors, `~>` coordinate
+  extraction, taxicab/chebyshev distance operators and the zero-dimensional
+  `'()'` cube are not implemented.
+* **earthdistance** — declares `requires: cube`, so plain `CREATE EXTENSION
+  earthdistance` fails `0A000` naming the requirement and `... CASCADE`
+  installs both. The `earth` domain is not enforced (any cube is accepted);
+  the point-based `<@>` operator is out (no `point` type).
+
+sqlparser 0.62 requires the `WITH` noise word before `CREATE EXTENSION`
+options; GuardianDB re-normalizes on the parse-error path so PostgreSQL's
+`CREATE EXTENSION earthdistance CASCADE` spelling works unchanged.
+
+**Explicitly not available** (fail `CREATE EXTENSION` with a typed `0A000`):
+
+| Missing     | Reason                                                         |
+| ----------- | -------------------------------------------------------------- |
+| `isn`       | check-digit type family (ISBN/ISSN/EAN13/UPC) pending           |
+| `lo`        | no large-object (`pg_largeobject`) infrastructure               |
+| `tablefunc` | `crosstab` requires set-returning-function-over-query machinery |
+
+Introspection matches PostgreSQL: `pg_extension`, `pg_available_extensions`,
+and `pg_available_extension_versions` are queryable; functions of a
+not-installed extension fail with `42883` naming the extension to install, and
+extension-owned types fail DDL with `42704` until installed. `DROP EXTENSION`
+honours RESTRICT when table columns depend on an extension type (and refuses
+CASCADE explicitly rather than destroying data).
+
+`pg_depend` reports the dependencies GuardianDB tracks, with PostgreSQL's
+catalog class OIDs: one `deptype = 'n'` row per installed extension
+(`classid = 3079` → `refclassid = 2615`, the `pg_catalog` namespace), and one
+row per table column whose type is extension-owned (`classid = 1259`,
+`objid` = table OID, `objsubid` = column attnum, `refclassid = 3079`,
+`refobjid` = the extension's `pg_extension` row) — the same relationship that
+blocks `DROP EXTENSION`.
+
+### ALTER EXTENSION
+
+sqlparser (0.62) has no `ALTER EXTENSION` AST, so the session recognizes it
+*before* the general parser: input is split into top-level statements with a
+quote-/comment-aware splitter, `ALTER EXTENSION` segments are hand-parsed, and
+everything else flows through the normal parser unchanged, in order.
+
+| Form                                   | Behaviour                                                        |
+| -------------------------------------- | ---------------------------------------------------------------- |
+| `ALTER EXTENSION x UPDATE`             | updates the stored version to the registry version (`ALTER EXTENSION` tag) |
+| `ALTER EXTENSION x UPDATE TO 'v'`      | same if `v` is the available version; otherwise `42704` naming it |
+| on a not-installed extension           | `42704` (`extension "x" does not exist`)                          |
+| `ALTER EXTENSION x SET SCHEMA s`       | `0A000` — no registry extension is relocatable                    |
+| `ALTER EXTENSION x ADD/DROP object`    | `0A000` — PostgreSQL reserves membership changes for extension scripts |
+
+`ALTER EXTENSION` participates in transactions like any DDL (staged on the
+open block, aborts it on error). It is **simple-protocol only**: preparing it
+through the extended query protocol fails with a `42601` error saying so.
+
+### The PostgreSQL sidecar runtime
+
+Extensions that cannot be reimplemented in the engine (C code, planner hooks,
+background workers — PostGIS, TimescaleDB, pg_stat_statements) are delegated
+to a **managed PostgreSQL sidecar**: a real PostgreSQL process the operator
+runs next to GuardianDB. GuardianDB ships its own minimal wire-protocol
+*client* (`src/sql/ext/sidecar.rs`) — plaintext protocol 3.0, trust or
+cleartext-password auth, simple query protocol, text results — and each
+session lazily pins one sidecar connection (closed when the session ends).
+
+**Configuration** — two channels, session GUC first, environment second:
+
+```sql
+SET guardian.sidecar_dsn = 'postgres://user:pass@host:5432/db?sslmode=disable';
+```
+
+```bash
+export GUARDIAN_PG_SIDECAR_DSN='postgres://user:pass@host:5432/db?sslmode=disable'
+```
+
+The DSN is a standard `postgres://` URI (`%XX` escapes decoded; the database
+defaults to the user, like libpq). Because the client is plaintext-only,
+`sslmode` must be absent or `disable` — anything else is rejected with
+`0A000`. Other URI parameters are accepted and ignored. `SET
+guardian.sidecar_dsn = ''` disables routing for the session.
+
+**Routing rules**
+
+1. `CREATE EXTENSION` of a sidecar-strategy extension: with no DSN configured
+   it fails `0A000` naming both configuration channels; with a DSN it is
+   forwarded **verbatim** to the sidecar, and on success the install is
+   recorded in the (replicated) local catalog with the version the sidecar
+   reports (`SELECT extversion FROM pg_extension ...`), marked as
+   sidecar-bound.
+2. A statement that fails locally with **undefined function (`42883`),
+   undefined type, or undefined relation (`42P01`)** while a DSN is
+   configured is forwarded verbatim and the sidecar's result (or its
+   SQLSTATE-tagged error) is returned. This is what makes
+   `SELECT ST_AsText(...)` or `SELECT * FROM pg_stat_statements` work: the
+   objects only exist on the sidecar. Statements with bound (`$n`) parameters
+   are not forwarded — the extended protocol keeps the local error.
+3. `DROP EXTENSION` of a sidecar-bound extension forwards the drop to the
+   sidecar, then removes the local record. Without a configured DSN it fails
+   `0A000` with the configuration hint.
+
+**Transaction limitation.** The sidecar cannot join a local GuardianDB
+transaction, so sidecar routing is **autocommit-only**: inside an explicit
+`BEGIN ... COMMIT` block, fallback-forwarding is disabled — the local error is
+kept (same SQLSTATE) with a hint appended — and sidecar `CREATE`/`DROP
+EXTENSION` are refused with `0A000`.
+
+Sidecar errors arrive as ordinary SQLSTATE-tagged errors: the sidecar's code
+and message are preserved verbatim, so clients cannot tell them apart from
+local errors. The wire-level conformance tests (`tests/sql_extensions.rs`)
+drive a second GuardianDB pgwire server as the mock sidecar, and an
+`#[ignore]`d `sidecar_real_postgres` test runs the full flow — `initdb`, real
+`CREATE EXTENSION pg_stat_statements`, stats query over the wire — against a
+local PostgreSQL 16 (`cargo test --features sql --test sql_extensions --
+--ignored`).
+
+---
+
+## 7. Unsupported SQL (documented gaps)
 
 Each gap has a conformance test in `tests/sql_conformance.rs`
 (clean-failure tests pass; intended-future features are `#[ignore]`d).
 
 | Feature                              | Status | Behaviour                              |
 | ------------------------------------ | ------ | -------------------------------------- |
-| Window functions (`OVER`)            | ✗      | error `0A000`                          |
-| `WITH RECURSIVE`                     | ✗      | ignored test (non-recursive CTEs only) |
+| Window functions (`OVER`)            | ✗      | error `0A000` — anywhere in the query (projection, subquery, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, named `WINDOW` reference) |
+| `WITH RECURSIVE`                     | ✗      | error `0A000` (non-recursive CTEs only; the `RECURSIVE` keyword itself is rejected, so no base-case-only results) |
 | Set-returning funcs in `FROM`        | ✗      | error `0A000` (scalar table funcs ok)  |
 | `WITH` inside a subquery             | ✗      | error `0A000` (top-level `WITH` ok)    |
 | `COPY` (bulk load)                   | ✗      | error `0A000` (no CopyIn/Out framing)  |
 | Materialized views                   | ✗      | error `0A000`                          |
-| `CREATE FUNCTION` / procedures / triggers | ✗ | error `0A000`                          |
-| Full-text search (`tsvector`/`@@`)   | ✗      | error                                  |
+| `CREATE FUNCTION` / `CREATE PROCEDURE` / `CREATE TRIGGER` / `DROP TRIGGER` | ✗ | error `0A000` for **every** spelling — detected by keyword prefix before the parser, since sqlparser 0.62 parses only some forms (which would otherwise leak `42601`) |
+| Full-text search                     | ✗      | error `0A000` — the function family (`to_tsvector`, `to_tsquery`, `plainto_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery`, `ts_rank`, `ts_rank_cd`, `ts_headline`, `setweight`, `ts_delete`, `tsvector_to_array`) is *named*-unsupported (never `42883`, so it is never sidecar-routed), and `@@` is an unsupported operator; the `tsvector`/`tsquery` types are `42704` |
 | Generated/computed columns           | ✗      | ignored test                           |
 | `SAVEPOINT` partial rollback         | partial| `SAVEPOINT`/`RELEASE` no-op; `ROLLBACK TO` collapses to full rollback |
-| FK cascade/restrict enforcement      | partial| constraints parsed + introspectable; referential actions not enforced |
+| `DEFERRABLE` constraints             | ✗      | error `0A000` — foreign keys are enforced immediately, per statement (see "Foreign keys" in §5); `MATCH FULL`/`MATCH PARTIAL` are `0A000` too |
 | `SERIALIZABLE` isolation             | ✗      | ignored test (read-committed only)     |
 | SSL/TLS transport                    | ✗      | negotiated-away, cleartext             |
 | Binary result encoding               | ✗      | results sent as text (node-postgres/psql use text) |
@@ -252,7 +612,7 @@ Each gap has a conformance test in `tests/sql_conformance.rs`
 
 ---
 
-## 7. Consistency modes
+## 8. Consistency modes
 
 GuardianDB is local-first; SQL does not change that. Two modes are defined.
 
@@ -275,11 +635,13 @@ GuardianDB is local-first; SQL does not change that. Two modes are defined.
   GuardianDB/Iroh primitives). Writes route to the leader, giving a global
   serial order and immediate cross-replica uniqueness.
 - Status: the API surface and routing flag exist; the leader/coordinator is a
-  documented in-progress component. `SERIALIZABLE` isolation has an `#[ignore]`
+  documented in-progress component — the accepted design is
+  [RFC 0001: Fenced Shard Primaries](rfcs/0001-fenced-shard-primaries.md),
+  which also adds table-group sharding and read/write replica routing. `SERIALIZABLE` isolation has an `#[ignore]`
   conformance test describing the target (one transaction aborts with `40001`
   on write-skew).
 
-## 8. Transaction semantics
+## 9. Transaction semantics
 
 - `BEGIN` / `COMMIT` / `ROLLBACK` are supported. Within a transaction, writes
   buffer in an overlay; reads merge the overlay over storage; `COMMIT` flushes
@@ -287,8 +649,9 @@ GuardianDB is local-first; SQL does not change that. Two modes are defined.
 - Isolation: **read committed** within a connection (a transaction sees its own
   uncommitted writes; other connections see committed state on their next
   statement). Autocommit wraps each statement in its own transaction.
-- Constraint checks (NOT NULL, unique, CHECK) run before the write is staged, so
-  a violating statement aborts without partial effects.
+- Constraint checks (NOT NULL, unique, CHECK, foreign keys — including
+  referential actions) run before the statement's writes are staged, so a
+  violating statement aborts without partial effects.
 - Any error inside an explicit transaction **aborts** it: further statements
   fail with `25P02` until `ROLLBACK` (and `COMMIT` on an aborted block rolls
   back), matching PostgreSQL.
@@ -328,7 +691,7 @@ NOWAIT, SKIP LOCKED, advisory, LOCK TABLE, pg_locks, release-on-rollback).
 > blocked writer can still overwrite based on its original snapshot once it
 > proceeds. `SERIALIZABLE` is not implemented.
 
-## 9. Replication semantics
+## 10. Replication semantics
 
 - Each table maps to a GuardianDB document collection; each row is a JSON
   document with a stable id (`__gdb_sql_rows_<oid>`), carrying internal fields
@@ -351,7 +714,7 @@ NOWAIT, SKIP LOCKED, advisory, LOCK TABLE, pg_locks, release-on-rollback).
   `#[ignore]`d `tests/sql_replication.rs` conformance target (raw document
   replication between peers already works — see `tests/integration_replication.rs`).
 
-## 10. Index behaviour
+## 11. Index behaviour
 
 - Indexes are real ordered (BTree) structures built from live rows and
   maintained incrementally within a statement/transaction.
@@ -362,7 +725,7 @@ NOWAIT, SKIP LOCKED, advisory, LOCK TABLE, pg_locks, release-on-rollback).
   test asserts indexed lookups return the same rows as a full scan.
 - `REINDEX` is implicit: indexes are rebuilt from storage on load.
 
-## 11. Error codes
+## 12. Error codes
 
 Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 `code` field:
@@ -375,7 +738,7 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 | `42601`  | syntax error                    |
 | `23505`  | unique violation                |
 | `23502`  | not-null violation              |
-| `23503`  | foreign-key violation           |
+| `23503`  | foreign-key violation (see §5 "Foreign keys")   |
 | `23514`  | check violation                 |
 | `22P02`  | invalid text representation     |
 | `22003`  | numeric value out of range      |
@@ -385,9 +748,13 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 | `40P01`  | deadlock detected               |
 | `55P03`  | lock not available (NOWAIT / lock_timeout) |
 | `25P02`  | in failed SQL transaction       |
+| `42501`  | insufficient privilege (row-level security) |
+| `42710`  | duplicate object (policy, extension) |
+| `42704`  | undefined object (policy, extension) |
+| `2BP01`  | dependent objects still exist (DROP of an FK-referenced table) |
 | `0A000`  | feature not supported           |
 
-## 12. Examples
+## 13. Examples
 
 - `examples/postgres-typeorm` — a complete TypeORM app (entities, migration,
   seed, queries, transactions). Run `npm run demo`.
@@ -395,7 +762,7 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 - `tests/pgwire_wire.rs` — a `tokio-postgres` client driving the
   gateway over TCP.
 
-## 13. Testing summary
+## 14. Testing summary
 
 | Layer                | Tests                                                  |
 | -------------------- | ------------------------------------------------------ |

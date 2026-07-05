@@ -74,6 +74,28 @@ Set `GUARDIAN_PGWIRE_BIN` to point at the gateway binary, or pass `{ binary }`.
 > gateway (the `sql` feature of the `guardian-db` crate). The default
 > `guardian-pgwire` binary is in-memory and accepts these flags as no-ops.
 
+## Connecting with a plain connection string
+
+`GuardianDataSource` manages the gateway for you, but you don't need this
+package at all to talk to an already-running gateway — any PostgreSQL client
+connects with an ordinary connection string:
+
+```
+postgres://guardian:guardian@127.0.0.1:15432/app?sslmode=disable
+```
+
+```ts
+// node-postgres
+const client = new pg.Client({ connectionString: "postgres://guardian:guardian@127.0.0.1:15432/app?sslmode=disable" });
+
+// plain TypeORM
+const ds = new DataSource({ type: "postgres", url: "postgres://guardian:guardian@127.0.0.1:15432/app", ssl: false, entities: [...] });
+```
+
+Pass `sslmode=disable` for libpq-based clients (`psql`, DBeaver, psycopg) —
+the gateway is a plaintext loopback socket and does not negotiate TLS.
+node-postgres and TypeORM default to no-SSL and work without it.
+
 ## Build / test
 
 ```bash
