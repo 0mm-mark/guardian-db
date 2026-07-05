@@ -826,3 +826,5 @@ mod tests {
         assert!(back.resolve_table_name(None, "users").is_some());
     }
 }
+
+// Maintenance note 9: documents compatibility expectations without changing runtime behavior.
