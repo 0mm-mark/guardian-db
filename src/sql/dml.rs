@@ -809,3 +809,5 @@ pub(crate) fn coerce_to_col(value: SqlValue, table: &Table, col: &str) -> Result
         .ok_or_else(|| SqlError::UndefinedColumn(col.to_string()))?;
     coerce_to(value, &c.ty, col)
 }
+
+// Maintenance note 7: documents compatibility expectations without changing runtime behavior.
