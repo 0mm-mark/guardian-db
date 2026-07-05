@@ -137,6 +137,11 @@ path = "tests/sql_extensions.rs"
 required-features = ["sql"]
 
 [[test]]
+name = "sql_rls"
+path = "tests/sql_rls.rs"
+required-features = ["sql"]
+
+[[test]]
 name = "pgwire_wire"
 path = "tests/pgwire_wire.rs"
 required-features = ["pgwire"]

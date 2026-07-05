@@ -74,7 +74,14 @@ impl Exec {
         let rows: Vec<(String, _)> = self
             .tables
             .get(&q)
-            .map(|l| l.rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .map(|l| {
+                let rls_hidden = self.rls_select_hidden(&q);
+                l.rows
+                    .iter()
+                    .filter(|(rid, _)| rls_hidden.map(|h| !h.contains(*rid)).unwrap_or(true))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let mut allow = std::collections::BTreeSet::new();
@@ -347,8 +354,10 @@ impl Exec {
             })
             .collect();
         let schema = RowSchema::new(fields);
+        let rls_hidden = self.rls_select_hidden(&q);
         let rows = row_ids
             .iter()
+            .filter(|rid| rls_hidden.map(|h| !h.contains(*rid)).unwrap_or(true))
             .filter_map(|rid| loaded.rows.get(rid))
             .map(|values| {
                 loaded
@@ -451,7 +460,12 @@ impl Exec {
                             .filter(|(fq, _)| fq == &q)
                             .map(|(_, s)| s);
                         return Ok(relabel(
-                            loaded_to_rowset(loaded, &alias_name, filter),
+                            loaded_to_rowset(
+                                loaded,
+                                &alias_name,
+                                filter,
+                                self.rls_select_hidden(&q),
+                            ),
                             &alias_name,
                             alias,
                         ));
@@ -500,12 +514,7 @@ impl Exec {
         alias: &Option<sqlparser::ast::TableAlias>,
         outer: &[Frame],
     ) -> Result<RowSet> {
-        let fname = name
-            .0
-            .last()
-            .and_then(|p| p.as_ident())
-            .map(ident_name)
-            .unwrap_or_default();
+        let fname = crate::sql::names::function_dispatch_name(name);
         if matches!(
             fname.as_str(),
             "generate_series" | "unnest" | "jsonb_array_elements" | "json_array_elements"
@@ -1725,11 +1734,13 @@ fn cross_join(left: RowSet, right: RowSet) -> RowSet {
 }
 
 /// Build a RowSet from a loaded table, labelling each field with `alias`. When
-/// `filter` is given (SKIP LOCKED), only those row ids are included.
+/// `filter` is given (SKIP LOCKED), only those row ids are included; rows in
+/// `rls_hidden` (invisible under row-level security) are always excluded.
 fn loaded_to_rowset(
     loaded: &crate::sql::store::LoadedTable,
     alias: &str,
     filter: Option<&std::collections::BTreeSet<String>>,
+    rls_hidden: Option<&std::collections::BTreeSet<String>>,
 ) -> RowSet {
     let fields = loaded
         .meta
@@ -1746,6 +1757,7 @@ fn loaded_to_rowset(
         .rows
         .iter()
         .filter(|(rid, _)| filter.map(|f| f.contains(*rid)).unwrap_or(true))
+        .filter(|(rid, _)| rls_hidden.map(|h| !h.contains(*rid)).unwrap_or(true))
         .map(|(_, values)| {
             loaded
                 .meta

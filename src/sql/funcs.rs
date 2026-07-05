@@ -234,6 +234,34 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
             Text(value)
         }
         "pg_advisory_lock" | "pg_advisory_unlock" | "pg_notify" => Null,
+        // --- Supabase auth helpers (used by row-security policies) ---
+        // auth.uid(): the authenticated user's id — the JWT `sub` claim, as a
+        // uuid. NULL when no claims are set (e.g. anon without a user token).
+        "auth.uid" => match jwt_claim(exec, "sub") {
+            Some(sub) if !sub.is_empty() => match uuid::Uuid::parse_str(&sub) {
+                Ok(u) => Uuid(u),
+                Err(_) => {
+                    return Err(SqlError::InvalidTextRepresentation {
+                        ty: "uuid".into(),
+                        value: sub,
+                    });
+                }
+            },
+            _ => Null,
+        },
+        // auth.role(): the JWT `role` claim as text (NULL when absent).
+        "auth.role" => match jwt_claim(exec, "role") {
+            Some(role) if !role.is_empty() => Text(role),
+            _ => Null,
+        },
+        // auth.jwt(): the full claims document (`request.jwt.claims`) as jsonb.
+        "auth.jwt" => {
+            let claims = exec.vars.borrow().get("request.jwt.claims").cloned();
+            match claims.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+                Some(json) => SqlValue::Json(json),
+                None => Null,
+            }
+        }
         other => {
             let ctx = crate::sql::ext::ExtCtx {
                 now: exec.now,
@@ -255,6 +283,23 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
         }
     };
     Ok(out)
+}
+
+/// Read a JWT claim for the current session: a per-claim session variable
+/// (`request.jwt.claim.<name>`, PostgREST v9 style) wins; otherwise the claim
+/// is read out of the `request.jwt.claims` JSON document. `None` when neither
+/// is set or the claims document does not parse.
+fn jwt_claim(exec: &Exec, name: &str) -> Option<String> {
+    let vars = exec.vars.borrow();
+    if let Some(v) = vars.get(&format!("request.jwt.claim.{name}")) {
+        return Some(v.clone());
+    }
+    let json: serde_json::Value = serde_json::from_str(vars.get("request.jwt.claims")?).ok()?;
+    match json.get(name)? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    }
 }
 
 fn text(v: &SqlValue) -> Result<String> {

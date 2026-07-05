@@ -119,6 +119,10 @@ impl Exec {
         let mut count = 0usize;
 
         for (mut row_id, values) in prepared {
+            // Row security: every row proposed for insertion must pass the
+            // INSERT policies' WITH CHECK (also under ON CONFLICT, like
+            // PostgreSQL).
+            self.rls_check_new_row(&q, &table, &values, crate::relational::PolicyCmd::Insert)?;
             // Detect conflict.
             let conflict = self.find_conflict(&q, &values, conflict_target.as_deref());
             if let Some(existing_id) = conflict {
@@ -126,6 +130,26 @@ impl Exec {
                     Some(OnInsert::OnConflict(oc)) => match &oc.action {
                         OnConflictAction::DoNothing => continue,
                         OnConflictAction::DoUpdate(do_update) => {
+                            // The conflicting row must be updatable under the
+                            // UPDATE policies' USING expressions.
+                            let existing = self
+                                .tables
+                                .get(&q)
+                                .and_then(|l| l.rows.get(&existing_id))
+                                .cloned()
+                                .unwrap_or_default();
+                            if !self.rls_old_row_visible(
+                                &q,
+                                &table,
+                                &existing,
+                                crate::relational::PolicyCmd::Update,
+                            )? {
+                                return Err(SqlError::InsufficientPrivilege(format!(
+                                    "new row violates row-level security policy \
+                                     (USING expression) for table \"{}\"",
+                                    table.name
+                                )));
+                            }
                             let new_vals = self.apply_conflict_update(
                                 &table,
                                 &existing_id,
@@ -134,6 +158,12 @@ impl Exec {
                                 do_update.selection.as_ref(),
                             )?;
                             let Some(new_vals) = new_vals else { continue };
+                            self.rls_check_new_row(
+                                &q,
+                                &table,
+                                &new_vals,
+                                crate::relational::PolicyCmd::Update,
+                            )?;
                             self.write_update(
                                 &q,
                                 &collection,
@@ -374,11 +404,19 @@ impl Exec {
         let collection = table.storage_collection.clone();
         let schema = table_schema(&table, &alias);
 
-        // Snapshot the rows so we can evaluate predicates with &self.
+        // Snapshot the rows so we can evaluate predicates with &self. Rows the
+        // current role may not update (row security, UPDATE USING) are skipped.
         let snapshot: Vec<(String, RowValues)> = self
             .tables
             .get(&q)
-            .map(|l| l.rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .map(|l| {
+                let hidden = self.rls_dml_hidden(&q);
+                l.rows
+                    .iter()
+                    .filter(|(rid, _)| hidden.map(|h| !h.contains(*rid)).unwrap_or(true))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let mut targets: Vec<(String, RowValues)> = Vec::new();
@@ -424,6 +462,14 @@ impl Exec {
                 }
             }
             self.check_constraints(&table, &new_values)?;
+            // Row security: the updated row must pass UPDATE WITH CHECK
+            // (falling back to USING), like PostgreSQL.
+            self.rls_check_new_row(
+                &q,
+                &table,
+                &new_values,
+                crate::relational::PolicyCmd::Update,
+            )?;
             targets.push((rid.clone(), new_values));
         }
 
@@ -501,10 +547,19 @@ impl Exec {
         let collection = table.storage_collection.clone();
         let schema = table_schema(&table, &alias);
 
+        // Rows the current role may not delete (row security, DELETE USING)
+        // are excluded from the snapshot, so they are silently skipped.
         let snapshot: Vec<(String, RowValues)> = self
             .tables
             .get(&q)
-            .map(|l| l.rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .map(|l| {
+                let hidden = self.rls_dml_hidden(&q);
+                l.rows
+                    .iter()
+                    .filter(|(rid, _)| hidden.map(|h| !h.contains(*rid)).unwrap_or(true))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let mut deleted: Vec<RowValues> = Vec::new();

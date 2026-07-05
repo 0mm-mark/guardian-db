@@ -25,6 +25,7 @@ mod funcs;
 pub mod lock;
 mod names;
 mod result;
+mod rls;
 mod row;
 mod select;
 mod store;

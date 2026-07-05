@@ -63,6 +63,8 @@ pub fn view_rows(
             ("collnamespace", SqlType::Integer),
         ])),
         (true, "pg_roles") => Some(pg_roles()),
+        (true, "pg_tables") => Some(pg_tables(catalog)),
+        (true, "pg_policies") => Some(pg_policies(catalog)),
         (true, "pg_extension") => Some(pg_extension(catalog)),
         (true, "pg_available_extensions") => Some(pg_available_extensions(catalog)),
         (true, "pg_available_extension_versions") => Some(pg_available_extension_versions(catalog)),
@@ -448,7 +450,7 @@ fn pg_class(catalog: &Catalog) -> RowSet {
             b(table.primary_key.is_some()),
             b(false),
             b(false),
-            b(false),
+            b(table.rls_enabled),
             t("p"),
             b(false),
             SqlValue::Float4(table.columns.len() as f32),
@@ -888,6 +890,74 @@ fn pg_attrdef(catalog: &Catalog) -> RowSet {
                 ]);
                 oid += 1;
             }
+        }
+    }
+    rs(cols, rows)
+}
+
+fn pg_tables(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("schemaname", SqlType::Text),
+        ("tablename", SqlType::Text),
+        ("tableowner", SqlType::Text),
+        ("tablespace", SqlType::Text),
+        ("hasindexes", SqlType::Boolean),
+        ("hasrules", SqlType::Boolean),
+        ("hastriggers", SqlType::Boolean),
+        ("rowsecurity", SqlType::Boolean),
+    ];
+    let rows = catalog
+        .tables()
+        .map(|table| {
+            let nidx = catalog.indexes_for_table(&table.schema, &table.name).len();
+            vec![
+                t(&table.schema),
+                t(&table.name),
+                t("guardian"),
+                null(),
+                b(nidx > 0),
+                b(false),
+                b(false),
+                b(table.rls_enabled),
+            ]
+        })
+        .collect();
+    rs(cols, rows)
+}
+
+fn pg_policies(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("schemaname", SqlType::Text),
+        ("tablename", SqlType::Text),
+        ("policyname", SqlType::Text),
+        ("permissive", SqlType::Text),
+        ("roles", SqlType::Array(Box::new(SqlType::Text))),
+        ("cmd", SqlType::Text),
+        ("qual", SqlType::Text),
+        ("with_check", SqlType::Text),
+    ];
+    let mut rows = Vec::new();
+    for table in catalog.tables() {
+        for p in &table.policies {
+            let roles = if p.roles.is_empty() {
+                SqlValue::Array(vec![t("public")])
+            } else {
+                SqlValue::Array(p.roles.iter().map(|r| t(r)).collect())
+            };
+            rows.push(vec![
+                t(&table.schema),
+                t(&table.name),
+                t(&p.name),
+                t(if p.permissive {
+                    "PERMISSIVE"
+                } else {
+                    "RESTRICTIVE"
+                }),
+                roles,
+                t(p.cmd.as_sql()),
+                p.using_expr.as_deref().map(t).unwrap_or_else(null),
+                p.check_expr.as_deref().map(t).unwrap_or_else(null),
+            ]);
         }
     }
     rs(cols, rows)
