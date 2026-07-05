@@ -190,6 +190,9 @@ pub fn rank(weights: &[f32; 4], tv: &[TsLexeme], query: Option<&TsQueryNode>) ->
     }
     let mut operands = Vec::new();
     root.lexemes(&mut operands);
+    // PostgreSQL's SortAndUniqItems: repeated query terms count once.
+    operands.sort();
+    operands.dedup();
     if operands.is_empty() {
         return 0.0;
     }
@@ -680,7 +683,8 @@ pub fn porter_stem(word: &str) -> String {
     // Step 1a: plurals.
     if ends(&w, "sses") {
         w.truncate(w.len() - 2);
-    } else if ends(&w, "ies") {
+    } else if ends(&w, "ies") || ends(&w, "ied") {
+        // Snowball treats -ied exactly like -ies (died → die, carried → carri).
         let stem = w.len() - 3;
         w.truncate(stem);
         w.push(b'i');

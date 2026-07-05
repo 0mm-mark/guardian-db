@@ -62,9 +62,12 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
         // length(tsvector) is the lexeme count; char_length has no tsvector
         // form in PostgreSQL (42883).
         "length" | "char_length" | "character_length" => match args.first() {
-            Some(TsVector(v)) if name == "length" => Int4(v.len() as i32),
+            Some(TsVector(v)) if name == "length" && args.len() == 1 => Int4(v.len() as i32),
             Some(TsVector(_)) => {
-                return Err(SqlError::UndefinedFunction(format!("{name}(tsvector)")));
+                // Wrong name or extra arguments: no such function in PG.
+                return Err(SqlError::UndefinedFunction(format!(
+                    "{name}(tsvector, ...)"
+                )));
             }
             _ => nullable_unary(&|v| Ok(Int4(text(v)?.chars().count() as i32)))?,
         },
@@ -261,7 +264,17 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
         | "tsvector_to_array"
         | "tsquery_phrase"
         | "ts_rewrite"
-        | "ts_stat" => {
+        | "ts_stat"
+        | "querytree"
+        | "ts_lexize"
+        | "get_current_ts_config"
+        | "array_to_tsvector"
+        | "ts_filter"
+        | "ts_parse"
+        | "ts_token_type"
+        | "ts_debug"
+        | "tsvector_update_trigger"
+        | "tsvector_update_trigger_column" => {
             return Err(SqlError::FeatureNotSupported(format!(
                 "{name} is not supported (out of the full-text-search subset: to_tsvector, \
                  to_tsquery, plainto_tsquery, ts_rank, length, numnode, strip, @@)"
