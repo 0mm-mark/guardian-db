@@ -1177,3 +1177,5 @@ impl UniqueKind for sqlparser::ast::UniqueConstraint {
 }
 
 // Maintenance note 6: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note 18: documents compatibility expectations without changing runtime behavior.
