@@ -600,6 +600,8 @@ fn pg_type(catalog: &Catalog) -> RowSet {
         (1184, "timestamptz", 8, "D"),
         (1700, "numeric", -1, "N"),
         (2950, "uuid", 16, "U"),
+        (3614, "tsvector", -1, "U"),
+        (3615, "tsquery", -1, "U"),
         (3802, "jsonb", -1, "U"),
     ];
     let rows = base

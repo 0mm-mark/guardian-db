@@ -469,6 +469,11 @@ impl Exec {
                 }
             }
         }
+        // Full-text search: `@@` match (core, always on), plus typed
+        // rejections for tsvector/tsquery operators outside the subset.
+        if let Some(result) = self.fts_operator(op, &a, &b) {
+            return result;
+        }
         match op {
             Plus | Minus | Multiply | Divide | Modulo | PGExp => arith(&a, op, &b),
             StringConcat => {
@@ -487,6 +492,44 @@ impl Exec {
             other => Err(SqlError::FeatureNotSupported(format!(
                 "binary operator {other} not supported"
             ))),
+        }
+    }
+
+    /// Full-text-search operators. `@@` evaluates in every argument order
+    /// PostgreSQL defines (including the text coercions); the tsvector /
+    /// tsquery operators outside the subset — `||` concatenation, the `<->`
+    /// phrase operator, `&&` — are typed rejections (`0A000`) instead of
+    /// falling through to text concatenation or a generic operator error.
+    fn fts_operator(
+        &self,
+        op: &BinaryOperator,
+        a: &SqlValue,
+        b: &SqlValue,
+    ) -> Option<Result<SqlValue>> {
+        use BinaryOperator::*;
+        let fts_shaped = |v: &SqlValue| matches!(v, SqlValue::TsVector(_) | SqlValue::TsQuery(_));
+        match op {
+            AtAt => Some(crate::sql::fts::at_at(self, a, b)),
+            StringConcat if fts_shaped(a) || fts_shaped(b) => {
+                Some(Err(SqlError::FeatureNotSupported(
+                    "tsvector/tsquery concatenation (||) is not supported (out of the \
+                     full-text-search subset)"
+                        .into(),
+                )))
+            }
+            LtDashGt if fts_shaped(a) || fts_shaped(b) => Some(Err(SqlError::FeatureNotSupported(
+                "the tsquery phrase operator <-> is not supported (position-aware \
+                     phrase search is out of the full-text-search subset)"
+                    .into(),
+            ))),
+            PGOverlap if fts_shaped(a) || fts_shaped(b) => {
+                Some(Err(SqlError::FeatureNotSupported(
+                    "the tsquery && operator is not supported (out of the \
+                     full-text-search subset)"
+                        .into(),
+                )))
+            }
+            _ => None,
         }
     }
 

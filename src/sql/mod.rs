@@ -22,6 +22,7 @@ mod eval;
 mod exec;
 pub mod ext;
 mod fk;
+mod fts;
 mod funcs;
 pub mod lock;
 mod names;

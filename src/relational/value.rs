@@ -56,6 +56,11 @@ pub enum SqlValue {
         ll: Vec<f64>,
         ur: Vec<f64>,
     },
+    /// Full-text document vector (`tsvector`): sorted unique lexemes, each
+    /// with an optional sorted position list.
+    TsVector(Vec<crate::relational::fts::TsLexeme>),
+    /// Full-text query (`tsquery`) operator tree; `None` is the empty query.
+    TsQuery(Option<crate::relational::fts::TsQueryNode>),
 }
 
 impl SqlValue {
@@ -94,6 +99,8 @@ impl SqlValue {
             SqlValue::HStore(_) => SqlType::HStore,
             SqlValue::Ltree(_) => SqlType::Ltree,
             SqlValue::Cube { .. } => SqlType::Cube,
+            SqlValue::TsVector(_) => SqlType::TsVector,
+            SqlValue::TsQuery(_) => SqlType::TsQuery,
         }
     }
 
@@ -164,6 +171,12 @@ impl SqlValue {
                 obj.insert("ll".into(), nums(ll));
                 obj.insert("ur".into(), nums(ur));
                 Json::Object(obj)
+            }
+            // tsvector/tsquery store as their canonical text form, which the
+            // raw parsers read back losslessly (like ltree).
+            SqlValue::TsVector(v) => Json::String(crate::relational::fts::format_tsvector(v)),
+            SqlValue::TsQuery(q) => {
+                Json::String(crate::relational::fts::format_tsquery(q.as_ref()))
             }
         }
     }
@@ -279,6 +292,12 @@ impl SqlValue {
                 }
                 SqlValue::Cube { ll, ur }
             }
+            SqlType::TsVector => SqlValue::TsVector(crate::relational::fts::parse_tsvector(
+                value.as_str().ok_or_else(|| bad("tsvector"))?,
+            )?),
+            SqlType::TsQuery => SqlValue::TsQuery(crate::relational::fts::parse_tsquery(
+                value.as_str().ok_or_else(|| bad("tsquery"))?,
+            )?),
             SqlType::Unknown => SqlValue::Json(value.clone()),
         };
         Ok(out)
@@ -313,6 +332,8 @@ impl SqlValue {
             SqlValue::HStore(map) => format_hstore(map),
             SqlValue::Ltree(path) => path.clone(),
             SqlValue::Cube { ll, ur } => format_cube(ll, ur),
+            SqlValue::TsVector(v) => crate::relational::fts::format_tsvector(v),
+            SqlValue::TsQuery(q) => crate::relational::fts::format_tsquery(q.as_ref()),
         };
         Some(s)
     }
@@ -369,6 +390,9 @@ impl SqlValue {
             SqlType::HStore => parse_hstore_text(text)?,
             SqlType::Ltree => parse_ltree_text(text)?,
             SqlType::Cube => parse_cube_text(text)?,
+            // PostgreSQL raw input: lexemes as given, no config processing.
+            SqlType::TsVector => SqlValue::TsVector(crate::relational::fts::parse_tsvector(text)?),
+            SqlType::TsQuery => SqlValue::TsQuery(crate::relational::fts::parse_tsquery(text)?),
             SqlType::Unknown => SqlValue::Text(text.to_string()),
         };
         Ok(out)
@@ -525,6 +549,10 @@ impl SqlValue {
             // hstore has no natural order; equality (and a deterministic
             // order for sorting) come from the canonical sorted pair list.
             (HStore(a), HStore(b)) => Some(a.iter().cmp(b.iter())),
+            // tsvector compares lexeme-wise (word, then positions), which the
+            // sorted-lexeme invariant makes a plain list comparison; tsquery
+            // equality/order comes from the canonical text form (fallthrough).
+            (TsVector(a), TsVector(b)) => Some(a.cmp(b)),
             (Uuid(a), Uuid(b)) => Some(a.cmp(b)),
             (Bytea(a), Bytea(b)) => Some(a.cmp(b)),
             (Date(a), Date(b)) => Some(a.cmp(b)),
@@ -660,6 +688,16 @@ impl SqlValue {
             SqlType::Cube => match self {
                 SqlValue::Cube { .. } => self.clone(),
                 SqlValue::Text(s) | SqlValue::Citext(s) => parse_cube_text(s)?,
+                _ => return Err(bad(target)),
+            },
+            SqlType::TsVector => match self {
+                SqlValue::TsVector(_) => self.clone(),
+                SqlValue::Text(s) | SqlValue::Citext(s) => SqlValue::from_text(s, target)?,
+                _ => return Err(bad(target)),
+            },
+            SqlType::TsQuery => match self {
+                SqlValue::TsQuery(_) => self.clone(),
+                SqlValue::Text(s) | SqlValue::Citext(s) => SqlValue::from_text(s, target)?,
                 _ => return Err(bad(target)),
             },
             SqlType::Json | SqlType::Jsonb => match self {

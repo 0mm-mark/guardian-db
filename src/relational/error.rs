@@ -91,6 +91,11 @@ pub enum RelError {
     #[error("object \"{0}\" does not exist")]
     UndefinedObject(String),
 
+    /// Unknown text search configuration (SQLSTATE 42704, PostgreSQL's
+    /// message shape): only `simple` and `english` exist in this engine.
+    #[error("text search configuration \"{0}\" does not exist")]
+    UndefinedTsConfig(String),
+
     #[error("{0} already exists")]
     DuplicateObject(String),
 
@@ -214,6 +219,7 @@ impl RelError {
             RelError::CannotCoerce { .. } => "42846",
             RelError::UndefinedType(_) => "42704",
             RelError::UndefinedObject(_) => "42704",
+            RelError::UndefinedTsConfig(_) => "42704",
             RelError::DuplicateObject(_) => "42710",
             RelError::UndefinedFunction(_) => "42883",
             RelError::DuplicateFunction(_) => "42723",

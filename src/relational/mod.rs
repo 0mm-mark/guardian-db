@@ -18,6 +18,7 @@
 
 pub mod catalog;
 pub mod error;
+pub mod fts;
 pub mod index;
 pub mod storage;
 pub mod types;

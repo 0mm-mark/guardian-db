@@ -45,6 +45,10 @@ pub enum SqlType {
     Ltree,
     /// N-dimensional cube/point, provided by the `cube` extension.
     Cube,
+    /// Full-text-search document vector (core PostgreSQL type).
+    TsVector,
+    /// Full-text-search query (core PostgreSQL type).
+    TsQuery,
     /// `void`/unknown placeholder used for untyped NULLs and some expressions.
     Unknown,
 }
@@ -70,6 +74,8 @@ impl SqlType {
             SqlType::Timestamptz => 1184,
             SqlType::Numeric { .. } => 1700,
             SqlType::Uuid => 2950,
+            SqlType::TsVector => 3614,
+            SqlType::TsQuery => 3615,
             SqlType::Jsonb => 3802,
             SqlType::Array(inner) => inner.array_oid(),
             SqlType::Citext => 16390,
@@ -101,6 +107,8 @@ impl SqlType {
             SqlType::Timestamptz => 1185,
             SqlType::Numeric { .. } => 1231,
             SqlType::Uuid => 2951,
+            SqlType::TsVector => 3643,
+            SqlType::TsQuery => 3645,
             SqlType::Jsonb => 3807,
             // nested arrays / unknown collapse to text[]
             _ => 1009,
@@ -157,6 +165,8 @@ impl SqlType {
             SqlType::HStore => "hstore".into(),
             SqlType::Ltree => "ltree".into(),
             SqlType::Cube => "cube".into(),
+            SqlType::TsVector => "tsvector".into(),
+            SqlType::TsQuery => "tsquery".into(),
             SqlType::Unknown => "unknown".into(),
         }
     }
@@ -198,6 +208,8 @@ impl SqlType {
             SqlType::HStore => "hstore".into(),
             SqlType::Ltree => "ltree".into(),
             SqlType::Cube => "cube".into(),
+            SqlType::TsVector => "tsvector".into(),
+            SqlType::TsQuery => "tsquery".into(),
             SqlType::Unknown => "unknown".into(),
         }
     }
@@ -293,6 +305,8 @@ impl SqlType {
             "hstore" => SqlType::HStore,
             "ltree" => SqlType::Ltree,
             "cube" => SqlType::Cube,
+            "tsvector" => SqlType::TsVector,
+            "tsquery" => SqlType::TsQuery,
             other => return Err(RelError::UndefinedType(other.to_string())),
         };
         Ok(ty)

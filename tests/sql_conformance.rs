@@ -783,38 +783,53 @@ async fn materialized_view_unsupported() {
 }
 
 #[tokio::test]
-async fn full_text_search_unsupported() {
+async fn full_text_search_subset_and_exclusions() {
     let mut s = session().await;
     ok(&mut s, "CREATE TABLE t (body TEXT)").await;
     ok(&mut s, "INSERT INTO t VALUES ('a cat sat')").await;
-    // The FTS function family is *named*-unsupported: stable 0A000. It must
-    // never be 42883/"does not exist" — these are PostgreSQL core functions,
-    // and 42883 is also what triggers sidecar fallback-routing, which would
-    // make FTS semantics differ per deployment.
+    // The core subset works (details in tests/sql_fts.rs): the constructor
+    // functions, @@ in every PostgreSQL argument order, ts_rank, and the
+    // tsvector/tsquery types with raw-parse casts.
+    assert_eq!(
+        scalar_i64(
+            &mut s,
+            "SELECT count(*) FROM t WHERE to_tsvector(body) @@ to_tsquery('cat')"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        rows_text(&mut s, "SELECT to_tsvector('a cat sat')").await,
+        vec![vec!["'cat':2 'sat':3".to_string()]]
+    );
+    assert_eq!(
+        rows_text(&mut s, "SELECT body @@ 'cat' FROM t").await,
+        vec![vec!["t".to_string()]]
+    );
+    ok(&mut s, "SELECT 'a'::tsvector").await;
+    ok(&mut s, "SELECT 'a'::tsquery").await;
+    // Out-of-subset FTS constructs are *named*-unsupported: stable 0A000. It
+    // must never be 42883/"does not exist" — these are PostgreSQL core
+    // functions, and 42883 is also what triggers sidecar fallback-routing,
+    // which would make FTS semantics differ per deployment.
     for sql in [
-        "SELECT * FROM t WHERE to_tsvector(body) @@ to_tsquery('cat')",
-        "SELECT to_tsvector('a cat sat')",
-        "SELECT to_tsquery('cat')",
-        "SELECT plainto_tsquery('cat')",
         "SELECT phraseto_tsquery('the cat')",
         "SELECT websearch_to_tsquery('cat -dog')",
-        "SELECT ts_rank('a', 'b')",
         "SELECT ts_rank_cd('a', 'b')",
         "SELECT ts_headline('doc', 'query')",
         "SELECT setweight('a', 'A')",
         "SELECT ts_delete('a', 'b')",
         "SELECT tsvector_to_array('a')",
-        // The @@ operator itself lands on the unsupported-binary-operator
-        // rejection when no FTS function is involved.
-        "SELECT body @@ 'cat' FROM t",
+        "SELECT to_tsvector('cat') || to_tsvector('dog')",
+        "SELECT to_tsquery('cat <-> dog')",
     ] {
         assert_eq!(err_code(&mut s, sql).await, "0A000", "for `{sql}`");
     }
-    // The tsvector/tsquery *types* do not exist in the engine: 42704
-    // (undefined_object), like any unknown type name — truthful, and
-    // deliberately distinct from the 0A000 feature rejection above.
-    assert_eq!(err_code(&mut s, "SELECT 'a'::tsvector").await, "42704");
-    assert_eq!(err_code(&mut s, "SELECT 'a'::tsquery").await, "42704");
+    // Unknown text search configurations are 42704, like PostgreSQL.
+    assert_eq!(
+        err_code(&mut s, "SELECT to_tsvector('german', 'Haus')").await,
+        "42704"
+    );
 }
 
 // ---------------------------------------------------------------------------
