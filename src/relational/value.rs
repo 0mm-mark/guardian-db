@@ -217,7 +217,7 @@ impl SqlValue {
             SqlValue::Int2(n) => n.to_string(),
             SqlValue::Int4(n) => n.to_string(),
             SqlValue::Int8(n) => n.to_string(),
-            SqlValue::Float4(n) => format_float(*n as f64),
+            SqlValue::Float4(n) => format_float_f32(*n),
             SqlValue::Float8(n) => format_float(*n),
             SqlValue::Numeric(d) => d.normalize().to_string(),
             SqlValue::Text(s) => s.clone(),
@@ -626,6 +626,18 @@ fn format_float(n: f64) -> String {
     } else {
         let s = format!("{n}");
         s
+    }
+}
+
+/// float4 text output: shortest round-trip form of the f32 itself (widening
+/// through f64 would print excess digits, e.g. 0.36363637 -> 0.3636363744735718).
+fn format_float_f32(n: f32) -> String {
+    if n.is_nan() {
+        "NaN".to_string()
+    } else if n.is_infinite() {
+        if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+    } else {
+        format!("{n}")
     }
 }
 

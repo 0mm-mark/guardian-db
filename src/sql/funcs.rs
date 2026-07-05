@@ -153,7 +153,9 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
             }
         }
         // --- uuid ---
-        "gen_random_uuid" | "uuid_generate_v4" => Uuid(uuid::Uuid::new_v4()),
+        // gen_random_uuid is a PostgreSQL core function (since 13); the
+        // uuid_generate_* family belongs to uuid-ossp and is gated below.
+        "gen_random_uuid" => Uuid(uuid::Uuid::new_v4()),
         // --- introspection helpers commonly probed by drivers/clients ---
         "pg_table_is_visible"
         | "pg_type_is_visible"

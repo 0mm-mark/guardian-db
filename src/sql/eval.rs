@@ -414,6 +414,12 @@ impl Exec {
                 }
                 Custom(t) => Some(t.clone()),
                 PGCustomBinaryOperator(parts) => Some(parts.join(".")),
+                LtDashGt => Some("<->".to_string()),
+                Spaceship
+                    if matches!(a, SqlValue::Vector(_)) || matches!(b, SqlValue::Vector(_)) =>
+                {
+                    Some("<=>".to_string())
+                }
                 Arrow => Some("->".to_string()),
                 _ => None,
             };
