@@ -39,6 +39,12 @@ pub enum SqlType {
     /// Fixed-dimension float vector, provided by the `vector` (pgvector) extension.
     /// `None` means the dimension is unconstrained (`vector` without a modifier).
     Vector(Option<u32>),
+    /// Key/value store, provided by the `hstore` extension.
+    HStore,
+    /// Hierarchical label path, provided by the `ltree` extension.
+    Ltree,
+    /// N-dimensional cube/point, provided by the `cube` extension.
+    Cube,
     /// `void`/unknown placeholder used for untyped NULLs and some expressions.
     Unknown,
 }
@@ -68,6 +74,9 @@ impl SqlType {
             SqlType::Array(inner) => inner.array_oid(),
             SqlType::Citext => 16390,
             SqlType::Vector(_) => 16388,
+            SqlType::HStore => 16392,
+            SqlType::Ltree => 16394,
+            SqlType::Cube => 16396,
             SqlType::Unknown => 705, // unknown
         }
     }
@@ -145,6 +154,9 @@ impl SqlType {
             SqlType::Citext => "citext".into(),
             SqlType::Vector(Some(n)) => format!("vector({n})"),
             SqlType::Vector(None) => "vector".into(),
+            SqlType::HStore => "hstore".into(),
+            SqlType::Ltree => "ltree".into(),
+            SqlType::Cube => "cube".into(),
             SqlType::Unknown => "unknown".into(),
         }
     }
@@ -183,6 +195,9 @@ impl SqlType {
             SqlType::Array(inner) => format!("_{}", inner.udt_name()),
             SqlType::Citext => "citext".into(),
             SqlType::Vector(_) => "vector".into(),
+            SqlType::HStore => "hstore".into(),
+            SqlType::Ltree => "ltree".into(),
+            SqlType::Cube => "cube".into(),
             SqlType::Unknown => "unknown".into(),
         }
     }
@@ -275,6 +290,9 @@ impl SqlType {
             "name" => SqlType::Text,
             "citext" => SqlType::Citext,
             "vector" => SqlType::Vector(parse_mods().first().copied()),
+            "hstore" => SqlType::HStore,
+            "ltree" => SqlType::Ltree,
+            "cube" => SqlType::Cube,
             other => return Err(RelError::UndefinedType(other.to_string())),
         };
         Ok(ty)
@@ -341,6 +359,20 @@ mod tests {
         assert_eq!(SqlType::Jsonb.oid(), 3802);
         assert_eq!(SqlType::Timestamptz.oid(), 1184);
         assert_eq!(SqlType::Array(Box::new(SqlType::Integer)).oid(), 1007);
+    }
+
+    #[test]
+    fn extension_types_parse_and_report_names() {
+        assert_eq!(SqlType::parse("hstore").unwrap(), SqlType::HStore);
+        assert_eq!(SqlType::parse("LTREE").unwrap(), SqlType::Ltree);
+        assert_eq!(SqlType::parse("cube").unwrap(), SqlType::Cube);
+        assert_eq!(SqlType::HStore.name(), "hstore");
+        assert_eq!(SqlType::Ltree.udt_name(), "ltree");
+        assert_eq!(SqlType::Cube.name(), "cube");
+        // Extension OIDs live in the user range (16384+), like citext/vector.
+        for ty in [SqlType::HStore, SqlType::Ltree, SqlType::Cube] {
+            assert!(ty.oid() >= 16384, "{ty} oid {}", ty.oid());
+        }
     }
 
     #[test]
