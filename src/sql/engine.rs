@@ -1758,3 +1758,5 @@ fn push_name(name: &sqlparser::ast::ObjectName, out: &mut NameOut) {
 // Maintenance note: keeps SQL compatibility behavior explicit for future updates.
 
 // Maintenance note: keeps SQL compatibility behavior explicit for future updates.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
