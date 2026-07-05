@@ -19,6 +19,7 @@ pub mod citext;
 pub mod fuzzystrmatch;
 pub mod pg_trgm;
 pub mod pgcrypto;
+pub mod sidecar;
 pub mod unaccent;
 pub mod uuid_ossp;
 pub mod vector;
@@ -77,7 +78,7 @@ pub enum RuntimeStrategy {
     Native,
     /// Delegated to a managed PostgreSQL sidecar process: `CREATE EXTENSION`
     /// and the statements that use the extension's objects are forwarded over
-    /// the wire protocol.
+    /// the wire protocol (see [`sidecar`]).
     SidecarPostgres,
 }
 
@@ -309,6 +310,42 @@ pub fn column_dependencies(catalog: &Catalog) -> Vec<ColumnDependency> {
         }
     }
     out
+}
+
+/// The per-name semantics of `DROP EXTENSION` for locally-managed extensions:
+/// installed check, dependent-table RESTRICT, and the explicit CASCADE
+/// refusal (no implicit data destruction). Shared between the synchronous
+/// executor and the session's sidecar-aware drop path. Returns whether the
+/// catalog changed.
+pub fn drop_native_extension(
+    catalog: &mut Catalog,
+    name: &str,
+    if_exists: bool,
+    cascade_or_restrict: Option<sqlparser::ast::ReferentialAction>,
+) -> Result<bool> {
+    use sqlparser::ast::ReferentialAction as RA;
+    if !catalog.extension_installed(name) {
+        if if_exists {
+            return Ok(false);
+        }
+        return Err(SqlError::UndefinedObject(format!("extension \"{name}\"")));
+    }
+    let dependents = dependent_tables(catalog, name);
+    if !dependents.is_empty() {
+        if matches!(cascade_or_restrict, Some(RA::Cascade)) {
+            return Err(SqlError::FeatureNotSupported(format!(
+                "DROP EXTENSION {name} CASCADE would drop columns of: {} — \
+                 drop or alter those tables first",
+                dependents.join(", ")
+            )));
+        }
+        return Err(SqlError::FeatureNotSupported(format!(
+            "cannot drop extension {name} because other objects depend on it: {}",
+            dependents.join(", ")
+        )));
+    }
+    catalog.uninstall_extension(name);
+    Ok(true)
 }
 
 /// Tables whose columns depend on `ext` (blocks `DROP EXTENSION ... RESTRICT`).

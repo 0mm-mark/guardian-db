@@ -338,6 +338,66 @@ everything else flows through the normal parser unchanged, in order.
 open block, aborts it on error). It is **simple-protocol only**: preparing it
 through the extended query protocol fails with a `42601` error saying so.
 
+### The PostgreSQL sidecar runtime
+
+Extensions that cannot be reimplemented in the engine (C code, planner hooks,
+background workers — PostGIS, TimescaleDB, pg_stat_statements) are delegated
+to a **managed PostgreSQL sidecar**: a real PostgreSQL process the operator
+runs next to GuardianDB. GuardianDB ships its own minimal wire-protocol
+*client* (`src/sql/ext/sidecar.rs`) — plaintext protocol 3.0, trust or
+cleartext-password auth, simple query protocol, text results — and each
+session lazily pins one sidecar connection (closed when the session ends).
+
+**Configuration** — two channels, session GUC first, environment second:
+
+```sql
+SET guardian.sidecar_dsn = 'postgres://user:pass@host:5432/db?sslmode=disable';
+```
+
+```bash
+export GUARDIAN_PG_SIDECAR_DSN='postgres://user:pass@host:5432/db?sslmode=disable'
+```
+
+The DSN is a standard `postgres://` URI (`%XX` escapes decoded; the database
+defaults to the user, like libpq). Because the client is plaintext-only,
+`sslmode` must be absent or `disable` — anything else is rejected with
+`0A000`. Other URI parameters are accepted and ignored. `SET
+guardian.sidecar_dsn = ''` disables routing for the session.
+
+**Routing rules**
+
+1. `CREATE EXTENSION` of a sidecar-strategy extension: with no DSN configured
+   it fails `0A000` naming both configuration channels; with a DSN it is
+   forwarded **verbatim** to the sidecar, and on success the install is
+   recorded in the (replicated) local catalog with the version the sidecar
+   reports (`SELECT extversion FROM pg_extension ...`), marked as
+   sidecar-bound.
+2. A statement that fails locally with **undefined function (`42883`),
+   undefined type, or undefined relation (`42P01`)** while a DSN is
+   configured is forwarded verbatim and the sidecar's result (or its
+   SQLSTATE-tagged error) is returned. This is what makes
+   `SELECT ST_AsText(...)` or `SELECT * FROM pg_stat_statements` work: the
+   objects only exist on the sidecar. Statements with bound (`$n`) parameters
+   are not forwarded — the extended protocol keeps the local error.
+3. `DROP EXTENSION` of a sidecar-bound extension forwards the drop to the
+   sidecar, then removes the local record. Without a configured DSN it fails
+   `0A000` with the configuration hint.
+
+**Transaction limitation.** The sidecar cannot join a local GuardianDB
+transaction, so sidecar routing is **autocommit-only**: inside an explicit
+`BEGIN ... COMMIT` block, fallback-forwarding is disabled — the local error is
+kept (same SQLSTATE) with a hint appended — and sidecar `CREATE`/`DROP
+EXTENSION` are refused with `0A000`.
+
+Sidecar errors arrive as ordinary SQLSTATE-tagged errors: the sidecar's code
+and message are preserved verbatim, so clients cannot tell them apart from
+local errors. The wire-level conformance tests (`tests/sql_extensions.rs`)
+drive a second GuardianDB pgwire server as the mock sidecar, and an
+`#[ignore]`d `sidecar_real_postgres` test runs the full flow — `initdb`, real
+`CREATE EXTENSION pg_stat_statements`, stats query over the wire — against a
+local PostgreSQL 16 (`cargo test --features sql --test sql_extensions --
+--ignored`).
+
 ---
 
 ## 7. Unsupported SQL (documented gaps)
