@@ -383,3 +383,5 @@ mod tests {
         ));
     }
 }
+
+// Maintenance note 10: documents compatibility expectations without changing runtime behavior.
