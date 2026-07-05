@@ -205,6 +205,10 @@ pub struct Catalog {
     views: BTreeMap<QualifiedName, View>,
     next_oid: u32,
     pub search_path: Vec<String>,
+    /// Installed extensions: name -> installed version. Persisted with the
+    /// catalog document, so installs replicate like any other DDL.
+    #[serde(default)]
+    extensions: BTreeMap<String, String>,
 }
 
 impl Catalog {
@@ -219,7 +223,12 @@ impl Catalog {
             views: BTreeMap::new(),
             next_oid: FIRST_USER_OID,
             search_path: vec!["public".to_string()],
+            extensions: BTreeMap::new(),
         };
+        // PostgreSQL databases have plpgsql installed by default.
+        catalog
+            .extensions
+            .insert("plpgsql".to_string(), "1.0".to_string());
         // System schemas always present.
         for sys in ["pg_catalog", "information_schema"] {
             let oid = catalog.allocate_oid();
@@ -242,6 +251,34 @@ impl Catalog {
             },
         );
         catalog
+    }
+
+    /// Installed extensions as (name, version) pairs, sorted by name.
+    pub fn extensions(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.extensions
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// The installed version of `name`, if installed.
+    pub fn extension_version(&self, name: &str) -> Option<&str> {
+        self.extensions.get(name).map(String::as_str)
+    }
+
+    pub fn extension_installed(&self, name: &str) -> bool {
+        self.extensions.contains_key(name)
+    }
+
+    /// Record an extension as installed. Returns `false` if it already was.
+    pub fn install_extension(&mut self, name: &str, version: &str) -> bool {
+        self.extensions
+            .insert(name.to_string(), version.to_string())
+            .is_none()
+    }
+
+    /// Remove an installed extension. Returns `false` if it was not installed.
+    pub fn uninstall_extension(&mut self, name: &str) -> bool {
+        self.extensions.remove(name).is_some()
     }
 
     pub fn allocate_oid(&mut self) -> u32 {

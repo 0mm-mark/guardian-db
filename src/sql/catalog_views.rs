@@ -63,6 +63,11 @@ pub fn view_rows(
             ("collnamespace", SqlType::Integer),
         ])),
         (true, "pg_roles") => Some(pg_roles()),
+        (true, "pg_extension") => Some(pg_extension(catalog)),
+        (true, "pg_available_extensions") => Some(pg_available_extensions(catalog)),
+        (true, "pg_available_extension_versions") => {
+            Some(pg_available_extension_versions(catalog))
+        }
         (true, "pg_am") => Some(pg_am()),
         (true, "pg_settings") => Some(empty(&[
             ("name", SqlType::Text),
@@ -897,6 +902,90 @@ fn pg_roles() -> RowSet {
         ("rolcanlogin", SqlType::Boolean),
     ];
     rs(cols, vec![vec![i4(10), t("guardian"), b(true), b(true)]])
+}
+
+fn pg_extension(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("oid", SqlType::Integer),
+        ("extname", SqlType::Text),
+        ("extowner", SqlType::Integer),
+        ("extnamespace", SqlType::Integer),
+        ("extrelocatable", SqlType::Boolean),
+        ("extversion", SqlType::Text),
+    ];
+    let pg = schema_oid(catalog, "pg_catalog");
+    let rows = catalog
+        .extensions()
+        .enumerate()
+        .map(|(i, (name, version))| {
+            vec![
+                i4(16384 + i as i32),
+                t(name),
+                i4(10),
+                i4(pg),
+                b(false),
+                t(version),
+            ]
+        })
+        .collect();
+    rs(cols, rows)
+}
+
+fn pg_available_extensions(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("name", SqlType::Text),
+        ("default_version", SqlType::Text),
+        ("installed_version", SqlType::Text),
+        ("comment", SqlType::Text),
+    ];
+    let rows = crate::sql::ext::available()
+        .iter()
+        .map(|d| {
+            vec![
+                t(d.name),
+                t(d.default_version),
+                catalog
+                    .extension_version(d.name)
+                    .map(t)
+                    .unwrap_or_else(null),
+                t(d.comment),
+            ]
+        })
+        .collect();
+    rs(cols, rows)
+}
+
+fn pg_available_extension_versions(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("name", SqlType::Text),
+        ("version", SqlType::Text),
+        ("installed", SqlType::Boolean),
+        ("superuser", SqlType::Boolean),
+        ("trusted", SqlType::Boolean),
+        ("relocatable", SqlType::Boolean),
+        ("requires", SqlType::Array(Box::new(SqlType::Text))),
+        ("comment", SqlType::Text),
+    ];
+    let rows = crate::sql::ext::available()
+        .iter()
+        .map(|d| {
+            vec![
+                t(d.name),
+                t(d.default_version),
+                b(catalog.extension_installed(d.name)),
+                b(!d.trusted),
+                b(d.trusted),
+                b(false),
+                if d.requires.is_empty() {
+                    null()
+                } else {
+                    SqlValue::Array(d.requires.iter().map(|r| t(r)).collect())
+                },
+                t(d.comment),
+            ]
+        })
+        .collect();
+    rs(cols, rows)
 }
 
 fn pg_am() -> RowSet {

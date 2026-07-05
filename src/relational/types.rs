@@ -34,6 +34,11 @@ pub enum SqlType {
     Json,
     Jsonb,
     Array(Box<SqlType>),
+    /// Case-insensitive text, provided by the `citext` extension.
+    Citext,
+    /// Fixed-dimension float vector, provided by the `vector` (pgvector) extension.
+    /// `None` means the dimension is unconstrained (`vector` without a modifier).
+    Vector(Option<u32>),
     /// `void`/unknown placeholder used for untyped NULLs and some expressions.
     Unknown,
 }
@@ -61,6 +66,8 @@ impl SqlType {
             SqlType::Uuid => 2950,
             SqlType::Jsonb => 3802,
             SqlType::Array(inner) => inner.array_oid(),
+            SqlType::Citext => 16390,
+            SqlType::Vector(_) => 16388,
             SqlType::Unknown => 705, // unknown
         }
     }
@@ -135,6 +142,9 @@ impl SqlType {
             SqlType::Json => "json".into(),
             SqlType::Jsonb => "jsonb".into(),
             SqlType::Array(inner) => format!("{}[]", inner.name()),
+            SqlType::Citext => "citext".into(),
+            SqlType::Vector(Some(n)) => format!("vector({n})"),
+            SqlType::Vector(None) => "vector".into(),
             SqlType::Unknown => "unknown".into(),
         }
     }
@@ -171,6 +181,8 @@ impl SqlType {
             SqlType::Json => "json".into(),
             SqlType::Jsonb => "jsonb".into(),
             SqlType::Array(inner) => format!("_{}", inner.udt_name()),
+            SqlType::Citext => "citext".into(),
+            SqlType::Vector(_) => "vector".into(),
             SqlType::Unknown => "unknown".into(),
         }
     }
@@ -192,7 +204,10 @@ impl SqlType {
     }
 
     pub fn is_string(&self) -> bool {
-        matches!(self, SqlType::Text | SqlType::Varchar(_) | SqlType::Char(_))
+        matches!(
+            self,
+            SqlType::Text | SqlType::Varchar(_) | SqlType::Char(_) | SqlType::Citext
+        )
     }
 
     pub fn is_temporal(&self) -> bool {
@@ -258,6 +273,8 @@ impl SqlType {
             "oid" | "regclass" | "regtype" | "regproc" | "regrole" | "regnamespace" | "xid"
             | "cid" => SqlType::Integer,
             "name" => SqlType::Text,
+            "citext" => SqlType::Citext,
+            "vector" => SqlType::Vector(parse_mods().first().copied()),
             other => return Err(RelError::UndefinedType(other.to_string())),
         };
         Ok(ty)
