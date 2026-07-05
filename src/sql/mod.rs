@@ -58,3 +58,5 @@ pub use crate::relational::{
 mod tests;
 
 // SQL compatibility note 9: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 9: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
