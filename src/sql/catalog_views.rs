@@ -65,9 +65,7 @@ pub fn view_rows(
         (true, "pg_roles") => Some(pg_roles()),
         (true, "pg_extension") => Some(pg_extension(catalog)),
         (true, "pg_available_extensions") => Some(pg_available_extensions(catalog)),
-        (true, "pg_available_extension_versions") => {
-            Some(pg_available_extension_versions(catalog))
-        }
+        (true, "pg_available_extension_versions") => Some(pg_available_extension_versions(catalog)),
         (true, "pg_am") => Some(pg_am()),
         (true, "pg_settings") => Some(empty(&[
             ("name", SqlType::Text),

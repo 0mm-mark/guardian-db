@@ -779,7 +779,6 @@ fn map_action(action: Option<sqlparser::ast::ReferentialAction>) -> ReferentialA
         Some(sqlparser::ast::ReferentialAction::SetDefault) => ReferentialAction::SetDefault,
         _ => ReferentialAction::NoAction,
     }
-
 }
 
 impl Exec {
@@ -833,10 +832,12 @@ impl Exec {
                 let dep = crate::sql::ext::find(req).ok_or_else(|| {
                     SqlError::Internal(format!("extension dependency {req} not in registry"))
                 })?;
-                self.catalog.install_extension(dep.name, dep.default_version);
+                self.catalog
+                    .install_extension(dep.name, dep.default_version);
             }
         }
-        self.catalog.install_extension(def.name, def.default_version);
+        self.catalog
+            .install_extension(def.name, def.default_version);
         self.catalog_dirty = true;
         Ok(ExecResult::empty_command("CREATE EXTENSION"))
     }

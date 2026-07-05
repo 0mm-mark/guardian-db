@@ -89,11 +89,7 @@ pub fn operator(op: &str, left: &SqlValue, right: &SqlValue) -> Result<SqlValue>
 
 /// Extract the two vector arguments of `func`, enforce equal dimensions
 /// (pgvector: "different vector dimensions"), and apply `f`.
-fn binary(
-    args: &[SqlValue],
-    func: &str,
-    f: impl Fn(&[f32], &[f32]) -> f64,
-) -> Result<SqlValue> {
+fn binary(args: &[SqlValue], func: &str, f: impl Fn(&[f32], &[f32]) -> f64) -> Result<SqlValue> {
     let a = arg_vector(args, 0, func)?;
     let b = arg_vector(args, 1, func)?;
     if a.len() != b.len() {
@@ -242,7 +238,10 @@ mod tests {
 
     #[test]
     fn vector_norm_exact() {
-        assert_eq!(f8(invoke("vector_norm", &[vector(&[3.0, 4.0])]).unwrap()), 5.0);
+        assert_eq!(
+            f8(invoke("vector_norm", &[vector(&[3.0, 4.0])]).unwrap()),
+            5.0
+        );
     }
 
     #[test]
@@ -281,11 +280,19 @@ mod tests {
     #[test]
     fn null_arguments_yield_null() {
         let v = vector(&[1.0]);
-        assert!(invoke("l2_distance", &[SqlValue::Null, v.clone()]).unwrap().is_null());
+        assert!(
+            invoke("l2_distance", &[SqlValue::Null, v.clone()])
+                .unwrap()
+                .is_null()
+        );
         assert!(invoke("l2_normalize", &[SqlValue::Null]).unwrap().is_null());
         assert!(operator("<->", &SqlValue::Null, &v).unwrap().is_null());
         assert!(operator("<=>", &v, &SqlValue::Null).unwrap().is_null());
-        assert!(operator("<#>", &SqlValue::Null, &SqlValue::Null).unwrap().is_null());
+        assert!(
+            operator("<#>", &SqlValue::Null, &SqlValue::Null)
+                .unwrap()
+                .is_null()
+        );
     }
 
     #[test]
