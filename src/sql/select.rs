@@ -2677,3 +2677,5 @@ pub(crate) fn walk_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
 // SQL compatibility note 18: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
 
 // SQL compatibility note 2: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 18: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
