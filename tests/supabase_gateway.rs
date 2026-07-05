@@ -542,3 +542,179 @@ async fn auth_oauth_provider_is_typed_unsupported() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "SUPA_COMPAT_AUTH_PROVIDER_UNSUPPORTED");
 }
+
+// ---------------------------------------------------------------------------
+// Row-Level Security through the gateway
+// ---------------------------------------------------------------------------
+
+const UID_A: &str = "0b9fbc1e-6a34-4bff-8df5-6b9f7c4e3d21";
+const UID_B: &str = "7f3a1d52-9c1b-4e8e-b0a4-2c5d9e8f7a61";
+
+/// `notes` owned per user: RLS enabled, owner-scoped SELECT/INSERT policies
+/// for `authenticated` (so `anon` is default-denied).
+async fn seed_rls_notes(db: &Arc<Database<MemoryStorage>>) {
+    let mut s = Session::new(db.clone(), "postgres");
+    s.execute("CREATE TABLE notes (id int PRIMARY KEY, user_id text, body text, secret int)")
+        .await
+        .unwrap();
+    s.execute(&format!(
+        "INSERT INTO notes VALUES (1, '{UID_A}', 'a note', 1), (2, '{UID_B}', 'b note', 2)"
+    ))
+    .await
+    .unwrap();
+    s.execute("ALTER TABLE notes ENABLE ROW LEVEL SECURITY")
+        .await
+        .unwrap();
+    s.execute(
+        "CREATE POLICY notes_select ON notes FOR SELECT TO authenticated \
+         USING (user_id = auth.uid()::text)",
+    )
+    .await
+    .unwrap();
+    s.execute(
+        "CREATE POLICY notes_insert ON notes FOR INSERT TO authenticated \
+         WITH CHECK (user_id = auth.uid()::text AND secret < 100)",
+    )
+    .await
+    .unwrap();
+}
+
+/// Mint a real user access token (`role: authenticated`, `sub: <uuid>`) signed
+/// with the project secret, like GoTrue would.
+fn user_token(sub: &str) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let mut claims = guardian_db::supabase::Claims::api_key("authenticated", now, now + 3600);
+    claims.sub = Some(sub.to_string());
+    claims.aud = Some("authenticated".to_string());
+    guardian_db::supabase::jwt::sign(&claims, TEST_SECRET).unwrap()
+}
+
+#[tokio::test]
+async fn rls_anon_sees_nothing() {
+    let h = harness().await;
+    seed_rls_notes(&h.db).await;
+    let (status, _h, body) = call(
+        &h.app,
+        "GET",
+        "/rest/v1/notes?select=*",
+        Some(&h.anon),
+        None,
+        None,
+        None,
+    )
+    .await;
+    // Policies target `authenticated`: anon is default-denied, not an error.
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([]));
+}
+
+#[tokio::test]
+async fn rls_authenticated_user_sees_only_their_rows() {
+    let h = harness().await;
+    seed_rls_notes(&h.db).await;
+    let token = user_token(UID_A);
+    let (status, _h, body) = call(
+        &h.app,
+        "GET",
+        "/rest/v1/notes?select=*&order=id.asc",
+        Some(&h.anon),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "user A must see exactly their row: {body}");
+    assert_eq!(arr[0]["user_id"], UID_A);
+    assert_eq!(arr[0]["body"], "a note");
+}
+
+#[tokio::test]
+async fn rls_service_role_bypasses_policies() {
+    let h = harness().await;
+    seed_rls_notes(&h.db).await;
+    let (status, _h, body) = call(
+        &h.app,
+        "GET",
+        "/rest/v1/notes?select=*",
+        Some(&h.service),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn rls_insert_passing_with_check_succeeds() {
+    let h = harness().await;
+    seed_rls_notes(&h.db).await;
+    let token = user_token(UID_A);
+    let (status, _h, body) = call(
+        &h.app,
+        "POST",
+        "/rest/v1/notes",
+        Some(&h.anon),
+        Some(&token),
+        Some("return=representation"),
+        Some(json!({"id": 3, "user_id": UID_A, "body": "mine", "secret": 5})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    assert_eq!(body.as_array().unwrap()[0]["body"], "mine");
+}
+
+#[tokio::test]
+async fn rls_insert_violating_with_check_is_pgrst_42501() {
+    let h = harness().await;
+    seed_rls_notes(&h.db).await;
+    let token = user_token(UID_A);
+    // secret >= 100 violates the policy's WITH CHECK.
+    let (status, _h, body) = call(
+        &h.app,
+        "POST",
+        "/rest/v1/notes",
+        Some(&h.anon),
+        Some(&token),
+        None,
+        Some(json!({"id": 4, "user_id": UID_A, "body": "x", "secret": 500})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "42501");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("row-level security policy for table \"notes\""),
+        "message: {body}"
+    );
+    // Writing a row for someone else fails the same way.
+    let (status, _h, body) = call(
+        &h.app,
+        "POST",
+        "/rest/v1/notes",
+        Some(&h.anon),
+        Some(&token),
+        None,
+        Some(json!({"id": 5, "user_id": UID_B, "body": "forged", "secret": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "42501");
+    // Nothing leaked into the table.
+    let (_s, _h2, all) = call(
+        &h.app,
+        "GET",
+        "/rest/v1/notes?select=id",
+        Some(&h.service),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(all.as_array().unwrap().len(), 2);
+}

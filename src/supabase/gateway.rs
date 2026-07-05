@@ -89,6 +89,18 @@ impl AuthContext {
             .and_then(|c| c.sub.as_deref())
             .filter(|s| !s.is_empty())
     }
+
+    /// The claims document injected into the per-request session as
+    /// `request.jwt.claims` (what `auth.uid()` / `auth.jwt()` and
+    /// `current_setting('request.jwt.claims')` read, PostgREST-style). When no
+    /// bearer token was supplied, a minimal `{"role": ...}` document is
+    /// synthesized so `auth.role()` still reflects the effective role.
+    pub fn claims_json(&self) -> String {
+        self.claims
+            .as_ref()
+            .and_then(|c| serde_json::to_string(c).ok())
+            .unwrap_or_else(|| serde_json::json!({ "role": self.role }).to_string())
+    }
 }
 
 /// A request/response correlation id extension.
@@ -252,6 +264,8 @@ pub(crate) async fn load_catalog<S: RelationalStorage>(
 }
 
 /// Run a single parameterised statement as `role`, returning its result.
+/// No JWT claims are injected — used for internal (service_role) work, which
+/// bypasses row security anyway.
 pub(crate) async fn run_sql<S: RelationalStorage + 'static>(
     db: &Arc<Database<S>>,
     role: &str,
@@ -259,6 +273,22 @@ pub(crate) async fn run_sql<S: RelationalStorage + 'static>(
     params: Vec<SqlValue>,
 ) -> Result<ExecResult, SqlError> {
     let mut session = Session::new(db.clone(), role.to_string());
+    let prepared = session.prepare(sql)?;
+    session.execute_one(&prepared.statement, &params).await
+}
+
+/// Run a single parameterised statement in a session bound to the request's
+/// resolved role, with the request's JWT claims installed as
+/// `request.jwt.claims` — the seam that makes row-security policies
+/// (`auth.uid()`, `current_setting('request.jwt.claims')`) see the caller.
+pub(crate) async fn run_sql_as<S: RelationalStorage + 'static>(
+    db: &Arc<Database<S>>,
+    auth: &AuthContext,
+    sql: &str,
+    params: Vec<SqlValue>,
+) -> Result<ExecResult, SqlError> {
+    let mut session = Session::new(db.clone(), auth.role.clone());
+    session.set_var("request.jwt.claims", &auth.claims_json());
     let prepared = session.prepare(sql)?;
     session.execute_one(&prepared.statement, &params).await
 }
