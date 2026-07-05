@@ -243,3 +243,5 @@ pub type Result<T> = std::result::Result<T, RelError>;
 // Maintenance note: keeps SQL compatibility behavior explicit for future updates.
 
 // SQL compatibility note 11: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 11: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
