@@ -34,6 +34,11 @@ pub struct AppState<S: RelationalStorage> {
     pub config: Arc<ServiceConfig>,
     /// One-shot guard so the `auth` schema is bootstrapped on first use.
     pub schema_ready: Arc<tokio::sync::OnceCell<()>>,
+    /// One-shot guard so the `storage` schema is bootstrapped on first use.
+    pub storage_ready: Arc<tokio::sync::OnceCell<()>>,
+    /// Shared realtime state (the broadcast bus between websocket subscribers
+    /// and the id generator for connections / bindings).
+    pub realtime: Arc<crate::supabase::realtime::RealtimeShared>,
 }
 
 impl<S: RelationalStorage> Clone for AppState<S> {
@@ -43,6 +48,8 @@ impl<S: RelationalStorage> Clone for AppState<S> {
             project: self.project.clone(),
             config: self.config.clone(),
             schema_ready: self.schema_ready.clone(),
+            storage_ready: self.storage_ready.clone(),
+            realtime: self.realtime.clone(),
         }
     }
 }
@@ -58,6 +65,8 @@ impl<S: RelationalStorage> AppState<S> {
             project: Arc::new(project),
             config: Arc::new(config),
             schema_ready: Arc::new(tokio::sync::OnceCell::new()),
+            storage_ready: Arc::new(tokio::sync::OnceCell::new()),
+            realtime: Arc::new(crate::supabase::realtime::RealtimeShared::new()),
         }
     }
 }
@@ -113,16 +122,31 @@ pub struct RequestId(pub String);
 
 /// Build the full Kong-shaped router over `state`.
 pub fn build_router<S: RelationalStorage + 'static>(state: AppState<S>) -> Router {
+    let apikey_layer = axum::middleware::from_fn_with_state(state.clone(), require_apikey::<S>);
+
     let protected = Router::new()
         .nest("/rest/v1", crate::supabase::rest::router::<S>())
         .nest("/auth/v1", crate::supabase::auth::router::<S>())
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            require_apikey::<S>,
-        ));
+        // postgres-meta (Studio): apikey-verified here, service_role-gated in
+        // the handlers.
+        .nest("/pg-meta", crate::supabase::pg_meta::router::<S>())
+        .nest("/platform/pg-meta", crate::supabase::pg_meta::router::<S>())
+        .layer(apikey_layer.clone());
+
+    // Storage: authenticated routes behind the apikey layer, plus the
+    // credential-less public/signed download routes, plus a typed catch-all so
+    // an unimplemented storage path never yields a bare 404.
+    let storage = Router::new()
+        .merge(crate::supabase::storage::protected_router::<S>().layer(apikey_layer.clone()))
+        .merge(crate::supabase::storage::public_router::<S>())
+        .fallback(crate::supabase::storage::unsupported_route);
 
     Router::new()
         .merge(protected)
+        .nest("/storage/v1", storage)
+        // Realtime: browsers cannot set headers on websocket connects, so the
+        // apikey arrives as a query parameter, verified inside the handler.
+        .nest("/realtime/v1", crate::supabase::realtime::router::<S>())
         .merge(stub_router::<S>())
         .route("/health", any(health))
         .layer(axum::middleware::from_fn(request_id))
@@ -134,13 +158,9 @@ pub fn build_router<S: RelationalStorage + 'static>(state: AppState<S>) -> Route
 /// answer is a clear "not implemented" regardless of credentials.
 fn stub_router<S: RelationalStorage + 'static>() -> Router<AppState<S>> {
     Router::new()
-        .route("/realtime/v1/{*rest}", any(|| not_impl("REALTIME")))
-        .route("/storage/v1/{*rest}", any(|| not_impl("STORAGE")))
         .route("/functions/v1/{*rest}", any(|| not_impl("FUNCTIONS")))
         .route("/graphql/v1", any(|| not_impl("GRAPHQL")))
         .route("/graphql/v1/{*rest}", any(|| not_impl("GRAPHQL")))
-        .route("/pg-meta/{*rest}", any(|| not_impl("PG_META")))
-        .route("/platform/pg-meta/{*rest}", any(|| not_impl("PG_META")))
 }
 
 async fn not_impl(service: &'static str) -> Response {

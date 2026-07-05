@@ -124,8 +124,26 @@ async fn missing_apikey_is_401_typed() {
 }
 
 #[tokio::test]
-async fn storage_service_is_501_not_404() {
+async fn functions_service_is_501_not_404() {
+    // Storage / realtime / pg-meta are implemented since stage 3 (see
+    // tests/supabase_storage_realtime.rs); functions and graphql keep their
+    // precise typed 501s.
     let h = harness().await;
+    let (status, _h, body) = call(
+        &h.app,
+        "POST",
+        "/functions/v1/hello-world",
+        Some(&h.anon),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(body["code"], "SUPA_COMPAT_FUNCTIONS_NOT_IMPLEMENTED");
+    assert_eq!(body["hint"], "tracked for a later slice");
+
+    // A missing storage object is now a typed storage-api error, not a 501.
     let (status, _h, body) = call(
         &h.app,
         "GET",
@@ -136,9 +154,8 @@ async fn storage_service_is_501_not_404() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["code"], "SUPA_COMPAT_STORAGE_NOT_IMPLEMENTED");
-    assert_eq!(body["hint"], "tracked for a later slice");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["statusCode"], "404");
 }
 
 #[tokio::test]

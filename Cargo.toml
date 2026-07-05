@@ -79,7 +79,7 @@ pgwire = { version = "0.40", optional = true }
 # Supabase-compatible HTTP gateway (the `supabase` feature). axum brings the
 # http/hyper/tower stack already present transitively; `tower`'s `util` feature
 # powers the in-process `oneshot` integration tests.
-axum = { version = "0.8", optional = true }
+axum = { version = "0.8", optional = true, features = ["ws"] }
 tower = { version = "0.5", optional = true, features = ["util"] }
 
 [dev-dependencies]
@@ -92,6 +92,9 @@ crossterm = "0.29.0"
 base64 = "0.22.1"
 # Real PostgreSQL client used by the `pgwire` wire-protocol tests.
 tokio-postgres = "0.7"
+# Real WebSocket client used by the Supabase realtime tests (same version
+# axum's `ws` feature builds on).
+tokio-tungstenite = "0.28"
 
 [[bin]]
 name = "guardian-admin"
@@ -149,6 +152,11 @@ required-features = ["pgwire"]
 [[test]]
 name = "supabase_gateway"
 path = "tests/supabase_gateway.rs"
+required-features = ["supabase"]
+
+[[test]]
+name = "supabase_storage_realtime"
+path = "tests/supabase_storage_realtime.rs"
 required-features = ["supabase"]
 
 [[bench]]

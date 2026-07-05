@@ -5,9 +5,12 @@ PostgREST clients, GoTrue clients) talk to a GuardianDB node with no
 GuardianDB-specific code. It lives entirely behind the `supabase` Cargo feature
 (`supabase = ["sql", "dep:axum", "dep:tower"]`); default builds are unaffected.
 
-This document describes the **foundation slice**: **REST** (PostgREST-compatible)
-and **Auth** (GoTrue-compatible) are implemented end-to-end. Every other Kong
-service returns a typed `501` — never a bare 404 and never fake success.
+Implemented end-to-end: **REST** (PostgREST-compatible), **Auth**
+(GoTrue-compatible), **Storage** (storage-api-compatible), **postgres-meta**
+(the API Supabase Studio talks to), and **Realtime** (Phoenix-protocol
+websocket: postgres_changes + broadcast). The remaining Kong services
+(**functions**, **graphql**) return a typed `501` — never a bare 404 and never
+fake success.
 
 ---
 
@@ -51,9 +54,14 @@ HTTP request
   │     • effective role = bearer.role ?? api_key_role  (PostgREST semantics)
   │     • attach AuthContext{ role, api_key_role, claims, request_id }
   │
-  ├─ /rest/v1/*   → rest.rs   → Session(role)          → SQL → PostgREST JSON
-  ├─ /auth/v1/*   → auth.rs   → Session(service_role)  → auth.* tables → GoTrue JSON
-  └─ /storage | /realtime | /functions | /graphql | /pg-meta → 501 typed
+  ├─ /rest/v1/*        → rest.rs     → Session(role)          → SQL → PostgREST JSON
+  ├─ /auth/v1/*        → auth.rs     → Session(service_role)  → auth.* tables → GoTrue JSON
+  ├─ /storage/v1/*     → storage.rs  → Session(role)          → storage.* tables (RLS-governed)
+  │     (public/signed downloads sit outside the apikey layer)
+  ├─ /pg-meta/*        → pg_meta.rs  → catalog + pg_catalog views (service_role-gated)
+  ├─ /platform/pg-meta → alias of /pg-meta
+  ├─ /realtime/v1/websocket → realtime.rs → Phoenix ws (apikey via query param)
+  └─ /functions | /graphql → 501 typed
 ```
 
 Files (all under `src/supabase/`, behind `#[cfg(feature = "supabase")]`):
@@ -64,6 +72,9 @@ Files (all under `src/supabase/`, behind `#[cfg(feature = "supabase")]`):
 - `gateway.rs` — axum `Router`, middleware, `AuthContext`, shared exec helpers.
 - `rest.rs` — PostgREST translation and handlers.
 - `auth.rs` — GoTrue schema bootstrap and handlers.
+- `storage.rs` — storage-api bucket/object handlers over the `storage` schema.
+- `pg_meta.rs` — postgres-meta endpoints (what Studio needs).
+- `realtime.rs` — Phoenix-protocol websocket (postgres_changes + broadcast).
 - `src/bin/guardian-supabase.rs` — the binary.
 
 A single project is served per gateway instance (the "single-project shell"),
@@ -96,12 +107,147 @@ configured from CLI flags / a supplied JWT secret.
 | `GET`/`POST` | `/auth/v1/admin/users` | list / create (service_role only). |
 | `GET`/`PUT`/`DELETE` | `/auth/v1/admin/users/{id}` | get / update / delete (service_role only). |
 
+### Storage (`/storage/v1`)
+
+| Method | Path | Behaviour |
+| --- | --- | --- |
+| `POST` | `/bucket` | create bucket (`{id?, name, public?, file_size_limit?, allowed_mime_types?}`). |
+| `GET` | `/bucket` / `/bucket/{id}` | list / get buckets. |
+| `PUT` | `/bucket/{id}` | update `public` / `file_size_limit` / `allowed_mime_types`. |
+| `DELETE` | `/bucket/{id}` | delete (409 unless empty). |
+| `POST` | `/bucket/{id}/empty` | delete every object in the bucket. |
+| `POST`/`PUT` | `/object/{bucket}/{key}` | upload the **raw request body** (`content-type` header; `x-upsert: true` to replace). |
+| `GET` | `/object/{bucket}/{key}` | authed download (RLS governs row visibility). |
+| `GET` | `/object/public/{bucket}/{key}` | credential-less download, only if `bucket.public`. |
+| `POST` | `/object/sign/{bucket}/{key}` | `{expiresIn}` → `{signedURL}` (HS256 token, project secret). |
+| `GET` | `/object/sign/{bucket}/{key}?token=` | verify signature/expiry/object binding, serve bytes. |
+| `DELETE` | `/object/{bucket}/{key}` and `/object/{bucket}` (`{prefixes:[…]}`) | delete one / many. |
+| `POST` | `/object/move`, `/object/copy` | `{bucketId, sourceKey, destinationKey}`. |
+| `POST` | `/object/list/{bucket}` | `{prefix, limit, offset, sortBy:{column,order}, search}`. |
+
+Errors use the storage-api shape `{"statusCode","error","message"}`
+(`statusCode` is a string, like Supabase's storage service). Unknown
+`/storage/v1` paths return a typed `SUPA_COMPAT_STORAGE_UNSUPPORTED_ROUTE` —
+never a bare 404. `multipart/form-data` uploads return a typed
+`SUPA_COMPAT_STORAGE_MULTIPART_UNSUPPORTED` `501` (browsers' supabase-js sends
+the raw body, which is supported).
+
+**Where the bytes live.** Bucket and object *metadata* live in
+`storage.buckets` / `storage.objects`; object *bytes* live in a dedicated
+`storage._blobs(object_id uuid PK, content bytea)` table written through
+parameterised SQL — so uploads persist and **replicate through the same
+document store as every other row**. Honest trade-off: bytes travel through
+the SQL layer (base64 inside the stored JSON document), which is fine for this
+slice; an iroh-blobs content-addressed path is a later optimisation. Uploads
+are capped at 50 MiB (`storage::MAX_UPLOAD_BYTES`), and per-bucket
+`file_size_limit` / `allowed_mime_types` (`jsonb` array; stock Supabase uses
+`text[]`) are enforced with typed 413/415 errors.
+
+**Authorization rides RLS.** The bootstrap enables row security on
+`storage.buckets` and `storage.objects` with **no default policies**:
+`service_role` (an RLS-bypass role) has full access; every other role is
+default-denied until you add policies. Object reads/writes run as the request
+role with its JWT claims injected, so the standard Supabase pattern works
+verbatim:
+
+```sql
+CREATE POLICY objects_owner_select ON storage.objects FOR SELECT
+    TO authenticated USING (owner = auth.uid());
+CREATE POLICY objects_owner_insert ON storage.objects FOR INSERT
+    TO authenticated WITH CHECK (owner = auth.uid());
+```
+
+The `owner` column is set from `auth.uid()` (the bearer token's `sub`) on
+upload/copy. Blob bytes are fetched only *after* the caller's role-bound query
+proved the object row visible; signed-URL redemption is pre-authorized at
+signing time (the signer must be able to see the object under their own role).
+Known divergences: `/object/list` returns flat object keys (no synthesized
+folder entries), and object/blob writes are two autocommits (metadata first,
+bytes second) rather than one transaction.
+
+### postgres-meta (`/pg-meta`, alias `/platform/pg-meta`)
+
+Service-role-gated (Studio uses the service key; any other role gets a typed
+403). Response keys mirror `github.com/supabase/postgres-meta`:
+
+| Endpoint | Source |
+| --- | --- |
+| `GET /schemas`, `/tables`, `/columns`, `/indexes`, `/constraints`, `/policies`, `/views` | the persisted engine catalog (tables embed `columns`, `primary_keys`, and FK `relationships`; `?included_schemas=`/`?excluded_schemas=` filters apply). |
+| `GET /types`, `/roles`, `/extensions` | the engine's `pg_type` / `pg_roles` / `pg_available_extensions` catalog views, queried through a `service_role` session (extensions include GuardianDB's `runtime` column: `native` vs `sidecar`). |
+| `GET /functions`, `/triggers` | `[]` — the engine has no user-defined functions or triggers; an empty array is the honest answer. |
+| `POST /query` | `{"query":"…"}` → runs through a `service_role` session (multi-statement OK, Studio's SQL editor path); rows return as an array of objects, errors as `{"error":{"message","code"}}` with the SQLSTATE. |
+
+Honesty notes: `bytes`/`size`/`live_rows_estimate` on `/tables` are reported
+as `0` (the engine keeps no relation statistics); `/roles` returns the engine
+owner from `pg_roles` **plus** the three gateway roles (`anon`,
+`authenticated`, `service_role`) that the JWT layer actually resolves.
+
+**Pointing Supabase Studio at GuardianDB.** Studio needs two backends: a
+postgres-meta URL and the project API. Run the official Studio image with:
+
+```bash
+docker run --rm -p 3000:3000 \
+  -e STUDIO_PG_META_URL="http://host.docker.internal:54321/pg-meta" \
+  -e SUPABASE_URL="http://host.docker.internal:54321" \
+  -e SUPABASE_PUBLIC_URL="http://127.0.0.1:54321" \
+  -e SUPABASE_ANON_KEY="$ANON_KEY" \
+  -e SUPABASE_SERVICE_KEY="$SERVICE_ROLE_KEY" \
+  -e AUTH_JWT_SECRET="$JWT_SECRET" \
+  supabase/studio
+```
+
+Studio's table editor, SQL editor, policies and extensions pages ride the
+endpoints above. Pages backed by services this slice does not implement
+(functions, logs/analytics) will show their typed errors.
+
+### Realtime (`/realtime/v1/websocket`)
+
+A Phoenix-channel websocket compatible with `@supabase/realtime-js` v2. Both
+message encodings are accepted and mirrored: the realtime-js **object** form
+`{"topic","event","payload","ref"}` and the Phoenix V2 **array** form
+`[join_ref, ref, topic, event, payload]`.
+
+* **Connect:** `ws(s)://…/realtime/v1/websocket?apikey=<key>&vsn=1.0.0`. The
+  apikey (or `token`) query parameter is verified **before** the upgrade —
+  a bad key is a typed HTTP 401. `access_token` join-payload fields and
+  `access_token` events rotate the connection's claims (verified against the
+  project secret).
+* **`phx_join`** on `realtime:<channel>` topics with
+  `config.postgres_changes: [{event, schema, table, filter?}]` — the reply
+  echoes each binding with a server-assigned `id` (what realtime-js matches
+  on). Filters support exactly `col=eq.value`; anything else is a typed join
+  error (`SUPA_COMPAT_REALTIME_UNSUPPORTED_FILTER`).
+* **`heartbeat`** (topic `phoenix`), **`phx_leave`**, and **`broadcast`**
+  passthrough between subscribers of a topic (`config.broadcast.self` honored;
+  broadcasting to an unjoined topic is a typed error). Presence and binary
+  frames get typed errors — nothing is silently dropped.
+* **postgres_changes delivery:** events come from the engine's local commit
+  hook (`Database::subscribe_changes` — emitted after every successful
+  autocommit/COMMIT). Payloads carry both the realtime wire keys
+  (`type`/`record`/`old_record`/`columns`) and the realtime-js client keys
+  (`eventType`/`new`/`old`), plus `schema`, `table`, `commit_timestamp`,
+  `errors: null`.
+
+**Authorization — no unauthorized delivery.** Each candidate event is
+authorized against the subscriber's own role before delivery: bypass roles
+(`service_role`, engine owners) receive everything; tables without RLS are
+visible to every role (engine semantics); for INSERT/UPDATE on RLS-enabled
+tables the row's **primary key is re-selected through a session bound to the
+subscriber's role and claims**, and the event is delivered only if the row is
+visible under the caller's policies. Documented constraints (when in doubt,
+don't deliver): DELETE events on RLS-enabled tables and rows of PK-less tables
+cannot be re-checked, so they are **withheld** from non-bypass roles.
+`TRUNCATE` produces no events, and only *local* commits are observed — writes
+arriving via Iroh replication from another node do not flow into this node's
+realtime stream (a replication-changefeed slice can lift this later).
+
 ### Not implemented in this slice → typed `501`
 
-`/realtime/v1/*`, `/storage/v1/*`, `/functions/v1/*`, `/graphql/v1`,
-`/pg-meta/*`, `/platform/pg-meta/*` each return
+`/functions/v1/*` and `/graphql/v1` return
 `{"code":"SUPA_COMPAT_<SERVICE>_NOT_IMPLEMENTED","message":"…","hint":"tracked for a later slice"}`
-with HTTP `501`. `/health` returns `200 {"status":"ok"}`.
+with HTTP `501` — functions would need a Deno/edge runtime and graphql a
+pg_graphql-equivalent schema reflection, neither of which the engine provides
+yet. `/health` returns `200 {"status":"ok"}`.
 
 ---
 
@@ -255,13 +401,21 @@ bad password/refresh token). OAuth/SSO grants (`id_token`, `authorization_code`,
 
 ## 7. Deferred to later slices
 
-- **Storage, Realtime, Edge Functions, GraphQL, pg-meta / Studio.** Routed and
-  returning typed `501`; not implemented.
+- **Edge Functions, GraphQL.** Routed and returning typed `501`; not implemented.
 - **REST**: embedded resources / joins (`select=author(name)`), the full operator
   set (`cs`, `cd`, `ov`, `fts`, `wfts`, …), logical `and`/`or` trees, computed
   columns, true named-argument RPC binding, vertical filtering on embeds.
 - **Auth**: email/SMS delivery and confirmation flows, OAuth/SSO providers, MFA,
   anonymous sign-in, password recovery, per-session logout scopes.
+- **Storage**: multipart/resumable (TUS) uploads, image transformations
+  (`/render/image`), folder-emulating list responses, iroh-blobs-backed object
+  bytes (bytes currently ride the SQL layer, see §3).
+- **Realtime**: presence, DELETE / PK-less-row delivery under RLS (withheld by
+  design, see §3), replicated-write changefeed (only local commits are
+  observed), Phoenix binary serializer.
+- **pg-meta**: mutation endpoints Studio uses for point-and-click DDL
+  (`POST /tables`, `PATCH /columns`, …) — Studio's SQL editor (`POST /query`)
+  covers the same ground; relation statistics (sizes / row estimates).
 - **Multi-project / multi-tenant** routing (the shell serves one project).
 
 ---
@@ -308,6 +462,20 @@ const { data: session } = await supabase.auth.signInWithPassword({
   email: "a@b.com",
   password: "hunter2pass",
 });
+
+// Storage (create buckets with the service key or add bucket policies first)
+await supabase.storage.from("avatars").upload("me.png", file);
+const { data: url } = await supabase.storage
+  .from("avatars")
+  .createSignedUrl("me.png", 3600);
+
+// Realtime
+supabase
+  .channel("room1")
+  .on("postgres_changes", { event: "INSERT", schema: "public", table: "todos" },
+      (payload) => console.log(payload.new))
+  .on("broadcast", { event: "cursor" }, (msg) => console.log(msg))
+  .subscribe();
 ```
 
 Tables must be created first (over `psql`/pgwire, or a direct `Session`); REST
@@ -329,9 +497,11 @@ curl -s -X POST "http://127.0.0.1:54321/auth/v1/signup" \
 ```bash
 cargo test --features supabase                       # everything
 cargo test --features supabase --test supabase_gateway   # in-process gateway tests
+cargo test --features supabase --test supabase_storage_realtime # storage + pg-meta + realtime
 cargo test --features supabase --lib supabase::          # unit tests
 ```
 
-The integration tests drive the axum `Router` in-process with
-`tower::ServiceExt::oneshot` over a `MemoryStorage`-backed `Database` — no real
-ports are bound.
+The REST/Auth/Storage/pg-meta integration tests drive the axum `Router`
+in-process with `tower::ServiceExt::oneshot` over a `MemoryStorage`-backed
+`Database` — no real ports are bound. The realtime tests bind an ephemeral
+`127.0.0.1` port and connect a real websocket client (`tokio-tungstenite`).
