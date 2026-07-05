@@ -262,10 +262,69 @@ Queryable `information_schema` (`tables`, `columns`, `schemata`,
 `table_constraints`, `key_column_usage`, `constraint_column_usage`,
 `referential_constraints`, `views`) and `pg_catalog` (`pg_class`,
 `pg_attribute`, `pg_type`, `pg_namespace`, `pg_index`, `pg_constraint`,
-`pg_database`, `pg_indexes`, `pg_attrdef`, `pg_am`, `pg_roles`, and empty
+`pg_database`, `pg_indexes`, `pg_attrdef`, `pg_am`, `pg_roles`, `pg_tables`
+(with `rowsecurity`), `pg_policies`, and empty
 `pg_description`/`pg_enum`/`pg_collation`/`pg_settings`). This is enough for
 TypeORM schema sync, migrations and QueryRunner inspection, and for
 node-postgres metadata.
+
+### Row-Level Security
+
+Row security is implemented with PostgreSQL semantics (`src/sql/rls.rs`).
+
+**Syntax**
+
+```sql
+ALTER TABLE t ENABLE ROW LEVEL SECURITY;   -- and DISABLE
+CREATE POLICY name ON t
+  [ AS { PERMISSIVE | RESTRICTIVE } ]
+  [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
+  [ TO role [, ...] ]                       -- omitted / PUBLIC = every role
+  [ USING (expression) ]
+  [ WITH CHECK (expression) ];
+DROP POLICY [ IF EXISTS ] name ON t;
+```
+
+Policies live in the replicated catalog document, so they replicate (and
+persist) like any other DDL. Expressions are stored as SQL text and validated
+at `CREATE POLICY` time (unparseable expressions are rejected with `42601`);
+PostgreSQL's clause rules are enforced (`USING` is not allowed `FOR INSERT`;
+`WITH CHECK` is not allowed `FOR SELECT`/`FOR DELETE`). A duplicate policy
+name on the same table is `42710`; dropping a missing policy is `42704`.
+
+**Semantics** (matching PostgreSQL)
+
+- A row is visible/allowed iff **any** applicable PERMISSIVE policy passes
+  **and all** applicable RESTRICTIVE policies pass. Expressions evaluating to
+  false **or NULL** deny.
+- `rls_enabled` with **no** applicable policy is **default-deny**: `SELECT`
+  returns nothing, `UPDATE`/`DELETE` affect nothing, `INSERT` fails.
+- Per command: `SELECT` and `DELETE` filter with `USING`; `UPDATE` filters
+  old rows with `USING` and checks new rows with `WITH CHECK` (falling back
+  to `USING`); `INSERT` checks `WITH CHECK`. `FOR ALL` matches every command.
+  `INSERT ... ON CONFLICT DO UPDATE` additionally requires the conflicting
+  row to pass the UPDATE policies' `USING`.
+- Enforcement happens where table rows become visible to execution, so
+  joins, subqueries, CTEs, index scans and `SELECT ... FOR UPDATE` all
+  inherit the filtering. A denied new row raises
+  `new row violates row-level security policy for table "t"` (SQLSTATE
+  `42501`).
+- **Bypass**: the roles `service_role`, `postgres` and `guardian` (the
+  engine's owner) bypass row security entirely — as does any table with row
+  security disabled. `FORCE ROW LEVEL SECURITY` is not supported.
+
+**Policy helpers.** Supabase's `auth.*` helpers are built in:
+
+- `auth.uid()` — the caller's user id: the `sub` claim of
+  `request.jwt.claims` (or the `request.jwt.claim.sub` variable), as `uuid`;
+  `NULL` when unset.
+- `auth.role()` — the `role` claim, as `text`.
+- `auth.jwt()` — the whole claims document, as `jsonb`.
+
+Claims are ordinary session variables: `SET request.jwt.claims = '{"sub":
+"...", "role": "authenticated"}'` (or `set_config(...)`) makes them visible
+to `current_setting('request.jwt.claims')` and the helpers above. The
+Supabase gateway injects them automatically per request.
 
 ---
 
@@ -560,6 +619,9 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 | `40P01`  | deadlock detected               |
 | `55P03`  | lock not available (NOWAIT / lock_timeout) |
 | `25P02`  | in failed SQL transaction       |
+| `42501`  | insufficient privilege (row-level security) |
+| `42710`  | duplicate object (policy, extension) |
+| `42704`  | undefined object (policy, extension) |
 | `0A000`  | feature not supported           |
 
 ## 13. Examples

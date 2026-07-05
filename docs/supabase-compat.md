@@ -20,7 +20,7 @@ conflict-free with concurrent work on `src/sql/ext/`).
 | Seam | Where | How the gateway uses it |
 | --- | --- | --- |
 | `Database<S: RelationalStorage>` | `src/sql/engine.rs` | Built once with `Database::new(Arc<S>, name)`; shared via `Arc` in `AppState`. |
-| `Session<S>` | `src/sql/engine.rs` | **One session per HTTP request**, `Session::new(db, role)`. The `role` (Postgres role name) is the RLS seam. |
+| `Session<S>` | `src/sql/engine.rs` | **One session per HTTP request**, `Session::new(db, role)`. The `role` (Postgres role name) drives row-security enforcement; `Session::set_var("request.jwt.claims", ...)` injects the caller's claims for policies. |
 | `Session::prepare` + `execute_one(&stmt, &[SqlValue])` | `src/sql/engine.rs` | The injection-safe path: a single parameterised statement with `$1..$n` binds. Used for all REST/Auth data ops. |
 | `Session::execute(sql)` | `src/sql/engine.rs` | Multi-statement string (no params). Used only for the `auth` schema bootstrap DDL. |
 | `ExecResult::{Rows{fields,rows}, Command{tag}}` | `src/sql/result.rs` | `OutField.name` + `SqlType` drive JSON rendering. |
@@ -105,7 +105,7 @@ with HTTP `501`. `/health` returns `200 {"status":"ok"}`.
 
 ---
 
-## 4. Auth, JWT, and RLS-readiness
+## 4. Auth, JWT, and Row-Level Security
 
 **JWT.** HS256, implemented from scratch (`jwt.rs`) on `hmac`+`sha2`+`base64`.
 Signatures are compared in constant time; `exp` is enforced. `Claims` carries
@@ -130,12 +130,35 @@ opaque `auth.refresh_tokens` row. Refresh **rotates**: the presented token is
 marked `revoked`, a new token is minted on the same session (with `parent`
 set), and a fresh access token is issued.
 
-**Role resolution (the RLS seam).** The effective Postgres role is the role
-claim of the `Authorization: Bearer` token if present, else the `apikey`'s role
-(PostgREST semantics). Each request opens `Session::new(db, role)`. **RLS is not
-yet enforced** — the role/claims context is threaded through end-to-end and the
-per-request session is bound to the role, so an RLS-enforcement slice can hook in
-at exactly that seam without reshaping the request path.
+**Role resolution.** The effective Postgres role is the role claim of the
+`Authorization: Bearer` token if present, else the `apikey`'s role (PostgREST
+semantics). Each request opens `Session::new(db, role)`.
+
+**Row-Level Security — enforced.** The Supabase security model is real:
+
+- Every REST data path runs through `run_sql_as` (`gateway.rs`), which binds
+  the per-request session to the resolved role **and injects the verified JWT
+  claims** as the `request.jwt.claims` session variable
+  (`Session::set_var`, no SQL round-trip). When no bearer token was supplied,
+  a minimal `{"role": "<role>"}` document is synthesized so `auth.role()`
+  still reflects the effective role.
+- The engine evaluates policies per row (see `docs/postgres-compat.md`,
+  "Row-Level Security"): tables with `ALTER TABLE ... ENABLE ROW LEVEL
+  SECURITY` are filtered for `anon` / `authenticated` / custom roles by their
+  `CREATE POLICY` rules — permissive policies OR together, restrictive
+  policies AND, no applicable policy means **default deny**.
+- `service_role` **bypasses** row security exactly like Supabase's service
+  key (as do the engine-owner roles `postgres`/`guardian`).
+- Policies use the standard Supabase helpers: `auth.uid()` (the `sub` claim
+  as `uuid`), `auth.role()`, `auth.jwt()`, and
+  `current_setting('request.jwt.claims')`.
+- A write denied by `WITH CHECK` surfaces as a PostgREST-shaped error with
+  SQLSTATE `42501` and HTTP **403** (`new row violates row-level security
+  policy for table "t"`); rows filtered by `USING` simply do not appear
+  (reads return fewer rows; `UPDATE`/`DELETE` affect fewer rows) — never an
+  error, matching PostgreSQL/PostgREST.
+- Internal work (GoTrue's `auth.*` tables, schema bootstrap) runs as
+  `service_role` via `run_sql` and is unaffected.
 
 **Auth schema bootstrap.** On first auth request, `BOOTSTRAP_SQL` runs through a
 `Session` (idempotent `CREATE SCHEMA/TABLE IF NOT EXISTS`), creating
@@ -232,8 +255,6 @@ bad password/refresh token). OAuth/SSO grants (`id_token`, `authorization_code`,
 
 ## 7. Deferred to later slices
 
-- **RLS enforcement.** The role/claims context is threaded through and each request
-  runs on a role-bound session, but row-level policies are not evaluated yet.
 - **Storage, Realtime, Edge Functions, GraphQL, pg-meta / Studio.** Routed and
   returning typed `501`; not implemented.
 - **REST**: embedded resources / joins (`select=author(name)`), the full operator
