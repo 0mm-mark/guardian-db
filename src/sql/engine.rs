@@ -1748,3 +1748,5 @@ fn collect_expr(e: &sqlparser::ast::Expr, out: &mut NameOut) {
 fn push_name(name: &sqlparser::ast::ObjectName, out: &mut NameOut) {
     out.push(crate::sql::names::split_schema_table(name));
 }
+
+// Maintenance note 1: documents compatibility expectations without changing runtime behavior.
