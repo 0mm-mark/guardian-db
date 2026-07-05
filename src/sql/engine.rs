@@ -538,6 +538,10 @@ impl<S: RelationalStorage> Session<S> {
         // Preload referenced tables.
         let mut names = Vec::new();
         collect_stmt(stmt, &mut names);
+        // Foreign-key enforcement reads parents (existence checks) and, for
+        // UPDATE/DELETE/upsert, reads and writes referencing tables
+        // transitively (referential actions); preload that ripple too.
+        names.extend(fk_preload(stmt, &catalog));
         // Row-security policies may reference other tables (e.g. in EXISTS
         // subqueries); preload those too so policy evaluation can scan them.
         let mut policy_names = Vec::new();
@@ -1327,6 +1331,26 @@ fn table_lock_plan(stmt: &Statement, catalog: &Catalog) -> Vec<(u32, LockMode)> 
         }
         _ => {}
     }
+    // Foreign-key ripple around a DML target: referencing tables may be
+    // written by referential actions (ROW EXCLUSIVE — the mode an explicit
+    // UPDATE/DELETE on them takes) and parents are read for existence checks
+    // (ROW SHARE, like PostgreSQL's FOR KEY SHARE probes).
+    if let Some((name, include_children)) = fk_dml_target(stmt) {
+        let (s, n) = crate::sql::names::split_schema_table(name);
+        if let Some(q) = catalog.resolve_table_name(s.as_deref(), &n) {
+            let (written, read) = crate::sql::fk::fk_ripple(catalog, &q, include_children);
+            for (set, mode) in [
+                (written, LockMode::RowExclusive),
+                (read, LockMode::RowShare),
+            ] {
+                for fq in set {
+                    if let Some(t) = catalog.get_table(&fq) {
+                        plan.push((t.oid, mode));
+                    }
+                }
+            }
+        }
+    }
     // Deduplicate to the strongest mode per table (lock in oid order to reduce
     // deadlocks between statements touching the same set of tables).
     let mut by_oid: std::collections::BTreeMap<u32, LockMode> = std::collections::BTreeMap::new();
@@ -1337,6 +1361,59 @@ fn table_lock_plan(stmt: &Statement, catalog: &Catalog) -> Vec<(u32, LockMode)> 
         }
     }
     by_oid.into_iter().collect()
+}
+
+/// The DML target of `stmt` plus whether foreign-key referencing tables can
+/// be *written* (referential actions): UPDATE/DELETE always; INSERT only when
+/// an `ON CONFLICT DO UPDATE` can rewrite referenced columns (a plain INSERT
+/// only reads parents).
+fn fk_dml_target(stmt: &Statement) -> Option<(&sqlparser::ast::ObjectName, bool)> {
+    use sqlparser::ast::{FromTable, OnConflictAction, OnInsert, TableFactor, TableObject};
+    match stmt {
+        Statement::Insert(i) => {
+            let upsert = matches!(
+                &i.on,
+                Some(OnInsert::OnConflict(oc))
+                    if matches!(oc.action, OnConflictAction::DoUpdate(_))
+            );
+            match &i.table {
+                TableObject::TableName(name) => Some((name, upsert)),
+                _ => None,
+            }
+        }
+        Statement::Update(u) => match &u.table.relation {
+            TableFactor::Table { name, .. } => Some((name, true)),
+            _ => None,
+        },
+        Statement::Delete(d) => {
+            let items = match &d.from {
+                FromTable::WithFromKeyword(items) | FromTable::WithoutKeyword(items) => items,
+            };
+            match items.first().map(|twj| &twj.relation) {
+                Some(TableFactor::Table { name, .. }) => Some((name, true)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extra table names foreign-key enforcement may touch for `stmt`, to be
+/// preloaded alongside the statement's own references.
+fn fk_preload(stmt: &Statement, catalog: &Catalog) -> NameOut {
+    let Some((name, include_children)) = fk_dml_target(stmt) else {
+        return Vec::new();
+    };
+    let (schema, n) = crate::sql::names::split_schema_table(name);
+    let Some(q) = catalog.resolve_table_name(schema.as_deref(), &n) else {
+        return Vec::new();
+    };
+    let (written, read) = crate::sql::fk::fk_ripple(catalog, &q, include_children);
+    written
+        .into_iter()
+        .chain(read)
+        .map(|fq| (Some(fq.schema), fq.name))
+        .collect()
 }
 
 fn table_mode_rank(mode: LockMode) -> u8 {

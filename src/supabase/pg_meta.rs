@@ -229,7 +229,7 @@ fn table_json(catalog: &Catalog, t: &Table) -> Json {
         "schema": t.schema,
         "name": t.name,
         "rls_enabled": t.rls_enabled,
-        "rls_forced": false,
+        "rls_forced": t.rls_forced,
         "replica_identity": "DEFAULT",
         "bytes": 0,
         "size": "0 bytes",

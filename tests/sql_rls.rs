@@ -110,6 +110,77 @@ async fn bypass_roles_see_everything() {
 }
 
 // ---------------------------------------------------------------------------
+// FORCE ROW LEVEL SECURITY
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn force_rls_subjects_owner_roles_and_no_force_restores() {
+    let db = db();
+    setup(&db).await;
+    let mut owner = session(&db, "guardian");
+    ok(
+        &mut owner,
+        "CREATE POLICY p_own ON docs FOR SELECT USING (owner = current_user)",
+    )
+    .await;
+    // Without FORCE, the owner roles bypass row security entirely.
+    assert_eq!(count(&mut owner, "SELECT count(*) FROM docs").await, 3);
+    ok(&mut owner, "ALTER TABLE docs FORCE ROW LEVEL SECURITY").await;
+    // With ENABLE + FORCE they are subject to policies: no row is owned by
+    // 'guardian' or 'postgres'.
+    assert_eq!(count(&mut owner, "SELECT count(*) FROM docs").await, 0);
+    let mut pg = session(&db, "postgres");
+    assert_eq!(count(&mut pg, "SELECT count(*) FROM docs").await, 0);
+    // Writes are policed too: only a SELECT policy exists, so INSERT denies.
+    assert_eq!(
+        err_code(&mut owner, "INSERT INTO docs VALUES (7, 'guardian', 7)").await,
+        "42501"
+    );
+    // NO FORCE restores the owner exemption.
+    ok(&mut owner, "ALTER TABLE docs NO FORCE ROW LEVEL SECURITY").await;
+    assert_eq!(count(&mut owner, "SELECT count(*) FROM docs").await, 3);
+}
+
+#[tokio::test]
+async fn force_rls_without_enable_has_no_effect() {
+    let db = db();
+    let mut s = session(&db, "guardian");
+    ok(&mut s, "CREATE TABLE t (id int PRIMARY KEY)").await;
+    ok(&mut s, "INSERT INTO t VALUES (1)").await;
+    // FORCE only matters while row security is enabled (PostgreSQL).
+    ok(&mut s, "ALTER TABLE t FORCE ROW LEVEL SECURITY").await;
+    assert_eq!(count(&mut s, "SELECT count(*) FROM t").await, 1);
+    let mut bob = session(&db, "bob");
+    assert_eq!(count(&mut bob, "SELECT count(*) FROM t").await, 1);
+}
+
+#[tokio::test]
+async fn service_role_still_bypasses_under_force() {
+    let db = db();
+    setup(&db).await;
+    let mut owner = session(&db, "guardian");
+    ok(&mut owner, "ALTER TABLE docs FORCE ROW LEVEL SECURITY").await;
+    // BYPASSRLS beats FORCE: service_role sees everything with no policies…
+    let mut service = session(&db, "service_role");
+    assert_eq!(count(&mut service, "SELECT count(*) FROM docs").await, 3);
+    // …while the owner roles fall into default-deny.
+    assert_eq!(count(&mut owner, "SELECT count(*) FROM docs").await, 0);
+}
+
+#[tokio::test]
+async fn force_rls_flag_is_introspectable() {
+    let db = db();
+    setup(&db).await;
+    let mut s = session(&db, "guardian");
+    let probe = "SELECT relforcerowsecurity::text FROM pg_class WHERE relname = 'docs'";
+    assert_eq!(scalar(&mut s, probe).await, Some("f".into()));
+    ok(&mut s, "ALTER TABLE docs FORCE ROW LEVEL SECURITY").await;
+    assert_eq!(scalar(&mut s, probe).await, Some("t".into()));
+    ok(&mut s, "ALTER TABLE docs NO FORCE ROW LEVEL SECURITY").await;
+    assert_eq!(scalar(&mut s, probe).await, Some("f".into()));
+}
+
+// ---------------------------------------------------------------------------
 // Combining semantics
 // ---------------------------------------------------------------------------
 

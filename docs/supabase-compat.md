@@ -230,7 +230,8 @@ message encodings are accepted and mirrored: the realtime-js **object** form
 
 **Authorization — no unauthorized delivery.** Each candidate event is
 authorized against the subscriber's own role before delivery: bypass roles
-(`service_role`, engine owners) receive everything; tables without RLS are
+receive everything (`service_role` always; the engine-owner roles unless the
+table declares `FORCE ROW LEVEL SECURITY`); tables without RLS are
 visible to every role (engine semantics); for INSERT/UPDATE on RLS-enabled
 tables the row's **primary key is re-selected through a session bound to the
 subscriber's role and claims**, and the event is delivered only if the row is
@@ -294,7 +295,11 @@ semantics). Each request opens `Session::new(db, role)`.
   `CREATE POLICY` rules — permissive policies OR together, restrictive
   policies AND, no applicable policy means **default deny**.
 - `service_role` **bypasses** row security exactly like Supabase's service
-  key (as do the engine-owner roles `postgres`/`guardian`).
+  key (`BYPASSRLS`). The engine-owner roles `postgres`/`guardian` bypass it
+  like PostgreSQL table owners — unless the table declares
+  `ALTER TABLE ... FORCE ROW LEVEL SECURITY`, which subjects them to its
+  policies (`BYPASSRLS` still wins; the flag surfaces as `rls_forced` in
+  `/pg-meta/tables` and `pg_class.relforcerowsecurity`).
 - Policies use the standard Supabase helpers: `auth.uid()` (the `sub` claim
   as `uuid`), `auth.role()`, `auth.jwt()`, and
   `current_setting('request.jwt.claims')`.

@@ -250,44 +250,78 @@ exposes them as strings — use `pg.types` parsers if you need `BigInt`).
 
 ### Constraints & indexes
 - `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`
-- `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` actions — **declared and
-  introspectable only; not enforced at runtime**, see the "Foreign keys"
+- `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` actions — declared,
+  introspectable **and enforced** (`MATCH SIMPLE`), see the "Foreign keys"
   subsection below
 - real BTree indexes: primary-key, unique, secondary, composite; maintained on
   insert/update/delete; used for equality index scans (the planner chooses an
   index scan when a single base table is filtered by `col = const` on an indexed
   column, and falls back to a full scan otherwise — results are identical).
 
-#### Foreign keys: parsed + introspectable, not enforced
+#### Foreign keys: enforced (`MATCH SIMPLE`)
 
 Foreign-key constraints are parsed (column-level `REFERENCES` and table-level
 `FOREIGN KEY`, including `ON DELETE` / `ON UPDATE` actions), stored in the
-replicated catalog, and fully introspectable: `pg_constraint` reports
-`contype = 'f'` with `confupdtype`/`confdeltype` reflecting the declared
-actions (`a`/`r`/`c`/`n`/`d`), and `information_schema.table_constraints`,
+replicated catalog, fully introspectable, **and enforced at runtime** with
+PostgreSQL's default `MATCH SIMPLE` semantics (`src/sql/fk.rs`):
+
+- `INSERT` into the referencing table — and any `UPDATE` that changes an FK
+  column's value — requires a parent row matching **all** referenced columns,
+  else SQLSTATE `23503`
+  (`insert or update on table "child" violates foreign key constraint "..."`,
+  with a PG-style `Key (...)=(...) is not present` detail). If **any** FK
+  column is NULL the constraint is satisfied (`MATCH SIMPLE`).
+- `DELETE` of a referenced row, or an `UPDATE` that actually changes a
+  referenced key column's value, executes the declared action:
+
+  | action | behaviour |
+  | ------ | --------- |
+  | `NO ACTION` (default), `RESTRICT` | `23503` (`update or delete on table "parent" violates foreign key constraint "..." on table "child"`) if a referencing row remains |
+  | `CASCADE` | deletes the referencing rows (or rewrites their FK columns to the new key), recursively applying *their* declared FK actions; self-referential chains terminate |
+  | `SET NULL` | sets the FK columns to NULL (a NOT NULL column surfaces the usual `23502`) |
+  | `SET DEFAULT` | sets the FK columns to their column defaults, then re-checks the constraint against the remaining parent rows (`23503` if the defaults reference nothing; all-NULL defaults satisfy `MATCH SIMPLE`) |
+
+- `NO ACTION` and `RESTRICT` are both checked **per statement** — after the
+  statement's own writes and cascades have applied — never deferred to
+  commit. Accordingly, `DEFERRABLE` / `INITIALLY DEFERRED` constraints are
+  rejected with `0A000` (`DEFERRABLE constraints are not supported`), as are
+  `MATCH FULL` / `MATCH PARTIAL` (only `MATCH SIMPLE` is implemented) and
+  `NOT ENFORCED`.
+- Referential actions run through the normal write path (row locks, staged
+  storage mutations), so a failing statement leaves nothing behind and
+  `ROLLBACK` undoes cascades atomically. Like PostgreSQL — which runs
+  referential actions with the table owner's privileges — the internal
+  child-row reads and writes **bypass row-level security**.
+- `TRUNCATE` of a referenced table is rejected (`0A000`, as in PostgreSQL)
+  unless every referencing table is truncated in the same statement. A plain
+  `DROP TABLE` of a referenced table fails with `2BP01` (dependent objects
+  still exist); `DROP TABLE ... CASCADE` drops the dependent constraints
+  instead. Because enforcement needs a resolvable parent, a foreign key
+  referencing a missing table or column is rejected at DDL time
+  (`42P01`/`42703`), and `REFERENCES parent` without a column list binds to
+  the parent's primary key.
+
+Like uniqueness (§8), this is **local-replica** enforcement: checks and
+actions see the locally materialized state, and cross-replica convergence
+follows the same eventual rules as all other writes.
+
+Deliberate simplifications vs PostgreSQL, kept honest here: the referenced
+columns are not required to carry a `UNIQUE`/`PRIMARY KEY` constraint at DDL
+time (PostgreSQL's `42830`) — if duplicate parent keys exist, a key counts as
+still-present while any duplicate survives; and there is no deferral of any
+kind (see the `0A000` rejections above).
+
+Introspection is unchanged: `pg_constraint` reports `contype = 'f'` with
+`confupdtype`/`confdeltype` reflecting the declared actions
+(`a`/`r`/`c`/`n`/`d`), and `information_schema.table_constraints`,
 `key_column_usage`, `constraint_column_usage` and `referential_constraints`
-(with `update_rule`/`delete_rule`) all show them — enough for ORM schema sync
-and migration tooling.
-
-They are **not enforced at runtime**, in any form:
-
-- `INSERT`/`UPDATE` of a referencing value with no matching parent row
-  **succeeds** — there is no existence check, no `23503`.
-- `DELETE` of a referenced parent row **succeeds** — referencing rows are not
-  checked and are left in place.
-- Declared referential actions (`CASCADE`, `SET NULL`, `SET DEFAULT`,
-  `RESTRICT`, `NO ACTION`) are **catalog metadata only — they are never
-  executed**. In particular, a declared `ON DELETE CASCADE` does *not* delete
-  child rows.
-
-This is the honest trade-off of a local-first CRDT store: cross-table
-referential checks cannot be guaranteed across asynchronously converging
-replicas, so the engine does not pretend to make them locally. SQLSTATE
-`23503` is reserved for a future enforcement slice and is currently never
-raised. `tests/sql_conformance.rs`
-(`foreign_keys_declared_but_not_enforced`,
-`foreign_keys_introspectable_with_declared_actions`) pins exactly this
-behaviour so it cannot drift silently.
+(with `update_rule`/`delete_rule`) all show them. `tests/sql_conformance.rs`
+pins the enforcement matrix (`foreign_keys_enforced_on_insert_and_child_update`,
+`foreign_keys_restrict_and_no_action_block_parent_delete`,
+`foreign_key_on_delete_*`, `foreign_key_on_update_actions`,
+`foreign_key_cascade_is_atomic_and_rolls_back`,
+`composite_foreign_key_match_simple`,
+`referenced_parent_guarded_on_drop_and_truncate`).
 
 ### Catalog / introspection
 Queryable `information_schema` (`tables`, `columns`, `schemata`,
@@ -308,6 +342,7 @@ Row security is implemented with PostgreSQL semantics (`src/sql/rls.rs`).
 
 ```sql
 ALTER TABLE t ENABLE ROW LEVEL SECURITY;   -- and DISABLE
+ALTER TABLE t FORCE ROW LEVEL SECURITY;    -- and NO FORCE
 CREATE POLICY name ON t
   [ AS { PERMISSIVE | RESTRICTIVE } ]
   [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
@@ -341,9 +376,15 @@ name on the same table is `42710`; dropping a missing policy is `42704`.
   inherit the filtering. A denied new row raises
   `new row violates row-level security policy for table "t"` (SQLSTATE
   `42501`).
-- **Bypass**: the roles `service_role`, `postgres` and `guardian` (the
-  engine's owner) bypass row security entirely — as does any table with row
-  security disabled. `FORCE ROW LEVEL SECURITY` is not supported.
+- **Bypass and FORCE**: the role `service_role` (the `BYPASSRLS` equivalent)
+  bypasses row security entirely; `postgres` and `guardian` (the engine's
+  owner names) bypass it like PostgreSQL table owners — until a table
+  declares `ALTER TABLE t FORCE ROW LEVEL SECURITY`, which subjects the owner
+  roles to its policies too (`NO FORCE` restores the exemption, and
+  `BYPASSRLS` beats `FORCE`, as in PostgreSQL). FORCE only matters while row
+  security is enabled, and the flag is introspectable as
+  `pg_class.relforcerowsecurity`. Tables with row security disabled are never
+  filtered.
 
 **Policy helpers.** Supabase's `auth.*` helpers are built in:
 
@@ -563,7 +604,7 @@ Each gap has a conformance test in `tests/sql_conformance.rs`
 | Full-text search                     | ✗      | error `0A000` — the function family (`to_tsvector`, `to_tsquery`, `plainto_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery`, `ts_rank`, `ts_rank_cd`, `ts_headline`, `setweight`, `ts_delete`, `tsvector_to_array`) is *named*-unsupported (never `42883`, so it is never sidecar-routed), and `@@` is an unsupported operator; the `tsvector`/`tsquery` types are `42704` |
 | Generated/computed columns           | ✗      | ignored test                           |
 | `SAVEPOINT` partial rollback         | partial| `SAVEPOINT`/`RELEASE` no-op; `ROLLBACK TO` collapses to full rollback |
-| Foreign-key enforcement              | ✗      | constraints parsed + introspectable; **no runtime checks and no referential actions** — see "Foreign keys" in §5 |
+| `DEFERRABLE` constraints             | ✗      | error `0A000` — foreign keys are enforced immediately, per statement (see "Foreign keys" in §5); `MATCH FULL`/`MATCH PARTIAL` are `0A000` too |
 | `SERIALIZABLE` isolation             | ✗      | ignored test (read-committed only)     |
 | SSL/TLS transport                    | ✗      | negotiated-away, cleartext             |
 | Binary result encoding               | ✗      | results sent as text (node-postgres/psql use text) |
@@ -608,8 +649,9 @@ GuardianDB is local-first; SQL does not change that. Two modes are defined.
 - Isolation: **read committed** within a connection (a transaction sees its own
   uncommitted writes; other connections see committed state on their next
   statement). Autocommit wraps each statement in its own transaction.
-- Constraint checks (NOT NULL, unique, CHECK) run before the write is staged, so
-  a violating statement aborts without partial effects.
+- Constraint checks (NOT NULL, unique, CHECK, foreign keys — including
+  referential actions) run before the statement's writes are staged, so a
+  violating statement aborts without partial effects.
 - Any error inside an explicit transaction **aborts** it: further statements
   fail with `25P02` until `ROLLBACK` (and `COMMIT` on an aborted block rolls
   back), matching PostgreSQL.
@@ -696,7 +738,7 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 | `42601`  | syntax error                    |
 | `23505`  | unique violation                |
 | `23502`  | not-null violation              |
-| `23503`  | foreign-key violation (reserved: FKs are declared but never enforced, so the engine currently never raises it — see §5 "Foreign keys") |
+| `23503`  | foreign-key violation (see §5 "Foreign keys")   |
 | `23514`  | check violation                 |
 | `22P02`  | invalid text representation     |
 | `22003`  | numeric value out of range      |
@@ -709,6 +751,7 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 | `42501`  | insufficient privilege (row-level security) |
 | `42710`  | duplicate object (policy, extension) |
 | `42704`  | undefined object (policy, extension) |
+| `2BP01`  | dependent objects still exist (DROP of an FK-referenced table) |
 | `0A000`  | feature not supported           |
 
 ## 13. Examples

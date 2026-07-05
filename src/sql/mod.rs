@@ -21,6 +21,7 @@ mod dml;
 mod eval;
 mod exec;
 pub mod ext;
+mod fk;
 mod funcs;
 pub mod lock;
 mod names;
@@ -44,7 +45,7 @@ pub use error::{Result as SqlResult, SqlError};
 pub use guardian_storage::{Consistency, GuardianRelationalStorage, open_sql, open_sql_with};
 pub use parser::parse_sql;
 pub use result::{ExecResult, OutField};
-pub use rls::role_bypasses_rls;
+pub use rls::{role_bypasses_rls, role_bypasses_rls_on};
 
 // Re-exports from the relational core for convenience.
 pub use crate::relational::{

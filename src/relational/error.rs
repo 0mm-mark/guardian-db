@@ -60,6 +60,9 @@ pub enum RelError {
         detail: String,
     },
 
+    #[error("cannot drop {object} because other objects depend on it")]
+    DependentObjectsStillExist { object: String, detail: String },
+
     #[error("new row for relation \"{table}\" violates check constraint \"{constraint}\"")]
     CheckViolation { table: String, constraint: String },
 
@@ -151,6 +154,7 @@ impl RelError {
             RelError::NotNullViolation { .. } => "23502",
             RelError::ForeignKeyViolation { .. } => "23503",
             RelError::ForeignKeyViolationReferenced { .. } => "23503",
+            RelError::DependentObjectsStillExist { .. } => "2BP01",
             RelError::CheckViolation { .. } => "23514",
             RelError::DatatypeMismatch { .. } => "42804",
             RelError::InvalidTextRepresentation { .. } => "22P02",

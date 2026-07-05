@@ -115,6 +115,9 @@ impl Exec {
         };
 
         let collection = table.storage_collection.clone();
+        // Parent-side referential actions apply when an ON CONFLICT DO UPDATE
+        // rewrites a row of a table that other tables reference.
+        let table_is_referenced = !self.catalog.referencing_foreign_keys(&q).is_empty();
         let mut inserted_rows: Vec<RowValues> = Vec::new();
         let mut count = 0usize;
 
@@ -164,6 +167,11 @@ impl Exec {
                                 &new_vals,
                                 crate::relational::PolicyCmd::Update,
                             )?;
+                            // The conflict update is an UPDATE for foreign-key
+                            // purposes: re-check FKs whose columns changed and
+                            // run parent-side actions if referenced columns
+                            // were rewritten.
+                            self.fk_check_child(&table, &new_vals, Some(&existing))?;
                             self.write_update(
                                 &q,
                                 &collection,
@@ -171,6 +179,15 @@ impl Exec {
                                 &existing_id,
                                 new_vals.clone(),
                             )?;
+                            if table_is_referenced {
+                                self.fk_apply_referential_actions(vec![
+                                    crate::sql::fk::RiWork::Updated {
+                                        table: q.clone(),
+                                        old: existing,
+                                        new: new_vals.clone(),
+                                    },
+                                ])?;
+                            }
                             inserted_rows.push(new_vals);
                             count += 1;
                             continue;
@@ -182,8 +199,9 @@ impl Exec {
                     }
                 }
             }
-            // Fresh insert: enforce uniqueness, then write.
+            // Fresh insert: enforce uniqueness and foreign keys, then write.
             self.check_unique_for(&q, &values, None)?;
+            self.fk_check_child(&table, &values, None)?;
             self.observe_serials(&table, &values);
             let loaded = self.tables.get_mut(&q).unwrap();
             let version = loaded.version_of(&row_id);
@@ -245,7 +263,7 @@ impl Exec {
         Ok(values)
     }
 
-    fn eval_default(&self, default_sql: &str) -> Result<SqlValue> {
+    pub(crate) fn eval_default(&self, default_sql: &str) -> Result<SqlValue> {
         let stmts = crate::sql::parser::parse_sql(&format!("SELECT {default_sql}"))?;
         if let Some(Statement::Query(q)) = stmts.into_iter().next()
             && let sqlparser::ast::SetExpr::Select(select) = q.body.as_ref()
@@ -267,7 +285,7 @@ impl Exec {
         }
     }
 
-    fn check_constraints(&self, table: &Table, values: &RowValues) -> Result<()> {
+    pub(crate) fn check_constraints(&self, table: &Table, values: &RowValues) -> Result<()> {
         for check in &table.checks {
             let stmts = crate::sql::parser::parse_sql(&format!("SELECT {}", check.expr))?;
             if let Some(Statement::Query(q)) = stmts.into_iter().next()
@@ -326,7 +344,7 @@ impl Exec {
         None
     }
 
-    fn check_unique_for(
+    pub(crate) fn check_unique_for(
         &self,
         q: &QualifiedName,
         values: &RowValues,
@@ -419,7 +437,7 @@ impl Exec {
             })
             .unwrap_or_default();
 
-        let mut targets: Vec<(String, RowValues)> = Vec::new();
+        let mut targets: Vec<(String, RowValues, RowValues)> = Vec::new();
         for (rid, values) in &snapshot {
             let tuple = row_tuple(&table, values);
             let matched = match &update.selection {
@@ -470,12 +488,14 @@ impl Exec {
                 &new_values,
                 crate::relational::PolicyCmd::Update,
             )?;
-            targets.push((rid.clone(), new_values));
+            targets.push((rid.clone(), values.clone(), new_values));
         }
 
+        let table_is_referenced = !self.catalog.referencing_foreign_keys(&q).is_empty();
         let mut updated: Vec<RowValues> = Vec::new();
+        let mut ri_work: Vec<crate::sql::fk::RiWork> = Vec::new();
         let mut count = 0;
-        for (rid, new_values) in targets {
+        for (rid, old_values, new_values) in targets {
             // Take a row-level FOR UPDATE lock (acquired after this statement).
             self.record_pending(
                 crate::sql::lock::LockObject::Row(table.oid, rid.clone()),
@@ -483,11 +503,24 @@ impl Exec {
                 crate::sql::lock::LockScope::Transaction,
             );
             self.check_unique_for(&q, &new_values, Some(&rid))?;
+            // Foreign keys of this table are re-checked on the columns the
+            // update actually changed.
+            self.fk_check_child(&table, &new_values, Some(&old_values))?;
             self.observe_serials(&table, &new_values);
             self.write_update(&q, &collection, &table, &rid, new_values.clone())?;
+            if table_is_referenced {
+                ri_work.push(crate::sql::fk::RiWork::Updated {
+                    table: q.clone(),
+                    old: old_values,
+                    new: new_values.clone(),
+                });
+            }
             updated.push(new_values);
             count += 1;
         }
+        // Parent-side referential actions (per statement, after all target
+        // rows are rewritten).
+        self.fk_apply_referential_actions(ri_work)?;
 
         if let Some(returning) = &update.returning {
             return self.returning_result(&table, updated, returning);
@@ -496,7 +529,7 @@ impl Exec {
     }
 
     /// Apply a single-row update (handles primary-key changes by relocating).
-    fn write_update(
+    pub(crate) fn write_update(
         &mut self,
         q: &QualifiedName,
         collection: &str,
@@ -597,6 +630,19 @@ impl Exec {
                 collection: collection.clone(),
                 row_id: rid.clone(),
             });
+        }
+
+        // Referential actions run after all target rows are removed, so a
+        // self-referential NO ACTION check sees the statement's full effect.
+        if !self.catalog.referencing_foreign_keys(&q).is_empty() {
+            let work = deleted
+                .iter()
+                .map(|row| crate::sql::fk::RiWork::Deleted {
+                    table: q.clone(),
+                    row: row.clone(),
+                })
+                .collect();
+            self.fk_apply_referential_actions(work)?;
         }
 
         if let Some(returning) = &delete.returning {
@@ -757,7 +803,7 @@ fn is_default_expr(expr: &sqlparser::ast::Expr) -> bool {
     matches!(expr, sqlparser::ast::Expr::Identifier(i) if i.value.eq_ignore_ascii_case("default"))
 }
 
-fn coerce_to_col(value: SqlValue, table: &Table, col: &str) -> Result<SqlValue> {
+pub(crate) fn coerce_to_col(value: SqlValue, table: &Table, col: &str) -> Result<SqlValue> {
     let c = table
         .column(col)
         .ok_or_else(|| SqlError::UndefinedColumn(col.to_string()))?;

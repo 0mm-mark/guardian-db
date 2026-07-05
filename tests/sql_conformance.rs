@@ -228,11 +228,48 @@ async fn full_text_search_unsupported() {
 }
 
 // ---------------------------------------------------------------------------
-// Foreign keys: declared + introspectable, NOT enforced (truthfulness pins).
+// Foreign keys: declared, introspectable AND enforced (MATCH SIMPLE).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn foreign_keys_declared_but_not_enforced() {
+async fn foreign_keys_enforced_on_insert_and_child_update() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE parent (id INT PRIMARY KEY)").await;
+    ok(
+        &mut s,
+        "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+    )
+    .await;
+
+    // INSERT with no matching parent: 23503 with the PostgreSQL message shape.
+    let err = s
+        .execute("INSERT INTO child VALUES (1, 999)")
+        .await
+        .unwrap_err();
+    assert_eq!(err.sqlstate(), "23503");
+    assert_eq!(
+        err.to_string(),
+        "insert or update on table \"child\" violates foreign key constraint \"child_pid_fkey\""
+    );
+
+    // MATCH SIMPLE: a NULL FK column satisfies the constraint.
+    ok(&mut s, "INSERT INTO child VALUES (1, NULL)").await;
+
+    ok(&mut s, "INSERT INTO parent VALUES (1)").await;
+    ok(&mut s, "INSERT INTO child VALUES (2, 1)").await;
+
+    // UPDATE of the referencing column re-checks: dangling value fails ...
+    assert_eq!(
+        err_code(&mut s, "UPDATE child SET pid = 12345 WHERE id = 2").await,
+        "23503"
+    );
+    // ... NULL and an existing parent pass.
+    ok(&mut s, "UPDATE child SET pid = NULL WHERE id = 2").await;
+    ok(&mut s, "UPDATE child SET pid = 1 WHERE id = 2").await;
+}
+
+#[tokio::test]
+async fn foreign_keys_restrict_and_no_action_block_parent_delete() {
     let mut s = session().await;
     ok(&mut s, "CREATE TABLE parent (id INT PRIMARY KEY)").await;
     ok(
@@ -242,35 +279,368 @@ async fn foreign_keys_declared_but_not_enforced() {
     .await;
     ok(
         &mut s,
-        "CREATE TABLE child_cascade (id INT PRIMARY KEY, \
+        "CREATE TABLE child_r (id INT PRIMARY KEY, \
+         pid INT REFERENCES parent(id) ON DELETE RESTRICT)",
+    )
+    .await;
+    ok(&mut s, "INSERT INTO parent VALUES (1), (2)").await;
+    ok(&mut s, "INSERT INTO child VALUES (1, 1)").await;
+    ok(&mut s, "INSERT INTO child_r VALUES (1, 2)").await;
+
+    // Default NO ACTION: deleting a referenced parent is 23503 with the
+    // PostgreSQL message shape.
+    let err = s
+        .execute("DELETE FROM parent WHERE id = 1")
+        .await
+        .unwrap_err();
+    assert_eq!(err.sqlstate(), "23503");
+    assert_eq!(
+        err.to_string(),
+        "update or delete on table \"parent\" violates foreign key constraint \
+         \"child_pid_fkey\" on table \"child\""
+    );
+    // RESTRICT: same outcome (per-statement checking; no deferral).
+    assert_eq!(
+        err_code(&mut s, "DELETE FROM parent WHERE id = 2").await,
+        "23503"
+    );
+    // Removing the referencing rows unblocks the delete — including within
+    // one statement (child rows deleted by the same DELETE's cascade set).
+    ok(&mut s, "DELETE FROM child WHERE id = 1").await;
+    ok(&mut s, "DELETE FROM parent WHERE id = 1").await;
+    // UPDATE of the referenced key is guarded the same way.
+    assert_eq!(
+        err_code(&mut s, "UPDATE parent SET id = 9 WHERE id = 2").await,
+        "23503"
+    );
+}
+
+#[tokio::test]
+async fn foreign_key_on_delete_cascade_multi_level_and_self_referential() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE a (id INT PRIMARY KEY)").await;
+    ok(
+        &mut s,
+        "CREATE TABLE b (id INT PRIMARY KEY, aid INT REFERENCES a(id) ON DELETE CASCADE)",
+    )
+    .await;
+    // The second level declares its own action; cascading into `b` applies
+    // b's children's actions recursively.
+    ok(
+        &mut s,
+        "CREATE TABLE c (id INT PRIMARY KEY, bid INT REFERENCES b(id) ON DELETE CASCADE)",
+    )
+    .await;
+    ok(&mut s, "INSERT INTO a VALUES (1), (2)").await;
+    ok(&mut s, "INSERT INTO b VALUES (10, 1), (20, 2)").await;
+    ok(&mut s, "INSERT INTO c VALUES (100, 10), (200, 20)").await;
+
+    ok(&mut s, "DELETE FROM a WHERE id = 1").await;
+    assert_eq!(scalar_i64(&mut s, "SELECT count(*) FROM a").await, 1);
+    assert_eq!(scalar_i64(&mut s, "SELECT count(*) FROM b").await, 1);
+    assert_eq!(scalar_i64(&mut s, "SELECT count(*) FROM c").await, 1);
+
+    // Self-referential CASCADE terminates (chain and even mutual references).
+    ok(
+        &mut s,
+        "CREATE TABLE tree (id INT PRIMARY KEY, \
+         parent_id INT REFERENCES tree(id) ON DELETE CASCADE)",
+    )
+    .await;
+    ok(
+        &mut s,
+        "INSERT INTO tree VALUES (1, NULL), (2, 1), (3, 2), (4, NULL)",
+    )
+    .await;
+    ok(&mut s, "DELETE FROM tree WHERE id = 1").await;
+    assert_eq!(scalar_i64(&mut s, "SELECT count(*) FROM tree").await, 1);
+}
+
+#[tokio::test]
+async fn foreign_key_on_delete_set_null() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE parent (id INT PRIMARY KEY)").await;
+    ok(
+        &mut s,
+        "CREATE TABLE child (id INT PRIMARY KEY, \
+         pid INT REFERENCES parent(id) ON DELETE SET NULL)",
+    )
+    .await;
+    ok(&mut s, "INSERT INTO parent VALUES (1)").await;
+    ok(&mut s, "INSERT INTO child VALUES (1, 1)").await;
+    ok(&mut s, "DELETE FROM parent WHERE id = 1").await;
+    let r = ok(&mut s, "SELECT pid FROM child WHERE id = 1").await;
+    match &r[0] {
+        ExecResult::Rows { rows, .. } => assert_eq!(rows[0][0].to_text(), None),
+        _ => panic!("expected rows"),
+    }
+
+    // SET NULL into a NOT NULL column surfaces the usual 23502.
+    ok(
+        &mut s,
+        "CREATE TABLE strict_child (id INT PRIMARY KEY, \
+         pid INT NOT NULL REFERENCES parent(id) ON DELETE SET NULL)",
+    )
+    .await;
+    ok(&mut s, "INSERT INTO parent VALUES (2)").await;
+    ok(&mut s, "INSERT INTO strict_child VALUES (1, 2)").await;
+    assert_eq!(
+        err_code(&mut s, "DELETE FROM parent WHERE id = 2").await,
+        "23502"
+    );
+}
+
+#[tokio::test]
+async fn foreign_key_on_delete_set_default() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE parent (id INT PRIMARY KEY)").await;
+    ok(
+        &mut s,
+        "CREATE TABLE child (id INT PRIMARY KEY, \
+         pid INT DEFAULT 1 REFERENCES parent(id) ON DELETE SET DEFAULT)",
+    )
+    .await;
+    ok(&mut s, "INSERT INTO parent VALUES (1), (2)").await;
+    ok(&mut s, "INSERT INTO child VALUES (10, 2)").await;
+
+    // Re-satisfying: the default (1) references a surviving parent.
+    ok(&mut s, "DELETE FROM parent WHERE id = 2").await;
+    assert_eq!(
+        scalar_i64(&mut s, "SELECT pid FROM child WHERE id = 10").await,
+        1
+    );
+    // Violating, default == deleted key: the internal update is a no-op, so
+    // the post-SET DEFAULT re-check fires (PostgreSQL raises the parent-side
+    // shape here).
+    let err = s
+        .execute("DELETE FROM parent WHERE id = 1")
+        .await
+        .unwrap_err();
+    assert_eq!(err.sqlstate(), "23503");
+    assert_eq!(
+        err.to_string(),
+        "update or delete on table \"parent\" violates foreign key constraint \
+         \"child_pid_fkey\" on table \"child\""
+    );
+
+    // Violating, default != any parent: the internal update re-checks the FK
+    // and fails with the insert-or-update shape.
+    ok(
+        &mut s,
+        "CREATE TABLE child_bad (id INT PRIMARY KEY, \
+         pid INT DEFAULT 999 REFERENCES parent(id) ON DELETE SET DEFAULT)",
+    )
+    .await;
+    ok(&mut s, "DELETE FROM child WHERE id = 10").await;
+    ok(&mut s, "INSERT INTO child_bad VALUES (1, 1)").await;
+    let err = s
+        .execute("DELETE FROM parent WHERE id = 1")
+        .await
+        .unwrap_err();
+    assert_eq!(err.sqlstate(), "23503");
+    assert_eq!(
+        err.to_string(),
+        "insert or update on table \"child_bad\" violates foreign key constraint \
+         \"child_bad_pid_fkey\""
+    );
+    ok(&mut s, "DELETE FROM child_bad").await;
+
+    // A column without a default becomes NULL, which satisfies MATCH SIMPLE.
+    ok(
+        &mut s,
+        "CREATE TABLE loose_child (id INT PRIMARY KEY, \
+         pid INT REFERENCES parent(id) ON DELETE SET DEFAULT)",
+    )
+    .await;
+    ok(&mut s, "DELETE FROM child WHERE id = 10").await;
+    ok(&mut s, "INSERT INTO loose_child VALUES (1, 1)").await;
+    ok(&mut s, "DELETE FROM parent WHERE id = 1").await;
+    let r = ok(&mut s, "SELECT pid FROM loose_child WHERE id = 1").await;
+    match &r[0] {
+        ExecResult::Rows { rows, .. } => assert_eq!(rows[0][0].to_text(), None),
+        _ => panic!("expected rows"),
+    }
+}
+
+#[tokio::test]
+async fn foreign_key_on_update_actions() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE parent (id INT PRIMARY KEY)").await;
+    ok(
+        &mut s,
+        "CREATE TABLE child (id INT PRIMARY KEY, \
+         pid INT REFERENCES parent(id) ON UPDATE CASCADE)",
+    )
+    .await;
+    ok(&mut s, "INSERT INTO parent VALUES (1), (2)").await;
+    ok(&mut s, "INSERT INTO child VALUES (1, 1)").await;
+
+    // CASCADE rewrites the child's FK value to the new key.
+    ok(&mut s, "UPDATE parent SET id = 5 WHERE id = 1").await;
+    assert_eq!(
+        scalar_i64(&mut s, "SELECT pid FROM child WHERE id = 1").await,
+        5
+    );
+    // Updating an unreferenced parent row (or a non-key column) fires nothing.
+    ok(&mut s, "UPDATE parent SET id = 7 WHERE id = 2").await;
+    assert_eq!(
+        scalar_i64(&mut s, "SELECT pid FROM child WHERE id = 1").await,
+        5
+    );
+
+    // SET NULL on update.
+    ok(
+        &mut s,
+        "CREATE TABLE child_null (id INT PRIMARY KEY, \
+         pid INT REFERENCES parent(id) ON UPDATE SET NULL)",
+    )
+    .await;
+    ok(&mut s, "INSERT INTO child_null VALUES (1, 7)").await;
+    ok(&mut s, "UPDATE parent SET id = 8 WHERE id = 7").await;
+    let r = ok(&mut s, "SELECT pid FROM child_null WHERE id = 1").await;
+    match &r[0] {
+        ExecResult::Rows { rows, .. } => assert_eq!(rows[0][0].to_text(), None),
+        _ => panic!("expected rows"),
+    }
+}
+
+#[tokio::test]
+async fn foreign_key_cascade_is_atomic_and_rolls_back() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE parent (id INT PRIMARY KEY)").await;
+    ok(
+        &mut s,
+        "CREATE TABLE c_cascade (id INT PRIMARY KEY, \
          pid INT REFERENCES parent(id) ON DELETE CASCADE)",
     )
     .await;
-
-    // The engine performs NO referential checks. These pins document the
-    // actual behaviour so it cannot drift silently; if FK enforcement is ever
-    // implemented, each `ok` below should flip to a 23503 assertion.
-    //
-    // No existence check on INSERT (PostgreSQL: 23503) ...
-    ok(&mut s, "INSERT INTO child VALUES (1, 999)").await;
-    // ... nor on UPDATE of the referencing column.
-    ok(&mut s, "UPDATE child SET pid = 12345 WHERE id = 1").await;
-
+    ok(
+        &mut s,
+        "CREATE TABLE c_restrict (id INT PRIMARY KEY, \
+         pid INT REFERENCES parent(id) ON DELETE RESTRICT)",
+    )
+    .await;
     ok(&mut s, "INSERT INTO parent VALUES (1)").await;
-    ok(&mut s, "INSERT INTO child VALUES (2, 1)").await;
-    ok(&mut s, "INSERT INTO child_cascade VALUES (1, 1)").await;
+    ok(&mut s, "INSERT INTO c_cascade VALUES (1, 1)").await;
+    ok(&mut s, "INSERT INTO c_restrict VALUES (1, 1)").await;
 
-    // Deleting a referenced parent succeeds (PostgreSQL: 23503 under the
-    // default NO ACTION) ...
-    ok(&mut s, "DELETE FROM parent WHERE id = 1").await;
-    // ... and a declared ON DELETE CASCADE does NOT cascade: the child rows
-    // must survive. (Half-implementing the cascade would be fabricated
-    // semantics; the declared action is catalog metadata only.)
+    // The RESTRICT sibling aborts the whole statement: the cascade into
+    // c_cascade must not be half-applied.
     assert_eq!(
-        scalar_i64(&mut s, "SELECT count(*) FROM child_cascade").await,
+        err_code(&mut s, "DELETE FROM parent WHERE id = 1").await,
+        "23503"
+    );
+    assert_eq!(scalar_i64(&mut s, "SELECT count(*) FROM parent").await, 1);
+    assert_eq!(
+        scalar_i64(&mut s, "SELECT count(*) FROM c_cascade").await,
         1
     );
-    assert_eq!(scalar_i64(&mut s, "SELECT count(*) FROM child").await, 2);
+
+    // A rolled-back transaction undoes the cascade with the delete.
+    ok(&mut s, "DELETE FROM c_restrict").await;
+    ok(&mut s, "BEGIN").await;
+    ok(&mut s, "DELETE FROM parent WHERE id = 1").await;
+    assert_eq!(
+        scalar_i64(&mut s, "SELECT count(*) FROM c_cascade").await,
+        0
+    );
+    ok(&mut s, "ROLLBACK").await;
+    assert_eq!(scalar_i64(&mut s, "SELECT count(*) FROM parent").await, 1);
+    assert_eq!(
+        scalar_i64(&mut s, "SELECT count(*) FROM c_cascade").await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn composite_foreign_key_match_simple() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE cp (a INT, b INT, PRIMARY KEY (a, b))").await;
+    ok(
+        &mut s,
+        "CREATE TABLE cc (id INT PRIMARY KEY, x INT, y INT, \
+         FOREIGN KEY (x, y) REFERENCES cp (a, b))",
+    )
+    .await;
+    ok(&mut s, "INSERT INTO cp VALUES (1, 2)").await;
+    ok(&mut s, "INSERT INTO cc VALUES (1, 1, 2)").await;
+    // MATCH SIMPLE: one NULL component passes, even if the rest dangles.
+    ok(&mut s, "INSERT INTO cc VALUES (2, 9, NULL)").await;
+    // A fully non-NULL key must match a parent row.
+    assert_eq!(
+        err_code(&mut s, "INSERT INTO cc VALUES (3, 1, 3)").await,
+        "23503"
+    );
+    // The composite key is guarded on the parent side too.
+    assert_eq!(err_code(&mut s, "DELETE FROM cp").await, "23503");
+}
+
+#[tokio::test]
+async fn deferrable_and_match_full_foreign_keys_rejected() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE dp (id INT PRIMARY KEY)").await;
+    // Deferred checking is not implemented: accepting DEFERRABLE and then
+    // checking immediately anyway would be a lie — stable 0A000 instead.
+    for sql in [
+        "CREATE TABLE dc (id INT PRIMARY KEY, pid INT REFERENCES dp(id) DEFERRABLE)",
+        "CREATE TABLE dc (id INT PRIMARY KEY, \
+         pid INT REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE TABLE dc (id INT PRIMARY KEY, pid INT REFERENCES dp(id) INITIALLY DEFERRED)",
+        "CREATE TABLE dc (id INT PRIMARY KEY, pid INT, \
+         FOREIGN KEY (pid) REFERENCES dp(id) DEFERRABLE)",
+        "CREATE TABLE dc (id INT PRIMARY KEY, pid INT UNIQUE DEFERRABLE)",
+        // Only MATCH SIMPLE is enforced; other MATCH kinds must not be
+        // silently downgraded.
+        "CREATE TABLE dc (id INT PRIMARY KEY, pid INT REFERENCES dp(id) MATCH FULL)",
+    ] {
+        assert_eq!(err_code(&mut s, sql).await, "0A000", "for `{sql}`");
+    }
+    // The defaults the engine implements are accepted.
+    ok(
+        &mut s,
+        "CREATE TABLE dc_ok (id INT PRIMARY KEY, \
+         pid INT REFERENCES dp(id) NOT DEFERRABLE INITIALLY IMMEDIATE)",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn referenced_parent_guarded_on_drop_and_truncate() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE TABLE parent (id INT PRIMARY KEY)").await;
+    ok(
+        &mut s,
+        "CREATE TABLE child (id INT PRIMARY KEY, pid INT REFERENCES parent(id))",
+    )
+    .await;
+    // TRUNCATE of a referenced parent is rejected (PostgreSQL 0A000) unless
+    // the referencing table is truncated in the same statement.
+    assert_eq!(err_code(&mut s, "TRUNCATE parent").await, "0A000");
+    ok(&mut s, "TRUNCATE parent, child").await;
+    // A referencing constraint blocks DROP TABLE (PostgreSQL 2BP01) ...
+    assert_eq!(err_code(&mut s, "DROP TABLE parent").await, "2BP01");
+    // ... and CASCADE drops the dependent constraint instead, after which the
+    // child accepts previously-dangling values.
+    ok(&mut s, "DROP TABLE parent CASCADE").await;
+    ok(&mut s, "INSERT INTO child VALUES (1, 999)").await;
+    // Dropping parent and child together also works.
+    ok(&mut s, "CREATE TABLE p2 (id INT PRIMARY KEY)").await;
+    ok(
+        &mut s,
+        "CREATE TABLE c2 (id INT PRIMARY KEY, pid INT REFERENCES p2(id))",
+    )
+    .await;
+    ok(&mut s, "DROP TABLE p2, c2").await;
+    // Foreign keys referencing a missing table are rejected at DDL time now
+    // that they are enforced (PostgreSQL 42P01).
+    assert_eq!(
+        err_code(
+            &mut s,
+            "CREATE TABLE orphan (id INT PRIMARY KEY, pid INT REFERENCES nowhere(id))"
+        )
+        .await,
+        "42P01"
+    );
 }
 
 #[tokio::test]
@@ -288,9 +658,9 @@ async fn foreign_keys_introspectable_with_declared_actions() {
          pid INT REFERENCES parent(id) ON DELETE CASCADE)",
     )
     .await;
-    // pg_constraint reports the declared referential actions even though they
-    // are not executed: contype 'f'; confdeltype 'c' for the declared CASCADE
-    // and 'a' (NO ACTION) otherwise; confupdtype 'a'.
+    // pg_constraint reports the declared (and enforced) referential actions:
+    // contype 'f'; confdeltype 'c' for the declared CASCADE and 'a'
+    // (NO ACTION) otherwise; confupdtype 'a'.
     let r = ok(
         &mut s,
         "SELECT conname, contype, confupdtype, confdeltype \

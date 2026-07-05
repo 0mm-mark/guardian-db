@@ -26,7 +26,8 @@
 //! candidate event is authorized against the subscriber's **own role** before
 //! delivery:
 //!
-//! * RLS-bypass roles (`service_role`, engine owners) receive everything;
+//! * RLS-bypass roles receive everything (`service_role` always; the engine
+//!   owners unless the table declares `FORCE ROW LEVEL SECURITY`);
 //! * tables without RLS enabled are visible to every role (engine semantics);
 //! * for `INSERT`/`UPDATE` on RLS-enabled tables the row's primary key is
 //!   re-selected through a session bound to the subscriber's role and claims —
@@ -50,7 +51,7 @@ use serde_json::{Map, Value as Json, json};
 use crate::relational::Catalog;
 use crate::relational::catalog::Table;
 use crate::sql::engine::{ChangeEvent, ChangeOp};
-use crate::sql::role_bypasses_rls;
+use crate::sql::role_bypasses_rls_on;
 use crate::sql::{RelationalStorage, SqlValue};
 use crate::supabase::error::SupaError;
 use crate::supabase::gateway::{AppState, AuthContext, load_catalog, run_sql_as};
@@ -767,7 +768,9 @@ async fn authorized<S: RelationalStorage + 'static>(
     event: &ChangeEvent,
 ) -> bool {
     let role = auth.role();
-    if role_bypasses_rls(&role) {
+    // Per-table bypass: FORCE ROW LEVEL SECURITY revokes the owner roles'
+    // exemption (BYPASSRLS-equivalent roles still pass).
+    if role_bypasses_rls_on(&role, table) {
         return true;
     }
     if !table.rls_enabled {

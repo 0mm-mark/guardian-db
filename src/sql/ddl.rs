@@ -53,6 +53,8 @@ impl Exec {
         // Table-level constraints.
         for constraint in &ct.constraints {
             self.apply_table_constraint(
+                &schema,
+                &name,
                 constraint,
                 &mut pk_columns,
                 &mut uniques,
@@ -88,6 +90,7 @@ impl Exec {
             checks,
             storage_collection: String::new(),
             rls_enabled: false,
+            rls_forced: false,
             policies: Vec::new(),
         };
         self.catalog.insert_table(table)?;
@@ -173,13 +176,15 @@ impl Exec {
                 ColumnOption::NotNull => nullable = false,
                 ColumnOption::Null => nullable = true,
                 ColumnOption::Default(expr) => default = Some(expr.to_string()),
-                ColumnOption::PrimaryKey(_) => {
+                ColumnOption::PrimaryKey(pk) => {
+                    reject_unsupported_characteristics(&pk.characteristics)?;
                     if !pk_columns.contains(&name) {
                         pk_columns.push(name.clone());
                     }
                     nullable = false;
                 }
                 ColumnOption::Unique(u) => {
+                    reject_unsupported_characteristics(&u.characteristics)?;
                     if u.is_primary_via_kind() {
                         if !pk_columns.contains(&name) {
                             pk_columns.push(name.clone());
@@ -193,20 +198,19 @@ impl Exec {
                     }
                 }
                 ColumnOption::ForeignKey(fk) => {
-                    let (_fs, ft) = split_schema_table(&fk.foreign_table);
-                    foreign_keys.push(ForeignKey {
-                        name: opt
-                            .name
-                            .as_ref()
-                            .map(ident_name)
-                            .unwrap_or_else(|| format!("{table}_{name}_fkey")),
-                        columns: vec![name.clone()],
-                        ref_schema: "public".into(),
-                        ref_table: ft,
-                        ref_columns: fk.referred_columns.iter().map(ident_name).collect(),
-                        on_delete: map_action(fk.on_delete),
-                        on_update: map_action(fk.on_update),
-                    });
+                    let fk_name = opt
+                        .name
+                        .as_ref()
+                        .map(ident_name)
+                        .unwrap_or_else(|| format!("{table}_{name}_fkey"));
+                    foreign_keys.push(self.build_foreign_key(
+                        fk,
+                        schema,
+                        table,
+                        pk_columns,
+                        vec![name.clone()],
+                        fk_name,
+                    )?);
                 }
                 ColumnOption::Check(c) => {
                     checks.push(CheckConstraint {
@@ -221,7 +225,6 @@ impl Exec {
                 _ => {}
             }
         }
-        let _ = schema;
         Ok(Column {
             name,
             ty,
@@ -232,8 +235,11 @@ impl Exec {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply_table_constraint(
         &self,
+        schema: &str,
+        table: &str,
         constraint: &TableConstraint,
         pk_columns: &mut Vec<String>,
         uniques: &mut Vec<UniqueConstraint>,
@@ -242,11 +248,13 @@ impl Exec {
     ) -> Result<()> {
         match constraint {
             TableConstraint::PrimaryKey(pk) => {
+                reject_unsupported_characteristics(&pk.characteristics)?;
                 for ic in &pk.columns {
                     pk_columns.push(index_column_name(ic)?);
                 }
             }
             TableConstraint::Unique(u) => {
+                reject_unsupported_characteristics(&u.characteristics)?;
                 let cols: Result<Vec<String>> = u.columns.iter().map(index_column_name).collect();
                 uniques.push(UniqueConstraint {
                     name: u.name.as_ref().map(ident_name).unwrap_or_default(),
@@ -254,20 +262,14 @@ impl Exec {
                 });
             }
             TableConstraint::ForeignKey(fk) => {
-                let (_fs, ft) = split_schema_table(&fk.foreign_table);
-                foreign_keys.push(ForeignKey {
-                    name: fk
-                        .name
-                        .as_ref()
-                        .map(ident_name)
-                        .unwrap_or_else(|| "fk".into()),
-                    columns: fk.columns.iter().map(ident_name).collect(),
-                    ref_schema: "public".into(),
-                    ref_table: ft,
-                    ref_columns: fk.referred_columns.iter().map(ident_name).collect(),
-                    on_delete: map_action(fk.on_delete),
-                    on_update: map_action(fk.on_update),
-                });
+                let cols: Vec<String> = fk.columns.iter().map(ident_name).collect();
+                let fk_name = fk
+                    .name
+                    .as_ref()
+                    .map(ident_name)
+                    .unwrap_or_else(|| format!("{table}_{}_fkey", cols.join("_")));
+                foreign_keys
+                    .push(self.build_foreign_key(fk, schema, table, pk_columns, cols, fk_name)?);
             }
             TableConstraint::Check(c) => {
                 checks.push(CheckConstraint {
@@ -282,6 +284,72 @@ impl Exec {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Resolve and validate a foreign-key declaration at DDL time.
+    ///
+    /// The referenced schema is pinned here (explicit qualification wins, an
+    /// unqualified self-reference binds to the declaring table's schema, and
+    /// anything else follows the search path), an omitted referenced column
+    /// list defaults to the parent's primary key (PostgreSQL), and — since
+    /// foreign keys are enforced at runtime — the referenced table and
+    /// columns must exist. A self-reference inside `CREATE TABLE` validates
+    /// against the primary key collected so far instead of the catalog.
+    fn build_foreign_key(
+        &self,
+        fk: &sqlparser::ast::ForeignKeyConstraint,
+        own_schema: &str,
+        own_table: &str,
+        own_pk: &[String],
+        columns: Vec<String>,
+        name: String,
+    ) -> Result<ForeignKey> {
+        reject_unsupported_characteristics(&fk.characteristics)?;
+        reject_unsupported_match(&fk.match_kind)?;
+        let (fs, ft) = split_schema_table(&fk.foreign_table);
+        let ref_schema = match &fs {
+            Some(s) => s.clone(),
+            None if ft == own_table => own_schema.to_string(),
+            None => self
+                .catalog
+                .resolve_table_name(None, &ft)
+                .map(|q| q.schema)
+                .unwrap_or_else(|| own_schema.to_string()),
+        };
+        let self_ref = ref_schema == own_schema && ft == own_table;
+        let parent = self
+            .catalog
+            .get_table(&QualifiedName::new(ref_schema.clone(), ft.clone()));
+        if parent.is_none() && !self_ref {
+            return Err(SqlError::UndefinedTable(ft.clone()));
+        }
+        let mut ref_columns: Vec<String> = fk.referred_columns.iter().map(ident_name).collect();
+        if ref_columns.is_empty() {
+            // `REFERENCES parent` without columns targets the parent's PK.
+            ref_columns = match parent {
+                Some(p) => p.pk_columns(),
+                None => own_pk.to_vec(),
+            };
+        }
+        if ref_columns.is_empty() || ref_columns.len() != columns.len() {
+            return Err(SqlError::InvalidConstraint(name));
+        }
+        if let Some(p) = parent {
+            for c in &ref_columns {
+                if p.column(c).is_none() {
+                    return Err(SqlError::UndefinedColumn(c.clone()));
+                }
+            }
+        }
+        Ok(ForeignKey {
+            name,
+            columns,
+            ref_schema,
+            ref_table: ft,
+            ref_columns,
+            on_delete: map_action(fk.on_delete),
+            on_update: map_action(fk.on_update),
+        })
     }
 
     pub fn exec_create_schema(&mut self, name: &str, if_not_exists: bool) -> Result<ExecResult> {
@@ -384,11 +452,41 @@ impl Exec {
         cascade: bool,
     ) -> Result<ExecResult> {
         use sqlparser::ast::ObjectType;
+        // All tables this statement drops (FK dependents inside the set never
+        // block, mirroring `DROP TABLE parent, child`).
+        let drop_set: Vec<QualifiedName> = if matches!(object_type, ObjectType::Table) {
+            names
+                .iter()
+                .filter_map(|name| {
+                    let (s, t) = split_schema_table(name);
+                    self.catalog.resolve_table_name(s.as_deref(), &t)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         for name in names {
             let (schema, n) = split_schema_table(name);
             match object_type {
                 ObjectType::Table => match self.catalog.resolve_table_name(schema.as_deref(), &n) {
                     Some(q) => {
+                        // Foreign keys on other tables depend on this one:
+                        // plain DROP fails (PostgreSQL 2BP01); CASCADE drops
+                        // the dependent constraints (see the catalog's
+                        // referential cleanup in `drop_table_qualified`).
+                        if !cascade {
+                            for (child, fk) in self.catalog.referencing_foreign_keys(&q) {
+                                if !drop_set.contains(&child) {
+                                    return Err(SqlError::DependentObjectsStillExist {
+                                        object: format!("table {}", q.name),
+                                        detail: format!(
+                                            "constraint {} on table {} depends on table {}",
+                                            fk.name, child.name, q.name
+                                        ),
+                                    });
+                                }
+                            }
+                        }
                         let table = self.catalog.drop_table_qualified(&q)?;
                         self.mutations.push(Mutation::Truncate {
                             collection: table.storage_collection,
@@ -428,15 +526,36 @@ impl Exec {
 
     pub fn exec_truncate(&mut self, stmt: &Statement) -> Result<ExecResult> {
         if let Statement::Truncate(t) = stmt {
+            // Resolve every target first: the FK guard considers the whole
+            // statement (PostgreSQL allows truncating parent and child
+            // together; a self-reference never blocks).
+            let mut targets: Vec<QualifiedName> = Vec::new();
             for target in &t.table_names {
                 let (schema, n) = split_schema_table(&target.name);
                 let q = self
                     .catalog
                     .resolve_table_name(schema.as_deref(), &n)
                     .ok_or_else(|| SqlError::UndefinedTable(n.clone()))?;
-                let collection = self.catalog.require_table(&q)?.storage_collection.clone();
+                targets.push(q);
+            }
+            for q in &targets {
+                for (child, fk) in self.catalog.referencing_foreign_keys(q) {
+                    if !targets.contains(&child) {
+                        // PostgreSQL rejects this with 0A000 rather than
+                        // running referential actions on a truncation.
+                        return Err(SqlError::FeatureNotSupported(format!(
+                            "cannot truncate a table referenced in a foreign key constraint — \
+                             table \"{}\" references \"{}\" (constraint \"{}\"); truncate \
+                             \"{}\" in the same statement",
+                            child.name, q.name, fk.name, child.name
+                        )));
+                    }
+                }
+            }
+            for q in &targets {
+                let collection = self.catalog.require_table(q)?.storage_collection.clone();
                 self.mutations.push(Mutation::Truncate { collection });
-                if let Some(loaded) = self.tables.get_mut(&q) {
+                if let Some(loaded) = self.tables.get_mut(q) {
                     loaded.rows.clear();
                     loaded.rebuild_indexes();
                 }
@@ -615,6 +734,8 @@ impl Exec {
                 let mut fks = Vec::new();
                 let mut checks = Vec::new();
                 self.apply_table_constraint(
+                    &q.schema,
+                    &q.name,
                     constraint,
                     &mut pk,
                     &mut uniques,
@@ -668,6 +789,14 @@ impl Exec {
             }
             AlterTableOperation::DisableRowLevelSecurity => {
                 self.catalog.get_table_mut(q).unwrap().rls_enabled = false;
+            }
+            // FORCE revokes the owner roles' row-security exemption (it only
+            // takes effect while row security is enabled, like PostgreSQL).
+            AlterTableOperation::ForceRowLevelSecurity => {
+                self.catalog.get_table_mut(q).unwrap().rls_forced = true;
+            }
+            AlterTableOperation::NoForceRowLevelSecurity => {
+                self.catalog.get_table_mut(q).unwrap().rls_forced = false;
             }
             AlterTableOperation::DropConstraint {
                 name, if_exists, ..
@@ -891,6 +1020,49 @@ pub fn index_column_name(ic: &sqlparser::ast::IndexColumn) -> Result<String> {
         other => Err(SqlError::FeatureNotSupported(format!(
             "index on expression not supported: {other}"
         ))),
+    }
+}
+
+/// Truthfulness carve-out: deferred constraint checking is not implemented,
+/// so `DEFERRABLE` / `INITIALLY DEFERRED` (and `NOT ENFORCED`) must fail with
+/// a stable `0A000` instead of being accepted and checked immediately anyway.
+/// `NOT DEFERRABLE`, `INITIALLY IMMEDIATE` and `ENFORCED` are the defaults
+/// the engine implements, so they pass.
+fn reject_unsupported_characteristics(
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
+) -> Result<()> {
+    if let Some(c) = characteristics {
+        if c.deferrable == Some(true)
+            || c.initially == Some(sqlparser::ast::DeferrableInitial::Deferred)
+        {
+            return Err(SqlError::FeatureNotSupported(
+                "DEFERRABLE constraints are not supported".into(),
+            ));
+        }
+        if c.enforced == Some(false) {
+            return Err(SqlError::FeatureNotSupported(
+                "NOT ENFORCED constraints are not supported".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Foreign keys are enforced with MATCH SIMPLE semantics only; accepting
+/// `MATCH FULL`/`MATCH PARTIAL` and then enforcing SIMPLE would be silently
+/// wrong for partially-NULL keys.
+fn reject_unsupported_match(
+    kind: &Option<sqlparser::ast::ConstraintReferenceMatchKind>,
+) -> Result<()> {
+    use sqlparser::ast::ConstraintReferenceMatchKind as M;
+    match kind {
+        Some(M::Full) => Err(SqlError::FeatureNotSupported(
+            "MATCH FULL foreign keys are not supported (MATCH SIMPLE only)".into(),
+        )),
+        Some(M::Partial) => Err(SqlError::FeatureNotSupported(
+            "MATCH PARTIAL foreign keys are not supported (MATCH SIMPLE only)".into(),
+        )),
+        Some(M::Simple) | None => Ok(()),
     }
 }
 
