@@ -33,6 +33,17 @@ impl Exec {
         self.eval_inner(expr, frames, Some(aggs))
     }
 
+    /// Evaluate with an optional precomputed aggregate/window value map (the
+    /// map also carries window-call results, keyed by their SQL text).
+    pub(crate) fn eval_opt_agg(
+        &self,
+        expr: &Expr,
+        frames: &[Frame],
+        aggs: Option<&HashMap<String, SqlValue>>,
+    ) -> Result<SqlValue> {
+        self.eval_inner(expr, frames, aggs)
+    }
+
     fn eval_inner(
         &self,
         expr: &Expr,
@@ -677,6 +688,18 @@ impl Exec {
         aggs: Option<&HashMap<String, SqlValue>>,
     ) -> Result<SqlValue> {
         let name = crate::sql::names::function_dispatch_name(&func.name);
+        // Window calls (`... OVER ...`) are precomputed by the SELECT pipeline
+        // and looked up by their SQL text; anywhere else they are misplaced.
+        if func.over.is_some() {
+            if let Some(map) = aggs
+                && let Some(v) = map.get(&func.to_string())
+            {
+                return Ok(v.clone());
+            }
+            return Err(SqlError::WindowingError(
+                "window functions are not allowed here".into(),
+            ));
+        }
         if funcs::is_aggregate(&name) {
             if let Some(map) = aggs {
                 let key = func.to_string();

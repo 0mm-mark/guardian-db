@@ -586,25 +586,14 @@ impl<S: RelationalStorage> Session<S> {
         // Row security: compute per-table visibility once, before anything is
         // evaluated (CTEs, scans and DML snapshots all consult it).
         exec.init_rls(stmt)?;
-        // Pre-materialize top-level CTEs. CTEs materialize exactly once, in
-        // order, non-recursively — so `WITH RECURSIVE` must be rejected here:
-        // materializing it would either return base-case rows only (silently
-        // wrong results) or fail with a misleading `42P01` on the
-        // self-reference (which sidecar routing could then forward).
+        // Pre-materialize top-level CTEs, in order. Recursive members of a
+        // `WITH RECURSIVE` iterate to a fixpoint against a working table (see
+        // `Exec::materialize_with`); everything else materializes exactly
+        // once, non-recursively.
         if let Statement::Query(q) = stmt
             && let Some(with) = &q.with
         {
-            if with.recursive {
-                return Err(SqlError::FeatureNotSupported(
-                    "WITH RECURSIVE is not supported".into(),
-                ));
-            }
-            for cte in &with.cte_tables {
-                let name = crate::sql::names::ident_name(&cte.alias.name);
-                let rs = exec.exec_select_query(&cte.query, &[])?;
-                let rs = relabel_cte(rs, &name);
-                exec.cte.insert(name, rs);
-            }
+            exec.materialize_with(with)?;
         }
         let result = self.dispatch(&mut exec, stmt)?;
         // Persist variable writes made during execution (e.g. `set_limit`).
@@ -1497,13 +1486,6 @@ fn stage_mutations(txn: &mut Transaction, mutations: Vec<Mutation>) {
             }
         }
     }
-}
-
-fn relabel_cte(mut rs: crate::sql::row::RowSet, name: &str) -> crate::sql::row::RowSet {
-    for f in &mut rs.schema.fields {
-        f.table = Some(name.to_string());
-    }
-    rs
 }
 
 fn show_value(var: &str) -> String {
