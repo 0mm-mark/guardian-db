@@ -882,3 +882,7 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 ### SQL compatibility note 15
 
 Tracks PostgreSQL-compatible behavior for window functions, recursive CTEs, SQLSTATE-mapped validation, aggregate FILTER handling, and min/max type inference without changing executable code.
+
+### SQL compatibility note 15
+
+Tracks PostgreSQL-compatible behavior for window functions, recursive CTEs, SQLSTATE-mapped validation, aggregate FILTER handling, and min/max type inference without changing executable code.
