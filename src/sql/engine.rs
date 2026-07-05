@@ -19,6 +19,9 @@ pub struct Database<S: RelationalStorage> {
     storage: Arc<S>,
     pub name: String,
     locks: Arc<LockManager>,
+    /// Registered row-change listeners (see [`Database::subscribe_changes`]).
+    /// Closed receivers are pruned lazily on the next emission.
+    change_listeners: std::sync::RwLock<Vec<tokio::sync::mpsc::UnboundedSender<ChangeEvent>>>,
 }
 
 impl<S: RelationalStorage> Database<S> {
@@ -27,6 +30,7 @@ impl<S: RelationalStorage> Database<S> {
             storage,
             name: name.into(),
             locks: Arc::new(LockManager::new()),
+            change_listeners: std::sync::RwLock::new(Vec::new()),
         }
     }
 
@@ -37,6 +41,76 @@ impl<S: RelationalStorage> Database<S> {
     /// The shared lock manager (single-node coordinator).
     pub fn locks(&self) -> &Arc<LockManager> {
         &self.locks
+    }
+
+    /// Subscribe to committed row changes. Every row mutation that reaches
+    /// storage through a [`Session`] — autocommit statements and explicit
+    /// `COMMIT`s alike — is delivered as a [`ChangeEvent`] *after* it has been
+    /// applied. Dropping the receiver unsubscribes (the sender is pruned on the
+    /// next emission). When no listener is registered the engine skips event
+    /// collection entirely, so the hook costs nothing unless used.
+    ///
+    /// `TRUNCATE` produces no per-row events, and writes that bypass the
+    /// engine (direct [`RelationalStorage`] calls, remote replication) are not
+    /// observed — this is a local-commit hook, not a replication changefeed.
+    pub fn subscribe_changes(&self) -> tokio::sync::mpsc::UnboundedReceiver<ChangeEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.change_listeners.write().unwrap().push(tx);
+        rx
+    }
+
+    /// Is at least one change listener registered?
+    fn has_change_listeners(&self) -> bool {
+        !self.change_listeners.read().unwrap().is_empty()
+    }
+
+    /// Deliver `events` to every registered listener, pruning closed ones.
+    fn emit_changes(&self, events: Vec<ChangeEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut listeners = self.change_listeners.write().unwrap();
+        if listeners.is_empty() {
+            return;
+        }
+        listeners.retain(|tx| events.iter().all(|e| tx.send(e.clone()).is_ok()));
+    }
+}
+
+/// A committed row change, delivered to [`Database::subscribe_changes`]
+/// receivers after the write reached storage. `old`/`new` carry the stored row
+/// documents (the engine's JSON row encoding, including the `__schema` /
+/// `__table` metadata fields); consumers decode column values with the catalog
+/// column types.
+#[derive(Clone, Debug)]
+pub struct ChangeEvent {
+    pub schema: String,
+    pub table: String,
+    pub op: ChangeOp,
+    /// The row document before the change (`UPDATE` / `DELETE`).
+    pub old: Option<Json>,
+    /// The row document after the change (`INSERT` / `UPDATE`).
+    pub new: Option<Json>,
+    /// When the local commit applied this change.
+    pub commit_time: chrono::DateTime<chrono::Utc>,
+}
+
+/// The kind of row change a [`ChangeEvent`] describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeOp {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl ChangeOp {
+    /// The PostgreSQL logical-replication spelling (`INSERT`/`UPDATE`/`DELETE`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ChangeOp::Insert => "INSERT",
+            ChangeOp::Update => "UPDATE",
+            ChangeOp::Delete => "DELETE",
+        }
     }
 }
 
@@ -126,6 +200,16 @@ impl<S: RelationalStorage> Session<S> {
                 pieces.push(Piece::AlterExtension(
                     crate::sql::ext::alter::parse_alter_extension(&segment)?,
                 ));
+            } else if let Some(feature) = unsupported_by_prefix(&segment) {
+                // Truthfulness contract: statements the engine deliberately
+                // does not implement are recognized by keyword prefix *before*
+                // parsing, so every syntactic variant fails with the same
+                // stable `0A000` — sqlparser accepts some spellings of these
+                // and rejects others, which would otherwise leak a
+                // form-dependent `42601` instead.
+                return Err(SqlError::FeatureNotSupported(format!(
+                    "{feature} is not supported"
+                )));
             } else {
                 pieces.push(Piece::Statements(crate::sql::parser::parse_sql(&segment)?));
             }
@@ -156,6 +240,14 @@ impl<S: RelationalStorage> Session<S> {
                  send it as an unprepared statement"
                     .into(),
             ));
+        }
+        // Deliberately-unsupported statements keep their stable `0A000` here
+        // too, instead of a form-dependent parser error (see
+        // [`unsupported_by_prefix`]).
+        if let Some(feature) = unsupported_by_prefix(sql) {
+            return Err(SqlError::FeatureNotSupported(format!(
+                "{feature} is not supported"
+            )));
         }
         let mut statements = crate::sql::parser::parse_sql(sql)?;
         let statement = match statements.len() {
@@ -490,10 +582,19 @@ impl<S: RelationalStorage> Session<S> {
         // Row security: compute per-table visibility once, before anything is
         // evaluated (CTEs, scans and DML snapshots all consult it).
         exec.init_rls(stmt)?;
-        // Pre-materialize top-level CTEs.
+        // Pre-materialize top-level CTEs. CTEs materialize exactly once, in
+        // order, non-recursively — so `WITH RECURSIVE` must be rejected here:
+        // materializing it would either return base-case rows only (silently
+        // wrong results) or fail with a misleading `42P01` on the
+        // self-reference (which sidecar routing could then forward).
         if let Statement::Query(q) = stmt
             && let Some(with) = &q.with
         {
+            if with.recursive {
+                return Err(SqlError::FeatureNotSupported(
+                    "WITH RECURSIVE is not supported".into(),
+                ));
+            }
             for cte in &with.cte_tables {
                 let name = crate::sql::names::ident_name(&cte.alias.name);
                 let rs = exec.exec_select_query(&cte.query, &[])?;
@@ -767,6 +868,23 @@ impl<S: RelationalStorage> Session<S> {
                     ))),
                 }
             }
+            // Truthfulness contract: features the engine deliberately does not
+            // implement get a *named* stable rejection (0A000) rather than the
+            // generic fallback message. These arms serve the extended query
+            // protocol; the simple protocol already rejects the same statements
+            // by keyword prefix (see [`unsupported_by_prefix`]).
+            Statement::CreateFunction(_) => Err(SqlError::FeatureNotSupported(
+                "CREATE FUNCTION is not supported".into(),
+            )),
+            Statement::CreateProcedure { .. } => Err(SqlError::FeatureNotSupported(
+                "CREATE PROCEDURE is not supported".into(),
+            )),
+            Statement::CreateTrigger(_) => Err(SqlError::FeatureNotSupported(
+                "CREATE TRIGGER is not supported".into(),
+            )),
+            Statement::DropTrigger(_) => Err(SqlError::FeatureNotSupported(
+                "DROP TRIGGER is not supported".into(),
+            )),
             other => self.dispatch_fallback(other),
         }
     }
@@ -842,20 +960,39 @@ impl<S: RelationalStorage> Session<S> {
                 self.db.locks.release_transaction(self.session_id);
                 return Ok(ExecResult::empty_command("ROLLBACK"));
             }
+            let watch = self.db.has_change_listeners();
+            let at = chrono::Utc::now();
+            let mut events = Vec::new();
             for c in &txn.truncated {
                 self.db.storage.truncate(c).await?;
             }
             for (collection, rows) in &txn.overlay {
                 for (rid, val) in rows {
+                    let old = if watch {
+                        self.db.storage.get(collection, rid).await?
+                    } else {
+                        None
+                    };
                     match val {
-                        Some(doc) => self.db.storage.put(collection, rid, doc).await?,
-                        None => self.db.storage.delete(collection, rid).await?,
+                        Some(doc) => {
+                            if watch {
+                                push_change(&mut events, old.as_ref(), Some(doc), at);
+                            }
+                            self.db.storage.put(collection, rid, doc).await?
+                        }
+                        None => {
+                            if watch {
+                                push_change(&mut events, old.as_ref(), None, at);
+                            }
+                            self.db.storage.delete(collection, rid).await?
+                        }
                     }
                 }
             }
             if txn.catalog_dirty {
                 self.save_catalog(&txn.catalog).await?;
             }
+            self.db.emit_changes(events);
         }
         self.db.locks.release_transaction(self.session_id);
         Ok(ExecResult::empty_command("COMMIT"))
@@ -926,21 +1063,158 @@ impl<S: RelationalStorage> Session<S> {
     }
 
     async fn apply_mutations(&self, mutations: Vec<Mutation>) -> Result<()> {
+        let watch = self.db.has_change_listeners();
+        let at = chrono::Utc::now();
+        let mut events = Vec::new();
         for m in mutations {
             match m {
                 Mutation::Put {
                     collection,
                     row_id,
                     doc,
-                } => self.db.storage.put(&collection, &row_id, &doc).await?,
+                } => {
+                    if watch {
+                        let old = self.db.storage.get(&collection, &row_id).await?;
+                        push_change(&mut events, old.as_ref(), Some(&doc), at);
+                    }
+                    self.db.storage.put(&collection, &row_id, &doc).await?
+                }
                 Mutation::Delete { collection, row_id } => {
+                    if watch {
+                        let old = self.db.storage.get(&collection, &row_id).await?;
+                        push_change(&mut events, old.as_ref(), None, at);
+                    }
                     self.db.storage.delete(&collection, &row_id).await?
                 }
                 Mutation::Truncate { collection } => self.db.storage.truncate(&collection).await?,
             }
         }
+        self.db.emit_changes(events);
         Ok(())
     }
+}
+
+/// Classify one storage write as a [`ChangeEvent`] and append it to `events`.
+/// `old` is the stored document before the write (`None` when absent), `new`
+/// the document being written (`None` for a physical delete). Tombstoned rows
+/// (`__deleted: true`) count as absent, so a tombstoning put is a `DELETE` and
+/// re-inserting over a tombstone is an `INSERT`. Documents that are not table
+/// rows (no `__table` marker) produce no event.
+fn push_change(
+    events: &mut Vec<ChangeEvent>,
+    old: Option<&Json>,
+    new: Option<&Json>,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    use crate::sql::store::{F_DELETED, F_ID, F_SCHEMA, F_TABLE};
+    // A fn item (not a closure) so the input/output lifetimes elide correctly.
+    fn live(doc: Option<&Json>) -> Option<&Json> {
+        let doc = doc?;
+        let obj = doc.as_object()?;
+        obj.get(F_ID)?.as_str()?;
+        if obj.get(F_DELETED).and_then(Json::as_bool).unwrap_or(false) {
+            return None;
+        }
+        Some(doc)
+    }
+    let old_live = live(old);
+    let new_live = live(new);
+    let (op, source) = match (old_live, new_live) {
+        (None, Some(n)) => (ChangeOp::Insert, n),
+        (Some(_), Some(n)) => (ChangeOp::Update, n),
+        (Some(o), None) => (ChangeOp::Delete, o),
+        (None, None) => return,
+    };
+    let Some(obj) = source.as_object() else {
+        return;
+    };
+    let Some(table) = obj.get(F_TABLE).and_then(Json::as_str) else {
+        return;
+    };
+    let schema = obj
+        .get(F_SCHEMA)
+        .and_then(Json::as_str)
+        .unwrap_or("public")
+        .to_string();
+    events.push(ChangeEvent {
+        schema,
+        table: table.to_string(),
+        op,
+        old: old_live.cloned(),
+        new: new_live.cloned(),
+        commit_time: at,
+    });
+}
+
+/// Recognize statements the engine deliberately does not support by their
+/// leading keywords, returning the feature name for the `0A000` message.
+///
+/// This runs on raw statement segments *before* parsing (the same mechanism
+/// that routes `ALTER EXTENSION` to its hand parser), because sqlparser 0.62
+/// parses only some spellings of these statements — e.g. it rejects the
+/// PostgreSQL form of `CREATE PROCEDURE` with a `42601` — and the truthfulness
+/// contract requires one stable rejection code for the whole family.
+fn unsupported_by_prefix(segment: &str) -> Option<&'static str> {
+    let words = leading_keywords(segment, 4);
+    let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    match (w(0), w(1)) {
+        ("CREATE", "FUNCTION") => Some("CREATE FUNCTION"),
+        ("CREATE", "PROCEDURE") => Some("CREATE PROCEDURE"),
+        ("CREATE", "TRIGGER") => Some("CREATE TRIGGER"),
+        ("CREATE", "CONSTRAINT") if w(2) == "TRIGGER" => Some("CREATE TRIGGER"),
+        ("CREATE", "OR") if w(2) == "REPLACE" => match w(3) {
+            "FUNCTION" => Some("CREATE FUNCTION"),
+            "PROCEDURE" => Some("CREATE PROCEDURE"),
+            "TRIGGER" => Some("CREATE TRIGGER"),
+            _ => None,
+        },
+        ("DROP", "TRIGGER") => Some("DROP TRIGGER"),
+        _ => None,
+    }
+}
+
+/// The first `max` bare keywords of a statement, upper-cased — skipping
+/// whitespace, `--` line comments and (nested) `/* */` block comments.
+/// Scanning stops at the first token that is not a bare word (a quoted
+/// identifier, punctuation, ...), so only genuine leading keywords match.
+fn leading_keywords(sql: &str, max: usize) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() && out.len() < max {
+        match bytes[i] {
+            c if c.is_ascii_whitespace() => i += 1,
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut depth = 1u32;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                out.push(sql[start..i].to_ascii_uppercase());
+            }
+            _ => break,
+        }
+    }
+    out
 }
 
 /// Errors eligible for sidecar fallback-forwarding: the statement referenced

@@ -234,6 +234,27 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
             Text(value)
         }
         "pg_advisory_lock" | "pg_advisory_unlock" | "pg_notify" => Null,
+        // --- full-text search: named-unsupported (0A000), not unknown ---
+        // These are PostgreSQL core functions, so "does not exist" (42883)
+        // would be untruthful — and 42883 is sidecar-routable, which would
+        // silently change semantics per deployment. The whole family fails
+        // with one stable feature-not-supported error instead. This arm must
+        // stay ahead of the extension-dispatch fallthrough below.
+        "to_tsvector"
+        | "to_tsquery"
+        | "plainto_tsquery"
+        | "phraseto_tsquery"
+        | "websearch_to_tsquery"
+        | "ts_rank"
+        | "ts_rank_cd"
+        | "ts_headline"
+        | "setweight"
+        | "ts_delete"
+        | "tsvector_to_array" => {
+            return Err(SqlError::FeatureNotSupported(
+                "full-text search is not supported".into(),
+            ));
+        }
         // --- Supabase auth helpers (used by row-security policies) ---
         // auth.uid(): the authenticated user's id — the JWT `sub` claim, as a
         // uuid. NULL when no claims are set (e.g. anon without a user token).
