@@ -1047,3 +1047,5 @@ fn eval_extract(field: &DateTimeField, v: &SqlValue) -> Result<SqlValue> {
     Ok(n.map(|x| SqlValue::Numeric(Decimal::from(x)))
         .unwrap_or(SqlValue::Null))
 }
+
+// Maintenance note 5: documents compatibility expectations without changing runtime behavior.
