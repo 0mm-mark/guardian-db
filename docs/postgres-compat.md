@@ -280,20 +280,29 @@ gates that extension's functions, operators, types and GUCs. Anything outside
 the registry fails with a typed `0A000` error pointing at
 `pg_available_extensions` — never silently.
 
-### Native registry
+### Registry
 
-| Extension        | Version | Provides                                                        |
-| ---------------- | ------- | --------------------------------------------------------------- |
-| `btree_gin`      | 1.3     | no-op shim (GuardianDB indexes are engine-native)                |
-| `btree_gist`     | 1.7     | no-op shim                                                       |
-| `citext`         | 1.6     | case-insensitive `CITEXT` type (comparison, UNIQUE, output case) |
-| `fuzzystrmatch`  | 1.2     | `levenshtein`, `soundex`, `difference`, `metaphone`, `dmetaphone`|
-| `pg_trgm`        | 1.6     | `similarity`, `%`/`<->` operators, `pg_trgm.similarity_threshold`|
-| `pgcrypto`       | 1.3     | `digest`, `hmac`, `crypt`/`gen_salt`, `encode`/`decode`, ...     |
-| `plpgsql`        | 1.0     | pre-installed shim (function bodies are not executable)          |
-| `unaccent`       | 1.1     | `unaccent()` accent stripping                                    |
-| `uuid-ossp`      | 1.1     | `uuid_generate_v1/v3/v4/v5`, namespace constants                 |
-| `vector`         | 0.8.1   | pgvector: `VECTOR(n)` type, `<->`/`<#>`/`<=>`/`<+>`, distances   |
+Every registry entry declares a **runtime strategy**: `native` (implemented
+inside the engine) or `sidecar` (delegated to a managed PostgreSQL sidecar
+process, see below). The strategy is surfaced as the `runtime` column of
+`pg_available_extensions` — a GuardianDB extension column that PostgreSQL does
+not have.
+
+| Extension             | Version | Runtime | Provides                                                        |
+| --------------------- | ------- | ------- | --------------------------------------------------------------- |
+| `btree_gin`           | 1.3     | native  | no-op shim (GuardianDB indexes are engine-native)                |
+| `btree_gist`          | 1.7     | native  | no-op shim                                                       |
+| `citext`              | 1.6     | native  | case-insensitive `CITEXT` type (comparison, UNIQUE, output case) |
+| `fuzzystrmatch`       | 1.2     | native  | `levenshtein`, `soundex`, `difference`, `metaphone`, `dmetaphone`|
+| `pg_stat_statements`  | 1.10    | sidecar | statement planning/execution statistics                          |
+| `pg_trgm`             | 1.6     | native  | `similarity`, `%`/`<->` operators, `pg_trgm.similarity_threshold`|
+| `pgcrypto`            | 1.3     | native  | `digest`, `hmac`, `crypt`/`gen_salt`, `encode`/`decode`, ...     |
+| `plpgsql`             | 1.0     | native  | pre-installed shim (function bodies are not executable)          |
+| `postgis`             | 3.4.2   | sidecar | spatial types and functions                                      |
+| `timescaledb`         | 2.15.2  | sidecar | time-series hypertables and queries                              |
+| `unaccent`            | 1.1     | native  | `unaccent()` accent stripping                                    |
+| `uuid-ossp`           | 1.1     | native  | `uuid_generate_v1/v3/v4/v5`, namespace constants                 |
+| `vector`              | 0.8.1   | native  | pgvector: `VECTOR(n)` type, `<->`/`<#>`/`<=>`/`<+>`, distances   |
 
 Introspection matches PostgreSQL: `pg_extension`, `pg_available_extensions`,
 and `pg_available_extension_versions` are queryable; functions of a

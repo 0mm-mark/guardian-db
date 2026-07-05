@@ -931,10 +931,14 @@ fn pg_extension(catalog: &Catalog) -> RowSet {
 }
 
 fn pg_available_extensions(catalog: &Catalog) -> RowSet {
+    // `runtime` is a GuardianDB extension column (PostgreSQL has no such
+    // concept): 'native' for engine-implemented extensions, 'sidecar' for
+    // extensions delegated to the managed PostgreSQL sidecar runtime.
     let cols = &[
         ("name", SqlType::Text),
         ("default_version", SqlType::Text),
         ("installed_version", SqlType::Text),
+        ("runtime", SqlType::Text),
         ("comment", SqlType::Text),
     ];
     let rows = crate::sql::ext::available()
@@ -947,6 +951,10 @@ fn pg_available_extensions(catalog: &Catalog) -> RowSet {
                     .extension_version(d.name)
                     .map(t)
                     .unwrap_or_else(null),
+                t(match d.strategy {
+                    crate::sql::ext::RuntimeStrategy::Native => "native",
+                    crate::sql::ext::RuntimeStrategy::SidecarPostgres => "sidecar",
+                }),
                 t(d.comment),
             ]
         })

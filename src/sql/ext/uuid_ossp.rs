@@ -13,7 +13,7 @@
 //! as PostgreSQL does. All functions are strict: any SQL NULL argument yields
 //! SQL NULL.
 
-use super::{ExtCtx, ExtensionDef, any_null, arg_text, no_such};
+use super::{ExtCtx, ExtensionDef, RuntimeStrategy, any_null, arg_text, no_such};
 use crate::relational::SqlValue;
 use crate::sql::error::{Result, SqlError};
 use uuid::Uuid;
@@ -39,6 +39,7 @@ pub static DEF: ExtensionDef = ExtensionDef {
     gucs: &[],
     trusted: true,
     call: Some(call),
+    strategy: RuntimeStrategy::Native,
 };
 
 fn call(_ctx: &ExtCtx, name: &str, args: &[SqlValue]) -> Result<SqlValue> {

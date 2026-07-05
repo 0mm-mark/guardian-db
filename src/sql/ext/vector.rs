@@ -17,7 +17,7 @@
 //! datatype-mismatch error mirroring pgvector's "different vector dimensions"
 //! error. All functions are strict (NULL in, NULL out).
 
-use super::{ExtCtx, ExtensionDef, any_null, arg_vector, no_such};
+use super::{ExtCtx, ExtensionDef, RuntimeStrategy, any_null, arg_vector, no_such};
 use crate::relational::SqlValue;
 use crate::sql::error::{Result, SqlError};
 
@@ -40,6 +40,7 @@ pub static DEF: ExtensionDef = ExtensionDef {
     gucs: &[],
     trusted: true,
     call: Some(call),
+    strategy: RuntimeStrategy::Native,
 };
 
 /// Scalar-function entry point. All functions are strict: any SQL NULL

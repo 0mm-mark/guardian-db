@@ -17,7 +17,7 @@
 //! `'ß'` does not fold to `"ss"`, so `'straße'` and `'strasse'` compare
 //! unequal even though a casefold-based collation would equate them.
 
-use super::{ExtCtx, ExtensionDef, any_null, arg_text, no_such};
+use super::{ExtCtx, ExtensionDef, RuntimeStrategy, any_null, arg_text, no_such};
 use crate::relational::SqlValue;
 use crate::sql::error::Result;
 use std::cmp::Ordering;
@@ -32,6 +32,7 @@ pub static DEF: ExtensionDef = ExtensionDef {
     gucs: &[],
     trusted: true,
     call: Some(call),
+    strategy: RuntimeStrategy::Native,
 };
 
 /// The case-insensitive ordering shared by `citext_eq` / `citext_cmp`: the

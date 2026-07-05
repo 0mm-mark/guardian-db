@@ -23,7 +23,7 @@
 //! function is STRICT: any NULL argument yields NULL — before dictionary
 //! validation, exactly as PostgreSQL's strictness short-circuit behaves.
 
-use super::{ExtCtx, ExtensionDef, any_null, arg_text, no_such};
+use super::{ExtCtx, ExtensionDef, RuntimeStrategy, any_null, arg_text, no_such};
 use crate::relational::SqlValue;
 use crate::sql::error::{Result, SqlError};
 use unicode_normalization::UnicodeNormalization;
@@ -40,6 +40,7 @@ pub static DEF: ExtensionDef = ExtensionDef {
     gucs: &[],
     trusted: true,
     call: Some(call),
+    strategy: RuntimeStrategy::Native,
 };
 
 /// Function-call entry point for the extension registry.
