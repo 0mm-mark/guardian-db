@@ -219,7 +219,13 @@ await ds.initialize();
 - `INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS JOIN`, `USING`, `NATURAL`
 - scalar / `IN` / `EXISTS` subqueries (correlated supported)
 - `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`
-- non-recursive `WITH` (CTEs)
+- `WITH` (CTEs), including `WITH RECURSIVE` (iterate-to-fixpoint, PostgreSQL
+  working-table semantics; guarded — see §7)
+- window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`,
+  `cume_dist`, `ntile`, `lag`/`lead`, `first_value`/`last_value`/`nth_value`,
+  and every regular aggregate as a window aggregate; `PARTITION BY`,
+  `ORDER BY`, named `WINDOW` clauses (incl. refinement), `ROWS`/`RANGE`
+  frames (subset — see §7)
 - parameterized queries (`$1`, ...)
 - `x = ANY(array)` / `ALL(array)`, `UNNEST(array)` in projections
 
@@ -594,8 +600,8 @@ Each gap has a conformance test in `tests/sql_conformance.rs`
 
 | Feature                              | Status | Behaviour                              |
 | ------------------------------------ | ------ | -------------------------------------- |
-| Window functions (`OVER`)            | ✗      | error `0A000` — anywhere in the query (projection, subquery, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, named `WINDOW` reference) |
-| `WITH RECURSIVE`                     | ✗      | error `0A000` (non-recursive CTEs only; the `RECURSIVE` keyword itself is rejected, so no base-case-only results) |
+| Window functions (`OVER`)            | ✓      | subset: ranking funcs, `lag`/`lead`, `first_value`/`last_value`/`nth_value`, all regular aggregates as window aggregates (with `FILTER`); `PARTITION BY`/`ORDER BY`/named `WINDOW` (incl. refinement); `ROWS` frames with offsets, `RANGE` frames with `UNBOUNDED`/`CURRENT ROW` bounds (default frame includes peers, like PostgreSQL). Out-of-subset → typed errors: `RANGE` with offset, `GROUPS` mode, `DISTINCT`/`WITHIN GROUP`/`IGNORE NULLS` in a window call → `0A000`; misplaced `OVER` (`WHERE`/`GROUP BY`/`HAVING`), nested window calls, invalid frames → `42P20`; `OVER` on a non-window function → `42809` |
+| `WITH RECURSIVE`                     | ✓      | iterate-to-fixpoint with PostgreSQL working-table semantics (`UNION` dedups against the full accumulation; the recursive term sees only the previous iteration's rows); column types fixed by the base term (recursive rows coerced or error). Guards: iteration cap (default 100 000, session-settable via `guardian.recursive_max_iterations`) and 10M-row cap → `54001` instead of hanging; invalid self-reference shapes (more than once, in a subquery, in the non-recursive term, in an outer join, aggregated) → `42P19`; `ORDER BY`/`LIMIT`/`GROUP BY`/`DISTINCT` in the recursive query and mutual recursion → `0A000` |
 | Set-returning funcs in `FROM`        | ✗      | error `0A000` (scalar table funcs ok)  |
 | `WITH` inside a subquery             | ✗      | error `0A000` (top-level `WITH` ok)    |
 | `COPY` (bulk load)                   | ✗      | error `0A000` (no CopyIn/Out framing)  |
