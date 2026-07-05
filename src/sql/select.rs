@@ -139,6 +139,13 @@ impl Exec {
         // Nested WITH that was not pre-materialized at the statement top level is
         // not supported.
         if let Some(with) = &query.with {
+            // CTEs materialize once, non-recursively; a recursive CTE would
+            // silently return base-case rows only, so it is rejected outright.
+            if with.recursive {
+                return Err(SqlError::FeatureNotSupported(
+                    "WITH RECURSIVE is not supported".into(),
+                ));
+            }
             for cte in &with.cte_tables {
                 let name = ident_name(&cte.alias.name);
                 if !self.cte.contains_key(&name) {
@@ -147,6 +154,13 @@ impl Exec {
                     ));
                 }
             }
+        }
+        // Window functions are unsupported anywhere in a query; ORDER BY is
+        // checked here (the SELECT block itself is checked in `exec_select`)
+        // so an OVER call cannot fall through to evaluation as a plain
+        // function (42883) or, worse, be silently ignored.
+        if query.order_by.as_ref().is_some_and(order_by_has_window) {
+            return Err(window_functions_unsupported());
         }
         let mut rowset = match query.body.as_ref() {
             // For a single SELECT block, ORDER BY is resolved with the input
@@ -272,10 +286,8 @@ impl Exec {
         outer: &[Frame],
         order_by: Option<&OrderBy>,
     ) -> Result<RowSet> {
-        if select_has_window(select) {
-            return Err(SqlError::FeatureNotSupported(
-                "window functions (OVER) are not supported".into(),
-            ));
+        if select_has_window(select) || order_by.is_some_and(order_by_has_window) {
+            return Err(window_functions_unsupported());
         }
         // Planner: prefer an index scan when a single base table is filtered by
         // an equality on an indexed column; otherwise fall back to a full scan.
@@ -1793,13 +1805,38 @@ fn relabel(
 // Aggregate helpers
 // ---------------------------------------------------------------------------
 
+/// The stable rejection for any use of a window function (`... OVER ...`).
+fn window_functions_unsupported() -> SqlError {
+    SqlError::FeatureNotSupported("window functions (OVER) are not supported".into())
+}
+
+/// Does any expression of this SELECT block contain a window function call?
+/// Every clause that can hold an expression is checked (projection, WHERE,
+/// GROUP BY, HAVING) so an `OVER` can never be silently evaluated as a plain
+/// aggregate or scalar call.
 fn select_has_window(select: &Select) -> bool {
-    select.projection.iter().any(|it| {
+    let projection = select.projection.iter().any(|it| {
         matches!(it,
             SelectItem::UnnamedExpr(e)
             | SelectItem::ExprWithAlias { expr: e, .. }
             | SelectItem::ExprWithAliases { expr: e, .. } if expr_has_window(e))
-    })
+    });
+    let group_by = match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) => exprs.iter().any(expr_has_window),
+        GroupByExpr::All(_) => false,
+    };
+    projection
+        || group_by
+        || select.selection.as_ref().is_some_and(expr_has_window)
+        || select.having.as_ref().is_some_and(expr_has_window)
+}
+
+/// Does any ORDER BY key contain a window function call?
+fn order_by_has_window(order_by: &OrderBy) -> bool {
+    match &order_by.kind {
+        OrderByKind::Expressions(exprs) => exprs.iter().any(|ob| expr_has_window(&ob.expr)),
+        OrderByKind::All(_) => false,
+    }
 }
 
 fn expr_has_window(expr: &Expr) -> bool {
