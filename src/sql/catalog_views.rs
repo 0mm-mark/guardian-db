@@ -66,6 +66,7 @@ pub fn view_rows(
         (true, "pg_extension") => Some(pg_extension(catalog)),
         (true, "pg_available_extensions") => Some(pg_available_extensions(catalog)),
         (true, "pg_available_extension_versions") => Some(pg_available_extension_versions(catalog)),
+        (true, "pg_depend") => Some(pg_depend(catalog)),
         (true, "pg_am") => Some(pg_am()),
         (true, "pg_settings") => Some(empty(&[
             ("name", SqlType::Text),
@@ -983,6 +984,62 @@ fn pg_available_extension_versions(catalog: &Catalog) -> RowSet {
             ]
         })
         .collect();
+    rs(cols, rows)
+}
+
+/// `pg_catalog.pg_depend`, restricted to the dependencies GuardianDB tracks:
+/// each installed extension depends on the `pg_catalog` namespace it lives in,
+/// and each table column of an extension-owned type depends on the extension's
+/// `pg_extension` row (the same relationship that blocks `DROP EXTENSION`).
+fn pg_depend(catalog: &Catalog) -> RowSet {
+    // PostgreSQL catalog class OIDs.
+    const PG_CLASS: i32 = 1259;
+    const PG_NAMESPACE: i32 = 2615;
+    const PG_EXTENSION: i32 = 3079;
+    let cols = &[
+        ("classid", SqlType::Integer),
+        ("objid", SqlType::Integer),
+        ("objsubid", SqlType::Integer),
+        ("refclassid", SqlType::Integer),
+        ("refobjid", SqlType::Integer),
+        ("refobjsubid", SqlType::Integer),
+        ("deptype", SqlType::Char(Some(1))),
+    ];
+    let pg = schema_oid(catalog, "pg_catalog");
+    // Extension row OIDs mirror the pg_extension view: 16384 + position.
+    let ext_oid: std::collections::HashMap<&str, i32> = catalog
+        .extensions()
+        .enumerate()
+        .map(|(i, (name, _))| (name, 16384 + i as i32))
+        .collect();
+    let mut rows: Vec<Tuple> = catalog
+        .extensions()
+        .enumerate()
+        .map(|(i, _)| {
+            vec![
+                i4(PG_EXTENSION),
+                i4(16384 + i as i32),
+                i4(0),
+                i4(PG_NAMESPACE),
+                i4(pg),
+                i4(0),
+                t("n"),
+            ]
+        })
+        .collect();
+    for dep in crate::sql::ext::column_dependencies(catalog) {
+        if let Some(&eoid) = ext_oid.get(dep.extension) {
+            rows.push(vec![
+                i4(PG_CLASS),
+                i4(dep.table_oid as i32),
+                i4(dep.attnum as i32),
+                i4(PG_EXTENSION),
+                i4(eoid),
+                i4(0),
+                t("n"),
+            ]);
+        }
+    }
     rs(cols, rows)
 }
 
