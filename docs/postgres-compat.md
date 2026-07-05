@@ -250,12 +250,44 @@ exposes them as strings — use `pg.types` parsers if you need `BigInt`).
 
 ### Constraints & indexes
 - `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`
-- `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` actions (metadata + parsing;
-  **local enforcement of cascade/restrict is a documented gap**, see below)
+- `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` actions — **declared and
+  introspectable only; not enforced at runtime**, see the "Foreign keys"
+  subsection below
 - real BTree indexes: primary-key, unique, secondary, composite; maintained on
   insert/update/delete; used for equality index scans (the planner chooses an
   index scan when a single base table is filtered by `col = const` on an indexed
   column, and falls back to a full scan otherwise — results are identical).
+
+#### Foreign keys: parsed + introspectable, not enforced
+
+Foreign-key constraints are parsed (column-level `REFERENCES` and table-level
+`FOREIGN KEY`, including `ON DELETE` / `ON UPDATE` actions), stored in the
+replicated catalog, and fully introspectable: `pg_constraint` reports
+`contype = 'f'` with `confupdtype`/`confdeltype` reflecting the declared
+actions (`a`/`r`/`c`/`n`/`d`), and `information_schema.table_constraints`,
+`key_column_usage`, `constraint_column_usage` and `referential_constraints`
+(with `update_rule`/`delete_rule`) all show them — enough for ORM schema sync
+and migration tooling.
+
+They are **not enforced at runtime**, in any form:
+
+- `INSERT`/`UPDATE` of a referencing value with no matching parent row
+  **succeeds** — there is no existence check, no `23503`.
+- `DELETE` of a referenced parent row **succeeds** — referencing rows are not
+  checked and are left in place.
+- Declared referential actions (`CASCADE`, `SET NULL`, `SET DEFAULT`,
+  `RESTRICT`, `NO ACTION`) are **catalog metadata only — they are never
+  executed**. In particular, a declared `ON DELETE CASCADE` does *not* delete
+  child rows.
+
+This is the honest trade-off of a local-first CRDT store: cross-table
+referential checks cannot be guaranteed across asynchronously converging
+replicas, so the engine does not pretend to make them locally. SQLSTATE
+`23503` is reserved for a future enforcement slice and is currently never
+raised. `tests/sql_conformance.rs`
+(`foreign_keys_declared_but_not_enforced`,
+`foreign_keys_introspectable_with_declared_actions`) pins exactly this
+behaviour so it cannot drift silently.
 
 ### Catalog / introspection
 Queryable `information_schema` (`tables`, `columns`, `schemata`,
@@ -466,17 +498,17 @@ Each gap has a conformance test in `tests/sql_conformance.rs`
 
 | Feature                              | Status | Behaviour                              |
 | ------------------------------------ | ------ | -------------------------------------- |
-| Window functions (`OVER`)            | ✗      | error `0A000`                          |
-| `WITH RECURSIVE`                     | ✗      | ignored test (non-recursive CTEs only) |
+| Window functions (`OVER`)            | ✗      | error `0A000` — anywhere in the query (projection, subquery, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, named `WINDOW` reference) |
+| `WITH RECURSIVE`                     | ✗      | error `0A000` (non-recursive CTEs only; the `RECURSIVE` keyword itself is rejected, so no base-case-only results) |
 | Set-returning funcs in `FROM`        | ✗      | error `0A000` (scalar table funcs ok)  |
 | `WITH` inside a subquery             | ✗      | error `0A000` (top-level `WITH` ok)    |
 | `COPY` (bulk load)                   | ✗      | error `0A000` (no CopyIn/Out framing)  |
 | Materialized views                   | ✗      | error `0A000`                          |
-| `CREATE FUNCTION` / procedures / triggers | ✗ | error `0A000`                          |
-| Full-text search (`tsvector`/`@@`)   | ✗      | error                                  |
+| `CREATE FUNCTION` / `CREATE PROCEDURE` / `CREATE TRIGGER` / `DROP TRIGGER` | ✗ | error `0A000` for **every** spelling — detected by keyword prefix before the parser, since sqlparser 0.62 parses only some forms (which would otherwise leak `42601`) |
+| Full-text search                     | ✗      | error `0A000` — the function family (`to_tsvector`, `to_tsquery`, `plainto_tsquery`, `phraseto_tsquery`, `websearch_to_tsquery`, `ts_rank`, `ts_rank_cd`, `ts_headline`, `setweight`, `ts_delete`, `tsvector_to_array`) is *named*-unsupported (never `42883`, so it is never sidecar-routed), and `@@` is an unsupported operator; the `tsvector`/`tsquery` types are `42704` |
 | Generated/computed columns           | ✗      | ignored test                           |
 | `SAVEPOINT` partial rollback         | partial| `SAVEPOINT`/`RELEASE` no-op; `ROLLBACK TO` collapses to full rollback |
-| FK cascade/restrict enforcement      | partial| constraints parsed + introspectable; referential actions not enforced |
+| Foreign-key enforcement              | ✗      | constraints parsed + introspectable; **no runtime checks and no referential actions** — see "Foreign keys" in §5 |
 | `SERIALIZABLE` isolation             | ✗      | ignored test (read-committed only)     |
 | SSL/TLS transport                    | ✗      | negotiated-away, cleartext             |
 | Binary result encoding               | ✗      | results sent as text (node-postgres/psql use text) |
@@ -609,7 +641,7 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 | `42601`  | syntax error                    |
 | `23505`  | unique violation                |
 | `23502`  | not-null violation              |
-| `23503`  | foreign-key violation           |
+| `23503`  | foreign-key violation (reserved: FKs are declared but never enforced, so the engine currently never raises it — see §5 "Foreign keys") |
 | `23514`  | check violation                 |
 | `22P02`  | invalid text representation     |
 | `22003`  | numeric value out of range      |

@@ -16,7 +16,12 @@
 
 pub mod alter;
 pub mod citext;
+pub mod cube;
+pub mod earthdistance;
 pub mod fuzzystrmatch;
+pub mod hstore;
+pub mod intarray;
+pub mod ltree;
 pub mod pg_trgm;
 pub mod pgcrypto;
 pub mod sidecar;
@@ -203,11 +208,16 @@ static TIMESCALEDB: ExtensionDef = ExtensionDef {
 
 /// Every extension that `CREATE EXTENSION` accepts, in `pg_available_extensions`
 /// order. Names not in this list are rejected with a typed error.
-static AVAILABLE: [&ExtensionDef; 13] = [
+static AVAILABLE: [&ExtensionDef; 18] = [
     &BTREE_GIN,
     &BTREE_GIST,
     &citext::DEF,
+    &cube::DEF,
+    &earthdistance::DEF,
     &fuzzystrmatch::DEF,
+    &hstore::DEF,
+    &intarray::DEF,
+    &ltree::DEF,
     &PG_STAT_STATEMENTS,
     &pg_trgm::DEF,
     &pgcrypto::DEF,
@@ -261,6 +271,9 @@ pub fn owning_extension(ty: &SqlType) -> Option<&'static str> {
     match ty {
         SqlType::Citext => Some("citext"),
         SqlType::Vector(_) => Some("vector"),
+        SqlType::HStore => Some("hstore"),
+        SqlType::Ltree => Some("ltree"),
+        SqlType::Cube => Some("cube"),
         SqlType::Array(inner) => owning_extension(inner),
         _ => None,
     }
@@ -386,9 +399,10 @@ pub fn dispatch_function(
     Some(call(ctx, name, args))
 }
 
-/// Operator dispatch for extension-owned operators (`%`, `<->`, `<=>`, `<#>`,
-/// `<+>`, `<%`, `%>`). Returns `None` when neither operand shape nor installed
-/// extensions claim the operator, so the caller's normal error path applies.
+/// Operator dispatch for extension-owned operators (pg_trgm's `%`/`<->`
+/// family, pgvector's distances, and the hstore/intarray/ltree/cube operator
+/// sets). Returns `None` when neither operand shape nor installed extensions
+/// claim the operator, so the caller's normal error path applies.
 /// SQL NULL semantics: any NULL operand yields NULL.
 pub fn dispatch_operator(
     catalog: &Catalog,
@@ -405,6 +419,17 @@ pub fn dispatch_operator(
             | (SqlValue::Null, SqlValue::Vector(_))
             | (SqlValue::Null, SqlValue::Null)
     );
+    // Operand-shape claims for the tier-2 extensions: an operator is routed
+    // when at least one operand is unmistakably the extension's type (the
+    // other may be NULL or a text/array literal the module coerces itself).
+    let is_hstore = |v: &SqlValue| matches!(v, SqlValue::HStore(_));
+    let is_ltree = |v: &SqlValue| matches!(v, SqlValue::Ltree(_));
+    let is_cube = |v: &SqlValue| matches!(v, SqlValue::Cube { .. });
+    let is_array = |v: &SqlValue| matches!(v, SqlValue::Array(_));
+    let hstore_side = is_hstore(left) || is_hstore(right);
+    let ltree_side = is_ltree(left) || is_ltree(right);
+    let cube_side = is_cube(left) || is_cube(right);
+    let array_side = is_array(left) || is_array(right);
     match op {
         // pg_trgm operators on text operands.
         "%" | "<%" | "%>" | "<<%" | "%>>"
@@ -418,6 +443,36 @@ pub fn dispatch_operator(
         // pgvector distance operators.
         "<->" | "<#>" | "<=>" | "<+>" if vector_pair && catalog.extension_installed("vector") => {
             Some(vector::operator(op, left, right))
+        }
+        // cube distance.
+        "<->" if cube_side && catalog.extension_installed("cube") => {
+            Some(cube::operator(op, left, right))
+        }
+        // hstore: key lookup, concat, exists, delete, containment.
+        "->" | "||" | "?" | "-" if hstore_side && catalog.extension_installed("hstore") => {
+            Some(hstore::operator(op, left, right))
+        }
+        // Containment and overlap route by operand type.
+        "@>" | "<@" if hstore_side && catalog.extension_installed("hstore") => {
+            Some(hstore::operator(op, left, right))
+        }
+        "@>" | "<@" if ltree_side && catalog.extension_installed("ltree") => {
+            Some(ltree::operator(op, left, right))
+        }
+        "@>" | "<@" | "&&" if cube_side && catalog.extension_installed("cube") => {
+            Some(cube::operator(op, left, right))
+        }
+        // intarray: overlap, containment, append/remove, union/intersection,
+        // index-of. The int-element check lives in the module (CannotCoerce
+        // for non-integer arrays).
+        "&&" | "@>" | "<@" | "+" | "-" | "|" | "&" | "#"
+            if array_side && catalog.extension_installed("intarray") =>
+        {
+            Some(intarray::operator(op, left, right))
+        }
+        // ltree lquery match (`path ~ 'a.*'` in either operand order).
+        "~" if ltree_side && catalog.extension_installed("ltree") => {
+            Some(ltree::operator(op, left, right))
         }
         _ => None,
     }
@@ -491,18 +546,35 @@ pub(crate) fn arg_vector(args: &[SqlValue], idx: usize, func: &str) -> Result<Ve
             }
         }
         Some(other) => Err(bad_arg(func, idx, "vector", other)),
-        None => Err(SqlError::UndefinedFunction(format!(
-            "{func}: missing argument {}",
-            idx + 1
-        ))),
+        None => Err(missing_arg(func, idx)),
     }
 }
 
-fn bad_arg(func: &str, idx: usize, want: &str, got: &SqlValue) -> SqlError {
+/// Extract a cube argument (Cube, or text parsed as cube) at `idx` as its
+/// `(ll, ur)` corners. Shared by the `cube` and `earthdistance` modules.
+pub(crate) fn arg_cube(args: &[SqlValue], idx: usize, func: &str) -> Result<(Vec<f64>, Vec<f64>)> {
+    match args.get(idx) {
+        Some(SqlValue::Cube { ll, ur }) => Ok((ll.clone(), ur.clone())),
+        Some(SqlValue::Text(s)) | Some(SqlValue::Citext(s)) => {
+            match SqlValue::from_text(s, &SqlType::Cube)? {
+                SqlValue::Cube { ll, ur } => Ok((ll, ur)),
+                _ => unreachable!("from_text(cube) yields Cube"),
+            }
+        }
+        Some(other) => Err(bad_arg(func, idx, "cube", other)),
+        None => Err(missing_arg(func, idx)),
+    }
+}
+
+pub(crate) fn bad_arg(func: &str, idx: usize, want: &str, got: &SqlValue) -> SqlError {
     SqlError::CannotCoerce {
         from: got.type_of().name(),
         to: format!("{want} (argument {} of {func})", idx + 1),
     }
+}
+
+pub(crate) fn missing_arg(func: &str, idx: usize) -> SqlError {
+    SqlError::UndefinedFunction(format!("{func}: missing argument {}", idx + 1))
 }
 
 /// Unknown sub-function name inside an extension module: internal error,

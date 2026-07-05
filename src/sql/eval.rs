@@ -403,11 +403,21 @@ impl Exec {
 
         let a = self.eval_inner(left, frames, aggs)?;
         let b = self.eval_inner(right, frames, aggs)?;
-        // Extension-owned operators first: pg_trgm text ops (`%`, `<->`, ...)
-        // and pgvector distance ops. `%` on non-numeric operands and the
-        // custom-operator tokens fall through to extension dispatch; numeric
-        // `%` stays ordinary modulo arithmetic.
+        // Extension-owned operators first: pg_trgm text ops (`%`, `<->`, ...),
+        // pgvector distances, and the hstore/intarray/ltree/cube operator
+        // sets. Tokens are only produced when the operand shapes could belong
+        // to an extension (numeric `%` stays modulo, text `||` stays concat,
+        // JSON `->` keeps its own path); dispatch_operator additionally gates
+        // on the owning extension being installed and returns `None`
+        // otherwise, so unclaimed operators keep their normal error paths.
         {
+            let hstore_side = matches!(a, SqlValue::HStore(_)) || matches!(b, SqlValue::HStore(_));
+            let ltree_side = matches!(a, SqlValue::Ltree(_)) || matches!(b, SqlValue::Ltree(_));
+            let array_side = matches!(a, SqlValue::Array(_)) || matches!(b, SqlValue::Array(_));
+            let ext_shaped = hstore_side
+                || array_side
+                || matches!(a, SqlValue::Cube { .. })
+                || matches!(b, SqlValue::Cube { .. });
             let op_token = match op {
                 Modulo if !(a.type_of().is_numeric() && b.type_of().is_numeric()) => {
                     Some("%".to_string())
@@ -420,11 +430,23 @@ impl Exec {
                 {
                     Some("<=>".to_string())
                 }
-                Arrow => Some("->".to_string()),
+                // `->` with an hstore left operand is the hstore key lookup;
+                // JSON `->` (any other left operand) is untouched.
+                Arrow if matches!(a, SqlValue::HStore(_)) => Some("->".to_string()),
+                AtArrow => Some("@>".to_string()),
+                ArrowAt => Some("<@".to_string()),
+                PGOverlap => Some("&&".to_string()),
+                Question => Some("?".to_string()),
+                PGRegexMatch if ltree_side => Some("~".to_string()),
+                StringConcat if hstore_side => Some("||".to_string()),
+                Plus if ext_shaped => Some("+".to_string()),
+                Minus if ext_shaped => Some("-".to_string()),
+                BitwiseOr if array_side => Some("|".to_string()),
+                BitwiseAnd if array_side => Some("&".to_string()),
+                PGBitwiseXor if array_side => Some("#".to_string()),
                 _ => None,
             };
-            // `->` belongs to JSON below; only divert genuinely unknown ones.
-            if let Some(tok) = op_token.filter(|t| t != "->") {
+            if let Some(tok) = op_token {
                 let ctx = crate::sql::ext::ExtCtx {
                     now: self.now,
                     vars: &self.vars,

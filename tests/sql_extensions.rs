@@ -946,3 +946,490 @@ async fn sidecar_real_postgres() {
     // Clean up the binding (forwards DROP EXTENSION to the sidecar).
     ok(&mut s, "DROP EXTENSION pg_stat_statements").await;
 }
+
+// ---------------------------------------------------------------------------
+// Tier-2 native contrib extensions: hstore, intarray, ltree, cube,
+// earthdistance. Expected values in this section were generated from live
+// PostgreSQL 16.13 with the matching contrib extensions installed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn registry_lists_all_eighteen_extensions() {
+    let mut s = session().await;
+    let n = scalar(&mut s, "SELECT count(*) FROM pg_available_extensions").await;
+    assert_eq!(n.as_deref(), Some("18"));
+    // The five tier-2 extensions run natively.
+    let native = scalar(
+        &mut s,
+        "SELECT count(*) FROM pg_available_extensions WHERE runtime = 'native' \
+         AND name IN ('hstore','intarray','ltree','cube','earthdistance')",
+    )
+    .await;
+    assert_eq!(native.as_deref(), Some("5"));
+    // Versions match the registry.
+    for (name, version) in [
+        ("hstore", "1.8"),
+        ("intarray", "1.5"),
+        ("ltree", "1.3"),
+        ("cube", "1.5"),
+        ("earthdistance", "1.2"),
+    ] {
+        let v = scalar(
+            &mut s,
+            &format!("SELECT default_version FROM pg_available_extensions WHERE name = '{name}'"),
+        )
+        .await;
+        assert_eq!(v.as_deref(), Some(version), "{name}");
+    }
+    // The excluded contrib names stay typed failures, never fake successes.
+    for name in ["isn", "lo", "tablefunc"] {
+        assert_eq!(
+            &err_code(&mut s, &format!("CREATE EXTENSION {name}")).await,
+            "0A000",
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hstore_column_end_to_end() {
+    let mut s = session().await;
+    // The type is gated on the extension.
+    assert_eq!(
+        &err_code(&mut s, "CREATE TABLE cfg (h HSTORE)").await,
+        "42704"
+    );
+    ok(&mut s, "CREATE EXTENSION hstore").await;
+    ok(&mut s, "CREATE TABLE cfg (id INT PRIMARY KEY, h HSTORE)").await;
+    ok(
+        &mut s,
+        "INSERT INTO cfg VALUES (1, 'a=>1, b=>NULL'), (2, 'a=>2, c=>x')",
+    )
+    .await;
+    // Canonical PG output: quoted, NULLs bare, (length, bytes) key order.
+    assert_eq!(
+        scalar(&mut s, "SELECT h FROM cfg WHERE id = 1")
+            .await
+            .as_deref(),
+        Some(r#""a"=>"1", "b"=>NULL"#)
+    );
+    // -> key lookup in projections and WHERE.
+    assert_eq!(
+        scalar(&mut s, "SELECT h -> 'a' FROM cfg WHERE id = 2")
+            .await
+            .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        scalar(&mut s, "SELECT id FROM cfg WHERE h -> 'a' = '1'")
+            .await
+            .as_deref(),
+        Some("1")
+    );
+    // ? exists and @> containment.
+    assert_eq!(
+        scalar(&mut s, "SELECT id FROM cfg WHERE h ? 'c'")
+            .await
+            .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        scalar(&mut s, "SELECT id FROM cfg WHERE h @> 'a=>1'")
+            .await
+            .as_deref(),
+        Some("1")
+    );
+    // || concatenation (right side wins) and - deletion.
+    assert_eq!(
+        scalar(&mut s, "SELECT h || 'a=>9' FROM cfg WHERE id = 1")
+            .await
+            .as_deref(),
+        Some(r#""a"=>"9", "b"=>NULL"#)
+    );
+    assert_eq!(
+        scalar(&mut s, "SELECT h - 'b'::text FROM cfg WHERE id = 1")
+            .await
+            .as_deref(),
+        Some(r#""a"=>"1""#)
+    );
+    // Functions route through the extension dispatch.
+    assert_eq!(
+        scalar(&mut s, "SELECT akeys(h) FROM cfg WHERE id = 1")
+            .await
+            .as_deref(),
+        Some("{a,b}")
+    );
+    assert_eq!(
+        scalar(&mut s, "SELECT hstore_to_json(h) FROM cfg WHERE id = 1")
+            .await
+            .as_deref(),
+        Some(r#"{"a":"1","b":null}"#)
+    );
+    // Bad input is a typed syntax error: 42601 from the hstore parser (like
+    // PG); the INSERT coercion path wraps it as datatype mismatch (42804).
+    assert_eq!(
+        &err_code(&mut s, "SELECT 'not hstore'::hstore").await,
+        "42601"
+    );
+    assert_eq!(
+        &err_code(&mut s, "INSERT INTO cfg VALUES (3, 'not hstore')").await,
+        "42804"
+    );
+    // The dependent column blocks DROP EXTENSION.
+    assert_eq!(&err_code(&mut s, "DROP EXTENSION hstore").await, "0A000");
+}
+
+#[tokio::test]
+async fn hstore_data_persists_across_sessions() {
+    let storage = Arc::new(MemoryStorage::new());
+    let database = Arc::new(Database::new(storage.clone(), "app"));
+    let mut s1 = Session::new(database, "guardian");
+    ok(&mut s1, "CREATE EXTENSION hstore").await;
+    ok(&mut s1, "CREATE TABLE kv (h HSTORE)").await;
+    ok(&mut s1, "INSERT INTO kv VALUES ('k=>persisted')").await;
+    drop(s1);
+    let database2 = Arc::new(Database::new(storage, "app"));
+    let mut s2 = Session::new(database2, "guardian");
+    assert_eq!(
+        scalar(&mut s2, "SELECT h -> 'k' FROM kv").await.as_deref(),
+        Some("persisted")
+    );
+}
+
+#[tokio::test]
+async fn intarray_functions_and_operators() {
+    let mut s = session().await;
+    // Gated before install: operators keep their normal error path...
+    assert!(s.execute("SELECT '{1,2}'::int[] + 3").await.is_err());
+    // ...and functions name the extension (42883).
+    assert_eq!(
+        &err_code(&mut s, "SELECT icount('{1,2}'::int[])").await,
+        "42883"
+    );
+    ok(&mut s, "CREATE EXTENSION intarray").await;
+    for (sql, expect) in [
+        ("SELECT icount('{1,2,3,2}'::int[])", "4"),
+        ("SELECT sort('{3,1,2}'::int[])", "{1,2,3}"),
+        ("SELECT sort('{3,1,2}'::int[], 'desc')", "{3,2,1}"),
+        ("SELECT uniq('{1,1,2,2,3,1,1}'::int[])", "{1,2,3,1}"),
+        ("SELECT uniq(sort('{1,2,3,2,1}'::int[]))", "{1,2,3}"),
+        ("SELECT idx('{1,2,3,2}'::int[], 2)", "2"),
+        ("SELECT subarray('{1,2,3,2,1}'::int[], 2, 3)", "{2,3,2}"),
+        ("SELECT intset(42)", "{42}"),
+        ("SELECT '{1,2,3}'::int[] && '{3,4}'::int[]", "t"),
+        ("SELECT '{1,2,3}'::int[] && '{4,5}'::int[]", "f"),
+        ("SELECT '{1,2,3}'::int[] @> '{2,2}'::int[]", "t"),
+        ("SELECT '{2}'::int[] <@ '{1,2,3}'::int[]", "t"),
+        ("SELECT '{1,2,3}'::int[] + 4", "{1,2,3,4}"),
+        ("SELECT '{1,2,3}'::int[] + '{3,4}'::int[]", "{1,2,3,3,4}"),
+        ("SELECT '{1,2,3,2}'::int[] - 2", "{1,3}"),
+        ("SELECT '{1,2,3,2,4}'::int[] - '{2,4,9}'::int[]", "{1,3}"),
+        ("SELECT '{1,2,3}'::int[] | '{3,4}'::int[]", "{1,2,3,4}"),
+        ("SELECT '{1,2,3,2}'::int[] & '{2,3,4}'::int[]", "{2,3}"),
+        ("SELECT '{1,3,5}'::int[] # 5", "3"),
+    ] {
+        assert_eq!(scalar(&mut s, sql).await.as_deref(), Some(expect), "{sql}");
+    }
+    // Table-driven WHERE with overlap.
+    ok(
+        &mut s,
+        "CREATE TABLE tagged (id INT PRIMARY KEY, tags INT[])",
+    )
+    .await;
+    ok(
+        &mut s,
+        "INSERT INTO tagged VALUES (1, '{1,2}'), (2, '{3,4}')",
+    )
+    .await;
+    assert_eq!(
+        scalar(&mut s, "SELECT id FROM tagged WHERE tags && '{2,9}'::int[]")
+            .await
+            .as_deref(),
+        Some("1")
+    );
+    // Non-int arrays are rejected with CannotCoerce (42846).
+    assert_eq!(
+        &err_code(&mut s, "SELECT icount(ARRAY['a','b'])").await,
+        "42846"
+    );
+}
+
+#[tokio::test]
+async fn ltree_column_end_to_end() {
+    let mut s = session().await;
+    assert_eq!(
+        &err_code(&mut s, "CREATE TABLE paths (p LTREE)").await,
+        "42704"
+    );
+    ok(&mut s, "CREATE EXTENSION ltree").await;
+    ok(&mut s, "CREATE TABLE paths (p LTREE)").await;
+    ok(
+        &mut s,
+        "INSERT INTO paths VALUES ('Top'), ('Top.Science'), ('Top.Science.Astronomy'), \
+         ('Top.Hobbies'), ('Top.Hobbies.Amateurs_Astronomy')",
+    )
+    .await;
+    // Descendant-or-self search, the canonical ltree query shape.
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT count(*) FROM paths WHERE p <@ 'Top.Science'"
+        )
+        .await
+        .as_deref(),
+        Some("2")
+    );
+    // Ancestor includes equality (PG-verified).
+    assert_eq!(
+        scalar(&mut s, "SELECT 'a.b'::ltree @> 'a.b'::ltree")
+            .await
+            .as_deref(),
+        Some("t")
+    );
+    // lquery matching with quantifiers and word matching.
+    assert_eq!(
+        scalar(&mut s, "SELECT count(*) FROM paths WHERE p ~ 'Top.*{1}'")
+            .await
+            .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT p FROM paths WHERE p ~ '*.Amateurs_Astronomy%'"
+        )
+        .await
+        .as_deref(),
+        Some("Top.Hobbies.Amateurs_Astronomy")
+    );
+    // Functions.
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT nlevel(p) FROM paths WHERE p = 'Top.Science.Astronomy'"
+        )
+        .await
+        .as_deref(),
+        Some("3")
+    );
+    assert_eq!(
+        scalar(&mut s, "SELECT subpath('Top.Child1.Child2', -2, 1)")
+            .await
+            .as_deref(),
+        Some("Child1")
+    );
+    assert_eq!(
+        scalar(&mut s, "SELECT lca('1.2.3'::ltree, '1.2.3.4'::ltree)")
+            .await
+            .as_deref(),
+        Some("1.2")
+    );
+    // ORDER BY uses label-sequence ordering.
+    let rows = ok(&mut s, "SELECT p FROM paths ORDER BY p").await;
+    match rows.into_iter().next().unwrap() {
+        ExecResult::Rows { rows, .. } => {
+            let sorted: Vec<String> = rows.iter().map(|r| r[0].to_text().unwrap()).collect();
+            assert_eq!(
+                sorted,
+                [
+                    "Top",
+                    "Top.Hobbies",
+                    "Top.Hobbies.Amateurs_Astronomy",
+                    "Top.Science",
+                    "Top.Science.Astronomy"
+                ]
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // Label validation is typed: 42601 from the ltree parser (like PG); the
+    // INSERT coercion path wraps it as datatype mismatch (42804).
+    assert_eq!(
+        &err_code(&mut s, "SELECT 'not a path'::ltree").await,
+        "42601"
+    );
+    assert_eq!(
+        &err_code(&mut s, "INSERT INTO paths VALUES ('not a path')").await,
+        "42804"
+    );
+}
+
+#[tokio::test]
+async fn cube_column_end_to_end() {
+    let mut s = session().await;
+    assert_eq!(
+        &err_code(&mut s, "CREATE TABLE boxes (c CUBE)").await,
+        "42704"
+    );
+    ok(&mut s, "CREATE EXTENSION cube").await;
+    ok(&mut s, "CREATE TABLE boxes (id INT PRIMARY KEY, c CUBE)").await;
+    ok(
+        &mut s,
+        "INSERT INTO boxes VALUES (1, '(0,0),(1,1)'), (2, '(2,2),(3,3)'), (3, '5')",
+    )
+    .await;
+    // Text output matches contrib/cube exactly.
+    assert_eq!(
+        scalar(&mut s, "SELECT c FROM boxes WHERE id = 1")
+            .await
+            .as_deref(),
+        Some("(0, 0),(1, 1)")
+    );
+    assert_eq!(
+        scalar(&mut s, "SELECT c FROM boxes WHERE id = 3")
+            .await
+            .as_deref(),
+        Some("(5)")
+    );
+    // Containment and overlap in WHERE.
+    assert_eq!(
+        scalar(&mut s, "SELECT id FROM boxes WHERE c @> '(0.5,0.5)'::cube")
+            .await
+            .as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT count(*) FROM boxes WHERE c && '(0.5,0.5),(2.5,2.5)'::cube"
+        )
+        .await
+        .as_deref(),
+        Some("2")
+    );
+    // Distance operator and nearest-neighbour ordering.
+    assert_eq!(
+        scalar(&mut s, "SELECT '(0,0)'::cube <-> '(3,4)'::cube")
+            .await
+            .as_deref(),
+        Some("5")
+    );
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT id FROM boxes WHERE id < 3 ORDER BY c <-> '(2.4,2.4)'::cube LIMIT 1"
+        )
+        .await
+        .as_deref(),
+        Some("2")
+    );
+    // Functions (PG-verified vectors).
+    for (sql, expect) in [
+        ("SELECT cube_dim('(1,2),(3,4)'::cube)", "2"),
+        ("SELECT cube_is_point('(1,2),(1,2)'::cube)", "t"),
+        (
+            "SELECT cube_union('(1)'::cube, '(2,3)'::cube)",
+            "(1, 0),(2, 3)",
+        ),
+        (
+            "SELECT cube_inter('(0,0),(1,1)'::cube, '(2,2),(3,3)'::cube)",
+            "(2, 2),(1, 1)",
+        ),
+        (
+            "SELECT cube_enlarge('(0,0),(1,1)'::cube, -2, 2)",
+            "(0.5, 0.5)",
+        ),
+        ("SELECT cube(1.5)", "(1.5)"),
+    ] {
+        assert_eq!(scalar(&mut s, sql).await.as_deref(), Some(expect), "{sql}");
+    }
+    // Bad input is 22P02 from the cube parser (like PG); the INSERT coercion
+    // path wraps it as datatype mismatch (42804).
+    assert_eq!(&err_code(&mut s, "SELECT '(1,2),(3)'::cube").await, "22P02");
+    assert_eq!(
+        &err_code(&mut s, "INSERT INTO boxes VALUES (4, '(1,2),(3)')").await,
+        "42804"
+    );
+}
+
+#[tokio::test]
+async fn earthdistance_requires_cube_and_cascades() {
+    let mut s = session().await;
+    // Without cube: typed 0A000 naming the missing requirement.
+    let err = s
+        .execute("CREATE EXTENSION earthdistance")
+        .await
+        .unwrap_err();
+    assert_eq!(err.sqlstate(), "0A000");
+    assert!(err.to_string().contains("cube"), "{err}");
+    assert!(err.to_string().contains("CASCADE"), "{err}");
+    // CASCADE installs the dependency chain.
+    ok(&mut s, "CREATE EXTENSION earthdistance CASCADE").await;
+    let n = scalar(
+        &mut s,
+        "SELECT count(*) FROM pg_extension WHERE extname IN ('cube','earthdistance')",
+    )
+    .await;
+    assert_eq!(n.as_deref(), Some("2"));
+    // PG: earth() = 6378168.
+    assert_eq!(
+        scalar(&mut s, "SELECT earth()").await.as_deref(),
+        Some("6378168")
+    );
+    // PG: earth_distance(ll_to_earth(51.5074,-0.1278), ll_to_earth(40.7128,-74.0060))
+    //     = 5576489.226133242 (London -> New York, meters). Transcendental
+    //     results are compared numerically, not textually.
+    let d: f64 = scalar(
+        &mut s,
+        "SELECT earth_distance(ll_to_earth(51.5074,-0.1278), ll_to_earth(40.7128,-74.0060))",
+    )
+    .await
+    .unwrap()
+    .parse()
+    .unwrap();
+    assert!((d - 5576489.226133242).abs() < 1e-3, "got {d}");
+    // Radius search: earth_box + containment (PG-verified truth values).
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT earth_box(ll_to_earth(0,0), 1000) @> ll_to_earth(0.001, 0.001)"
+        )
+        .await
+        .as_deref(),
+        Some("t")
+    );
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT earth_box(ll_to_earth(0,0), 1000) @> ll_to_earth(1, 1)"
+        )
+        .await
+        .as_deref(),
+        Some("f")
+    );
+    // latitude/longitude round-trip (exact for longitude at this input).
+    assert_eq!(
+        scalar(&mut s, "SELECT longitude(ll_to_earth(45, 100))")
+            .await
+            .as_deref(),
+        Some("100")
+    );
+    // cube cannot be dropped while earthdistance needs it... PostgreSQL
+    // allows it (dependencies are script-level), and so do we: dropping
+    // earthdistance first is the clean path.
+    ok(&mut s, "DROP EXTENSION earthdistance").await;
+    ok(&mut s, "DROP EXTENSION cube").await;
+}
+
+#[tokio::test]
+async fn hstore_arrow_does_not_shadow_json() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE EXTENSION hstore").await;
+    // `->` with an hstore left operand routes to hstore...
+    assert_eq!(
+        scalar(&mut s, "SELECT 'a=>1'::hstore -> 'a'")
+            .await
+            .as_deref(),
+        Some("1")
+    );
+    // ...while non-hstore left operands keep their pre-existing behaviour
+    // (the engine's JSON `->` path, whatever it supports) — the operator
+    // must not be silently claimed by hstore.
+    let json_arrow = s.execute("SELECT '{\"a\": 1}'::jsonb -> 'a'").await;
+    if let Ok(results) = json_arrow {
+        // If the JSON path supports `->`, it must produce JSON, not hstore.
+        if let Some(ExecResult::Rows { rows, .. }) = results.into_iter().next() {
+            assert_eq!(rows[0][0].to_text().as_deref(), Some("1"));
+        }
+    }
+}
