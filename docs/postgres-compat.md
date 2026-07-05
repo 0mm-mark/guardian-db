@@ -384,7 +384,12 @@ not have.
 | `btree_gin`           | 1.3     | native  | no-op shim (GuardianDB indexes are engine-native)                |
 | `btree_gist`          | 1.7     | native  | no-op shim                                                       |
 | `citext`              | 1.6     | native  | case-insensitive `CITEXT` type (comparison, UNIQUE, output case) |
+| `cube`                | 1.5     | native  | `CUBE` type, `cube_*` functions, `@>`/`<@`/`&&`/`<->` operators  |
+| `earthdistance`       | 1.2     | native  | `ll_to_earth`, `earth_distance`, `earth_box` (requires `cube`)   |
 | `fuzzystrmatch`       | 1.2     | native  | `levenshtein`, `soundex`, `difference`, `metaphone`, `dmetaphone`|
+| `hstore`              | 1.8     | native  | `HSTORE` type, `->`/`\|\|`/`?`/`-`/`@>`/`<@` operators, functions|
+| `intarray`            | 1.5     | native  | int[] functions + `&&`/`@>`/`<@`/`+`/`-`/`\|`/`&`/`#` operators  |
+| `ltree`               | 1.3     | native  | `LTREE` type, lquery `~` matching, `@>`/`<@`, path functions     |
 | `pg_stat_statements`  | 1.10    | sidecar | statement planning/execution statistics                          |
 | `pg_trgm`             | 1.6     | native  | `similarity`, `%`/`<->` operators, `pg_trgm.similarity_threshold`|
 | `pgcrypto`            | 1.3     | native  | `digest`, `hmac`, `crypt`/`gen_salt`, `encode`/`decode`, ...     |
@@ -394,6 +399,56 @@ not have.
 | `unaccent`            | 1.1     | native  | `unaccent()` accent stripping                                    |
 | `uuid-ossp`           | 1.1     | native  | `uuid_generate_v1/v3/v4/v5`, namespace constants                 |
 | `vector`              | 0.8.1   | native  | pgvector: `VECTOR(n)` type, `<->`/`<#>`/`<=>`/`<+>`, distances   |
+
+The tier-2 contrib set (`hstore`, `intarray`, `ltree`, `cube`,
+`earthdistance`) is implemented natively with semantics verified against live
+PostgreSQL 16.13 contrib output (text formats, key ordering, operator truth
+tables, function edge cases — the exact vectors live in the modules' unit
+tests). Notes and deliberate deviations:
+
+* **hstore** — full text syntax (quoting, escapes, `NULL` values, first
+  duplicate key wins) and contrib's internal (length, bytes) key order in
+  output and `akeys`/`avals`. Set-returning members (`each`, setof
+  `skeys`/`svals`) need SRF machinery the engine lacks; `akeys`/`avals`
+  return the same data as arrays. `?&`/`?|` and the record functions are not
+  implemented. `hstore_to_json` output is compact JSON (PostgreSQL prints
+  `{"a": "1"}` with spaces; the content is identical).
+* **intarray** — no new types; functions reject non-integer arrays with
+  `42846` and NULL elements with a typed error (PostgreSQL uses `22004`;
+  GuardianDB reports `22023`). All binary operators route (`&&`, `@>`, `<@`,
+  `+`, `-`, `|`, `&`, `#`); the `query_int` type with `@@`/`~~` is not
+  implemented, and the *prefix* `#` count operator is function-only
+  (`icount`).
+* **ltree** — labels of alphanumerics/`_`/`-` (hyphens per PostgreSQL 16),
+  the empty zero-level path, label-wise ordering (also in index keys). `~`
+  implements the documented lquery language: `@`/`*`/`%` modifiers, `|`
+  alternation, `!` negation, and `{n}`/`{n,}`/`{,m}`/`{n,m}` quantifiers on
+  star and non-star items. The `lquery`/`ltxtquery` named types are not
+  registered — write patterns as plain string literals (`path ~ 'a.*'`), not
+  `::lquery` casts; `@@` full-text matching and the ltree[] array operators
+  are not implemented.
+* **cube** — exact contrib text forms (corner order preserved, coincident
+  corners print as points), normalized accessors and predicates, inverted
+  `cube_inter` results for disjoint inputs (like PostgreSQL). The
+  `cube(cube, ...)` dimension-appending constructors, `~>` coordinate
+  extraction, taxicab/chebyshev distance operators and the zero-dimensional
+  `'()'` cube are not implemented.
+* **earthdistance** — declares `requires: cube`, so plain `CREATE EXTENSION
+  earthdistance` fails `0A000` naming the requirement and `... CASCADE`
+  installs both. The `earth` domain is not enforced (any cube is accepted);
+  the point-based `<@>` operator is out (no `point` type).
+
+sqlparser 0.62 requires the `WITH` noise word before `CREATE EXTENSION`
+options; GuardianDB re-normalizes on the parse-error path so PostgreSQL's
+`CREATE EXTENSION earthdistance CASCADE` spelling works unchanged.
+
+**Explicitly not available** (fail `CREATE EXTENSION` with a typed `0A000`):
+
+| Missing     | Reason                                                         |
+| ----------- | -------------------------------------------------------------- |
+| `isn`       | check-digit type family (ISBN/ISSN/EAN13/UPC) pending           |
+| `lo`        | no large-object (`pg_largeobject`) infrastructure               |
+| `tablefunc` | `crosstab` requires set-returning-function-over-query machinery |
 
 Introspection matches PostgreSQL: `pg_extension`, `pg_available_extensions`,
 and `pg_available_extension_versions` are queryable; functions of a
