@@ -176,11 +176,11 @@ pub fn default_guc(name: &str) -> Option<&'static str> {
 }
 
 /// The extension name that provides SQL type `ty`, if it is extension-owned.
-fn type_owner(ty: &SqlType) -> Option<&'static str> {
+pub fn owning_extension(ty: &SqlType) -> Option<&'static str> {
     match ty {
         SqlType::Citext => Some("citext"),
         SqlType::Vector(_) => Some("vector"),
-        SqlType::Array(inner) => type_owner(inner),
+        SqlType::Array(inner) => owning_extension(inner),
         _ => None,
     }
 }
@@ -188,7 +188,7 @@ fn type_owner(ty: &SqlType) -> Option<&'static str> {
 /// DDL gate: error (like PostgreSQL's `type "citext" does not exist`) when a
 /// column uses an extension type whose extension is not installed.
 pub fn check_type_usable(catalog: &Catalog, ty: &SqlType) -> Result<()> {
-    if let Some(owner) = type_owner(ty)
+    if let Some(owner) = owning_extension(ty)
         && !catalog.extension_installed(owner)
     {
         return Err(SqlError::UndefinedType(format!(
@@ -199,14 +199,47 @@ pub fn check_type_usable(catalog: &Catalog, ty: &SqlType) -> Result<()> {
     Ok(())
 }
 
-/// Tables whose columns depend on `ext` (blocks `DROP EXTENSION ... RESTRICT`).
-pub fn dependent_tables(catalog: &Catalog, ext: &str) -> Vec<String> {
+/// A table column whose type is provided by an extension. Drives the
+/// `DROP EXTENSION ... RESTRICT` dependency check and the `pg_depend` view.
+pub struct ColumnDependency {
+    /// OID of the owning table (its `pg_class` object).
+    pub table_oid: u32,
+    /// Schema-qualified table name.
+    pub table: String,
+    /// 1-based column attribute number (`pg_depend.objsubid`).
+    pub attnum: usize,
+    /// The extension providing the column's type.
+    pub extension: &'static str,
+}
+
+/// Every table column whose type is extension-owned, in catalog (schema,
+/// table, ordinal) order.
+pub fn column_dependencies(catalog: &Catalog) -> Vec<ColumnDependency> {
     let mut out = Vec::new();
     for table in catalog.tables() {
-        if table.columns.iter().any(|c| type_owner(&c.ty) == Some(ext)) {
-            out.push(format!("{}.{}", table.schema, table.name));
+        for col in &table.columns {
+            if let Some(extension) = owning_extension(&col.ty) {
+                out.push(ColumnDependency {
+                    table_oid: table.oid,
+                    table: format!("{}.{}", table.schema, table.name),
+                    attnum: col.ordinal + 1,
+                    extension,
+                });
+            }
         }
     }
+    out
+}
+
+/// Tables whose columns depend on `ext` (blocks `DROP EXTENSION ... RESTRICT`).
+pub fn dependent_tables(catalog: &Catalog, ext: &str) -> Vec<String> {
+    let mut out: Vec<String> = column_dependencies(catalog)
+        .into_iter()
+        .filter(|d| d.extension == ext)
+        .map(|d| d.table)
+        .collect();
+    // Multiple dependent columns of one table are adjacent (catalog order).
+    out.dedup();
     out
 }
 

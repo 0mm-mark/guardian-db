@@ -291,6 +291,51 @@ async fn pg_extension_reflects_installs() {
     assert_eq!(installed.as_deref(), Some("t"));
 }
 
+#[tokio::test]
+async fn pg_depend_tracks_extension_dependencies() {
+    let mut s = session().await;
+    ok(&mut s, "CREATE EXTENSION citext").await;
+    ok(
+        &mut s,
+        "CREATE TABLE users (id INT PRIMARY KEY, email CITEXT)",
+    )
+    .await;
+    // One pg_extension -> pg_namespace row per installed extension
+    // (plpgsql is pre-installed, so citext makes two).
+    let n = scalar(
+        &mut s,
+        "SELECT count(*) FROM pg_depend \
+         WHERE classid = 3079 AND refclassid = 2615 AND deptype = 'n'",
+    )
+    .await;
+    assert_eq!(n.as_deref(), Some("2"));
+    // The citext column registers a pg_class -> pg_extension dependency with
+    // objsubid = its attribute number (email is column 2 of users).
+    let sub = scalar(
+        &mut s,
+        "SELECT d.objsubid FROM pg_depend d JOIN pg_class c ON c.oid = d.objid \
+         WHERE d.classid = 1259 AND d.refclassid = 3079 AND c.relname = 'users'",
+    )
+    .await;
+    assert_eq!(sub.as_deref(), Some("2"));
+    // ... and it points at citext's pg_extension row.
+    let ext = scalar(
+        &mut s,
+        "SELECT e.extname FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid \
+         WHERE d.classid = 1259 AND d.refclassid = 3079",
+    )
+    .await;
+    assert_eq!(ext.as_deref(), Some("citext"));
+    // Dropping the table clears the column dependency.
+    ok(&mut s, "DROP TABLE users").await;
+    let n = scalar(
+        &mut s,
+        "SELECT count(*) FROM pg_depend WHERE classid = 1259",
+    )
+    .await;
+    assert_eq!(n.as_deref(), Some("0"));
+}
+
 // ---------------------------------------------------------------------------
 // Persistence: installed state lives in the catalog document (the replicated
 // unit), so a fresh session over the SAME storage sees it; a fresh storage

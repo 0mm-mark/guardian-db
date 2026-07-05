@@ -302,6 +302,14 @@ extension-owned types fail DDL with `42704` until installed. `DROP EXTENSION`
 honours RESTRICT when table columns depend on an extension type (and refuses
 CASCADE explicitly rather than destroying data).
 
+`pg_depend` reports the dependencies GuardianDB tracks, with PostgreSQL's
+catalog class OIDs: one `deptype = 'n'` row per installed extension
+(`classid = 3079` → `refclassid = 2615`, the `pg_catalog` namespace), and one
+row per table column whose type is extension-owned (`classid = 1259`,
+`objid` = table OID, `objsubid` = column attnum, `refclassid = 3079`,
+`refobjid` = the extension's `pg_extension` row) — the same relationship that
+blocks `DROP EXTENSION`.
+
 ### ALTER EXTENSION
 
 sqlparser (0.62) has no `ALTER EXTENSION` AST, so the session recognizes it
