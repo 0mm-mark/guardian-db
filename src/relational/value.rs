@@ -1464,3 +1464,5 @@ mod tests {
 }
 
 // Maintenance note 11: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note 23: documents compatibility expectations without changing runtime behavior.
