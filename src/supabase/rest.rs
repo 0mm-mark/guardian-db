@@ -25,7 +25,7 @@ use serde_json::{Map, Value as Json};
 use crate::relational::catalog::Table;
 use crate::sql::{ExecResult, OutField, RelationalStorage, SqlType, SqlValue};
 use crate::supabase::error::SupaError;
-use crate::supabase::gateway::{AppState, AuthContext, header_str, load_catalog, run_sql};
+use crate::supabase::gateway::{AppState, AuthContext, header_str, load_catalog, run_sql_as};
 
 /// The REST subrouter mounted at `/rest/v1`.
 pub fn router<S: RelationalStorage + 'static>() -> Router<AppState<S>> {
@@ -171,7 +171,7 @@ async fn do_select<S: RelationalStorage + 'static>(
         sql.push_str(&format!(" OFFSET {o}"));
     }
 
-    let result = run_sql(&state.db, &auth.role, &sql, buf.params)
+    let result = run_sql_as(&state.db, auth, &sql, buf.params)
         .await
         .map_err(SupaError::Sql)?;
     let (fields, rows) = expect_rows(result)?;
@@ -215,7 +215,7 @@ async fn count_exact<S: RelationalStorage + 'static>(
     let mut buf = SqlBuf::new();
     let where_sql = build_where(&mut buf, &rq.filters, table_def)?;
     let sql = format!("SELECT count(*) AS c FROM \"{schema}\".\"{table}\"{where_sql}");
-    let result = run_sql(&state.db, &auth.role, &sql, buf.params)
+    let result = run_sql_as(&state.db, auth, &sql, buf.params)
         .await
         .map_err(SupaError::Sql)?;
     let (_, rows) = expect_rows(result)?;
@@ -311,7 +311,7 @@ async fn do_insert<S: RelationalStorage + 'static>(
         "INSERT INTO \"{schema}\".\"{table}\" ({column_list}) VALUES {}{on_conflict}{returning}",
         tuples.join(", ")
     );
-    let result = run_sql(&state.db, &auth.role, &sql, buf.params)
+    let result = run_sql_as(&state.db, auth, &sql, buf.params)
         .await
         .map_err(SupaError::Sql)?;
 
@@ -427,7 +427,7 @@ async fn do_update<S: RelationalStorage + 'static>(
         "UPDATE \"{schema}\".\"{table}\" SET {}{where_sql}{returning}",
         sets.join(", ")
     );
-    let result = run_sql(&state.db, &auth.role, &sql, buf.params)
+    let result = run_sql_as(&state.db, auth, &sql, buf.params)
         .await
         .map_err(SupaError::Sql)?;
 
@@ -471,7 +471,7 @@ async fn do_delete<S: RelationalStorage + 'static>(
         ""
     };
     let sql = format!("DELETE FROM \"{schema}\".\"{table}\"{where_sql}{returning}");
-    let result = run_sql(&state.db, &auth.role, &sql, buf.params)
+    let result = run_sql_as(&state.db, auth, &sql, buf.params)
         .await
         .map_err(SupaError::Sql)?;
 
@@ -520,7 +520,7 @@ async fn do_rpc<S: RelationalStorage + 'static>(
         .map(|v| buf.bind(json_to_sqlvalue(v, None)))
         .collect();
     let sql = format!("SELECT {name}({})", placeholders.join(", "));
-    let result = run_sql(&state.db, &auth.role, &sql, buf.params)
+    let result = run_sql_as(&state.db, auth, &sql, buf.params)
         .await
         .map_err(SupaError::Sql)?;
     let (fields, rows) = expect_rows(result)?;
@@ -1058,6 +1058,9 @@ pub fn value_to_json(v: &SqlValue) -> Json {
                 })
                 .collect(),
         ),
+        // Extension types (hstore, ltree, cube, ...) render as their
+        // PostgreSQL text form, like PostgREST does for unknown types.
+        other => Json::String(other.to_text().unwrap_or_default()),
     }
 }
 

@@ -166,6 +166,8 @@ pub fn status_for_sqlstate(sqlstate: &str) -> StatusCode {
         "42P01" | "42703" | "42883" | "42704" | "3F000" => StatusCode::NOT_FOUND,
         // Duplicate objects.
         "42P07" | "42P06" | "42710" => StatusCode::CONFLICT,
+        // Insufficient privilege (row-level security) → 403, like PostgREST.
+        "42501" => StatusCode::FORBIDDEN,
         // Syntax / typing / data errors → 400.
         s if s.starts_with("42") || s.starts_with("22") => StatusCode::BAD_REQUEST,
         // Feature not supported.
