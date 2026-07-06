@@ -12,7 +12,7 @@ on:
       - tests/**
       - benches/**
       - guardian-db-derive/**
-      - sdk/typescript/**
+      - packages/guardiandb-odm-typescript/**
       - docs/ODM_BENCHMARKS.md
       - .github/workflows/odm-ci.yml
   pull_request:
@@ -26,7 +26,7 @@ on:
       - tests/**
       - benches/**
       - guardian-db-derive/**
-      - sdk/typescript/**
+      - packages/guardiandb-odm-typescript/**
       - docs/ODM_BENCHMARKS.md
       - .github/workflows/odm-ci.yml
   workflow_dispatch:
@@ -60,8 +60,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
-  NODE_VERSION: '24'
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+  NODE_VERSION: '22'
 
 jobs:
   rust-odm:
@@ -111,7 +110,10 @@ jobs:
         run: cargo test --features odm --test odm_benchmark_reliability -- --test-threads=1
 
       - name: Smoke-test benchmark harnesses without Criterion timing loop
-        run: cargo test --features odm --benches -- --test-threads=1
+        # Single-threading is passed via RUST_TEST_THREADS (env) rather than the
+        # `--test-threads` CLI arg: Criterion 0.8's bench harness rejects unknown
+        # CLI args ("unexpected argument found"), but honors the libtest env var.
+        run: RUST_TEST_THREADS=1 cargo test --features odm --benches
 
       - name: Compile Rust benchmark binary
         run: cargo bench --features odm --bench odm_benchmark --no-run
@@ -174,11 +176,12 @@ jobs:
       fail-fast: false
       matrix:
         node:
-          - '24'
+          - '20'
+          - '22'
 
     defaults:
       run:
-        working-directory: sdk/typescript
+        working-directory: packages/guardiandb-odm-typescript
 
     steps:
       - name: Checkout repository
@@ -189,7 +192,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-          cache-dependency-path: sdk/typescript/package-lock.json
+          cache-dependency-path: packages/guardiandb-odm-typescript/package-lock.json
 
       - name: Install TypeScript SDK dependencies
         run: npm ci
@@ -229,8 +232,8 @@ jobs:
         with:
           name: typescript-smoke-benchmarks-node-${{ matrix.node }}
           path: |
-            sdk/typescript/benchmark-smoke-node-${{ matrix.node }}.json
-            sdk/typescript/benchmark-large-smoke-node-${{ matrix.node }}.json
+            packages/guardiandb-odm-typescript/benchmark-smoke-node-${{ matrix.node }}.json
+            packages/guardiandb-odm-typescript/benchmark-large-smoke-node-${{ matrix.node }}.json
           if-no-files-found: error
           retention-days: 14
 
@@ -289,7 +292,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: sdk/typescript
+        working-directory: packages/guardiandb-odm-typescript
 
     steps:
       - name: Checkout repository
@@ -300,7 +303,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: sdk/typescript/package-lock.json
+          cache-dependency-path: packages/guardiandb-odm-typescript/package-lock.json
 
       - name: Install TypeScript SDK dependencies
         run: npm ci
@@ -337,7 +340,7 @@ jobs:
         with:
           name: typescript-full-benchmarks
           path: |
-            sdk/typescript/benchmark-full.json
-            sdk/typescript/benchmark-large-document.json
+            packages/guardiandb-odm-typescript/benchmark-full.json
+            packages/guardiandb-odm-typescript/benchmark-large-document.json
           if-no-files-found: ignore
           retention-days: 14

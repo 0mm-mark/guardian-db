@@ -21,7 +21,7 @@ mod guardian_core_tests {
     use crate::p2p::network::config::ClientConfig;
     use crate::p2p::network::core::IrohBackend;
     use crate::traits::{CreateDBOptions, MessageExchangeHeads};
-    use iroh::EndpointId;
+    use iroh::EndpointId as NodeId;
     use iroh_blobs::Hash;
     use std::ops::Deref;
     use std::sync::Arc;
@@ -37,8 +37,8 @@ mod guardian_core_tests {
         Identity::new(id, &format!("pubkey_{}", id), signatures)
     }
 
-    /// Cria um EndpointId de teste a partir de um seed
-    fn create_test_node_id(seed: u8) -> EndpointId {
+    /// Cria um NodeId de teste a partir de um seed
+    fn create_test_node_id(seed: u8) -> NodeId {
         let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
         secret.public()
     }
@@ -108,7 +108,7 @@ mod guardian_core_tests {
 
         // Verifica campos básicos
         assert!(!guardian.identity().id().is_empty());
-        assert_ne!(guardian.node_id(), EndpointId::from_bytes(&[0; 32]).unwrap());
+        assert_ne!(guardian.node_id(), NodeId::from_bytes(&[0; 32]).unwrap());
     }
 
     #[tokio::test]

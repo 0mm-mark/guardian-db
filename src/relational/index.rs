@@ -48,14 +48,6 @@ pub fn ordered_key(values: &[SqlValue]) -> String {
     out
 }
 
-/// Fast path for the common case of a single-column integer primary key.
-///
-/// Skips the SEP overhead and avoids constructing a `&[SqlValue]` slice just to
-/// derive a one-component composite key.
-pub fn single_int_key(v: i64) -> String {
-    v.to_string()
-}
-
 /// An ordered secondary index: composite key -> set of row ids.
 #[derive(Debug, Default, Clone)]
 pub struct SecondaryIndex {
@@ -90,8 +82,15 @@ impl SecondaryIndex {
     }
 
     /// Row ids for an exact key match.
-    pub fn get(&self, key: &str) -> BTreeSet<String> {
-        self.map.get(key).cloned().unwrap_or_default()
+    ///
+    /// Returns a reference to the internal set (or a shared empty set) to avoid
+    /// cloning on the hot path — callers that just iterate or check `.len()` pay
+    /// no allocation cost.
+    pub fn get(&self, key: &str) -> &BTreeSet<String> {
+        static EMPTY: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+        self.map
+            .get(key)
+            .unwrap_or_else(|| EMPTY.get_or_init(BTreeSet::new))
     }
 
     /// Returns the row id currently occupying `key`, if any (for unique checks).

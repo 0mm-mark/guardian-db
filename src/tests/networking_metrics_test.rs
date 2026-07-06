@@ -9,16 +9,16 @@
 /// - Concorrência e thread-safety
 /// - Limites de amostras e performance
 use crate::p2p::network::core::networking_metrics::NetworkingMetricsCollector;
-use iroh::EndpointId;
+use iroh::EndpointId as NodeId;
 use iroh_gossip::proto::TopicId;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, info};
 
-/// Helper para criar EndpointId de teste
-fn create_test_node_id(seed: u8) -> EndpointId {
-    // Usar SecretKey para gerar EndpointId válido
+/// Helper para criar NodeId de teste
+fn create_test_node_id(seed: u8) -> NodeId {
+    // Usar SecretKey para gerar NodeId válido
     use iroh::SecretKey;
     let mut bytes = [0u8; 32];
     bytes[0] = seed;
@@ -611,15 +611,15 @@ mod reporting_tests {
         let report = collector.generate_report().await;
 
         // Verificar que o relatório contém as seções esperadas
-        assert!(report.contains("RELATÓRIO DE MÉTRICAS"));
-        assert!(report.contains("CONECTIVIDADE P2P"));
+        assert!(report.contains("NETWORKING METRICS REPORT"));
+        assert!(report.contains("P2P CONNECTIVITY"));
         assert!(report.contains("GOSSIPSUB"));
         assert!(report.contains("DISCOVERY"));
         assert!(report.contains("Iroh"));
-        assert!(report.contains("Total conexões: 1"));
-        assert!(report.contains("Mensagens enviadas: 1"));
-        assert!(report.contains("Operações add: 1"));
-        assert!(report.contains("Tentativas: 1"));
+        assert!(report.contains("Total connections: 1"));
+        assert!(report.contains("Messages sent: 1"));
+        assert!(report.contains("Add operations: 1"));
+        assert!(report.contains("Attempts: 1"));
 
         info!("✓ Relatório gerado com sucesso");
         debug!("Relatório:\n{}", report);
@@ -1030,7 +1030,7 @@ mod integration_tests {
 
         // 6. Gerar relatório
         let report = collector.generate_report().await;
-        assert!(report.contains("RELATÓRIO"));
+        assert!(report.contains("NETWORKING METRICS REPORT"));
 
         // 7. Exportar JSON
         let json = collector.export_json().await.unwrap();

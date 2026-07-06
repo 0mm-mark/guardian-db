@@ -27,6 +27,10 @@ pub mod rotation;
 #[cfg(feature = "sql")]
 pub mod sql;
 pub mod stores;
+/// Supabase-compatible HTTP gateway (Kong-shaped REST + Auth) fronting the
+/// [`sql`] engine. Enabled by the `supabase` feature (which implies `sql`).
+#[cfg(feature = "supabase")]
+pub mod supabase;
 pub mod traits;
 
 #[cfg(test)]

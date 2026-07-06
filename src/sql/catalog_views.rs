@@ -63,6 +63,14 @@ pub fn view_rows(
             ("collnamespace", SqlType::Integer),
         ])),
         (true, "pg_roles") => Some(pg_roles()),
+        (true, "pg_tables") => Some(pg_tables(catalog)),
+        (true, "pg_policies") => Some(pg_policies(catalog)),
+        (true, "pg_extension") => Some(pg_extension(catalog)),
+        (true, "pg_available_extensions") => Some(pg_available_extensions(catalog)),
+        (true, "pg_available_extension_versions") => Some(pg_available_extension_versions(catalog)),
+        (true, "pg_proc") => Some(pg_proc(catalog)),
+        (true, "pg_trigger") => Some(pg_trigger(catalog)),
+        (true, "pg_depend") => Some(pg_depend(catalog)),
         (true, "pg_am") => Some(pg_am()),
         (true, "pg_settings") => Some(empty(&[
             ("name", SqlType::Text),
@@ -421,6 +429,7 @@ fn pg_class(catalog: &Catalog) -> RowSet {
         ("relhasrules", SqlType::Boolean),
         ("relhastriggers", SqlType::Boolean),
         ("relrowsecurity", SqlType::Boolean),
+        ("relforcerowsecurity", SqlType::Boolean),
         ("relpersistence", SqlType::Char(Some(1))),
         ("relispartition", SqlType::Boolean),
         ("reltuples", SqlType::Real),
@@ -444,7 +453,8 @@ fn pg_class(catalog: &Catalog) -> RowSet {
             b(table.primary_key.is_some()),
             b(false),
             b(false),
-            b(false),
+            b(table.rls_enabled),
+            b(table.rls_forced),
             t("p"),
             b(false),
             SqlValue::Float4(table.columns.len() as f32),
@@ -469,6 +479,7 @@ fn pg_class(catalog: &Catalog) -> RowSet {
             b(false),
             b(false),
             b(false),
+            b(false),
             t("p"),
             b(false),
             SqlValue::Float4(0.0),
@@ -487,6 +498,7 @@ fn pg_class(catalog: &Catalog) -> RowSet {
             i4(0),
             t("v"),
             i2(v.columns.len() as i16),
+            b(false),
             b(false),
             b(false),
             b(false),
@@ -588,6 +600,8 @@ fn pg_type(catalog: &Catalog) -> RowSet {
         (1184, "timestamptz", 8, "D"),
         (1700, "numeric", -1, "N"),
         (2950, "uuid", 16, "U"),
+        (3614, "tsvector", -1, "U"),
+        (3615, "tsquery", -1, "U"),
         (3802, "jsonb", -1, "U"),
     ];
     let rows = base
@@ -689,6 +703,11 @@ fn pg_constraint(catalog: &Catalog) -> RowSet {
         ("confkey", SqlType::Array(Box::new(SqlType::SmallInt))),
         ("confupdtype", SqlType::Char(Some(1))),
         ("confdeltype", SqlType::Char(Some(1))),
+        // Foreign key `MATCH` mode: 'f' (FULL), 's' (SIMPLE), 'p' (PARTIAL —
+        // never actually stored, since `MATCH PARTIAL` is rejected at DDL
+        // time). Blank (' ') on every non-foreign-key row, matching
+        // `confupdtype`/`confdeltype`'s existing convention above.
+        ("confmatchtype", SqlType::Char(Some(1))),
     ];
     let mut rows = Vec::new();
     let mut oid = 30000;
@@ -718,6 +737,7 @@ fn pg_constraint(catalog: &Catalog) -> RowSet {
                 SqlValue::Array(vec![]),
                 t(" "),
                 t(" "),
+                t(" "),
             ]);
             oid += 1;
         }
@@ -739,6 +759,7 @@ fn pg_constraint(catalog: &Catalog) -> RowSet {
                 i4(0),
                 colnums(&u.columns),
                 SqlValue::Array(vec![]),
+                t(" "),
                 t(" "),
                 t(" "),
             ]);
@@ -777,6 +798,7 @@ fn pg_constraint(catalog: &Catalog) -> RowSet {
                 confkey,
                 t(action_char(fk.on_update)),
                 t(action_char(fk.on_delete)),
+                t(match_type_char(fk.match_type)),
             ]);
             oid += 1;
         }
@@ -795,6 +817,7 @@ fn pg_constraint(catalog: &Catalog) -> RowSet {
                 SqlValue::Array(vec![]),
                 t(" "),
                 t(" "),
+                t(" "),
             ]);
             oid += 1;
         }
@@ -810,6 +833,20 @@ fn action_char(a: crate::relational::catalog::ReferentialAction) -> &'static str
         Cascade => "c",
         SetNull => "n",
         SetDefault => "d",
+    }
+}
+
+/// `pg_constraint.confmatchtype` for a foreign key's `MATCH` mode
+/// (PostgreSQL's `FKCONSTR_MATCH_*` constants in `pg_constraint.h`): `'f'`
+/// (FULL), `'s'` (SIMPLE). PostgreSQL also has `'p'` (PARTIAL), but
+/// [`MatchType`](crate::relational::catalog::MatchType) has no such variant
+/// to match on here — `MATCH PARTIAL` is rejected at DDL time (see
+/// `crate::sql::ddl::fk_match_type`) and can never reach this function.
+fn match_type_char(m: crate::relational::catalog::MatchType) -> &'static str {
+    use crate::relational::catalog::MatchType::*;
+    match m {
+        Simple => "s",
+        Full => "f",
     }
 }
 
@@ -889,6 +926,74 @@ fn pg_attrdef(catalog: &Catalog) -> RowSet {
     rs(cols, rows)
 }
 
+fn pg_tables(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("schemaname", SqlType::Text),
+        ("tablename", SqlType::Text),
+        ("tableowner", SqlType::Text),
+        ("tablespace", SqlType::Text),
+        ("hasindexes", SqlType::Boolean),
+        ("hasrules", SqlType::Boolean),
+        ("hastriggers", SqlType::Boolean),
+        ("rowsecurity", SqlType::Boolean),
+    ];
+    let rows = catalog
+        .tables()
+        .map(|table| {
+            let nidx = catalog.indexes_for_table(&table.schema, &table.name).len();
+            vec![
+                t(&table.schema),
+                t(&table.name),
+                t("guardian"),
+                null(),
+                b(nidx > 0),
+                b(false),
+                b(false),
+                b(table.rls_enabled),
+            ]
+        })
+        .collect();
+    rs(cols, rows)
+}
+
+fn pg_policies(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("schemaname", SqlType::Text),
+        ("tablename", SqlType::Text),
+        ("policyname", SqlType::Text),
+        ("permissive", SqlType::Text),
+        ("roles", SqlType::Array(Box::new(SqlType::Text))),
+        ("cmd", SqlType::Text),
+        ("qual", SqlType::Text),
+        ("with_check", SqlType::Text),
+    ];
+    let mut rows = Vec::new();
+    for table in catalog.tables() {
+        for p in &table.policies {
+            let roles = if p.roles.is_empty() {
+                SqlValue::Array(vec![t("public")])
+            } else {
+                SqlValue::Array(p.roles.iter().map(|r| t(r)).collect())
+            };
+            rows.push(vec![
+                t(&table.schema),
+                t(&table.name),
+                t(&p.name),
+                t(if p.permissive {
+                    "PERMISSIVE"
+                } else {
+                    "RESTRICTIVE"
+                }),
+                roles,
+                t(p.cmd.as_sql()),
+                p.using_expr.as_deref().map(t).unwrap_or_else(null),
+                p.check_expr.as_deref().map(t).unwrap_or_else(null),
+            ]);
+        }
+    }
+    rs(cols, rows)
+}
+
 fn pg_roles() -> RowSet {
     let cols = &[
         ("oid", SqlType::Integer),
@@ -897,6 +1002,260 @@ fn pg_roles() -> RowSet {
         ("rolcanlogin", SqlType::Boolean),
     ];
     rs(cols, vec![vec![i4(10), t("guardian"), b(true), b(true)]])
+}
+
+/// `pg_proc`: user-defined functions (`CREATE FUNCTION`). Builtins and
+/// extension functions are not cataloged here — like the rest of this
+/// module, only what `CREATE ...` actually recorded is reflected.
+fn pg_proc(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("oid", SqlType::Integer),
+        ("proname", SqlType::Text),
+        ("pronamespace", SqlType::Integer),
+        ("proowner", SqlType::Integer),
+        ("prolang", SqlType::Text),
+        ("provolatile", SqlType::Char(Some(1))),
+        ("proisstrict", SqlType::Boolean),
+        ("prorettype", SqlType::Integer),
+        ("pronargs", SqlType::SmallInt),
+        ("proargtypes", SqlType::Text),
+        ("prosrc", SqlType::Text),
+    ];
+    let rows = catalog
+        .functions()
+        .map(|f| {
+            vec![
+                i4(f.oid as i32),
+                t(&f.name),
+                i4(schema_oid(catalog, &f.schema)),
+                i4(10),
+                t(f.language.as_sql()),
+                t(&f.volatility.as_char().to_string()),
+                b(f.strict),
+                // 2279 = PostgreSQL's `trigger` pseudo-type oid.
+                i4(if f.returns_trigger {
+                    2279
+                } else {
+                    f.return_type.oid() as i32
+                }),
+                i2(f.args.len() as i16),
+                t(&f.args
+                    .iter()
+                    .map(|a| a.ty.oid().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")),
+                t(&f.body),
+            ]
+        })
+        .collect();
+    rs(cols, rows)
+}
+
+/// `pg_trigger`: user triggers (`CREATE TRIGGER`). `tgtype` carries the
+/// PostgreSQL bitmask (ROW=1, BEFORE=2, INSERT=4, DELETE=8, UPDATE=16;
+/// TRUNCATE/INSTEAD bits are never set — those forms are rejected at DDL),
+/// `tgattr` the 1-based column ordinals of an `UPDATE OF` list (int2vector
+/// analog, the `proargtypes` text convention), and `tgqual` the raw `WHEN`
+/// text (the `pg_policies.qual` convention).
+fn pg_trigger(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("oid", SqlType::Integer),
+        ("tgrelid", SqlType::Integer),
+        ("tgname", SqlType::Text),
+        ("tgfoid", SqlType::Integer),
+        ("tgtype", SqlType::SmallInt),
+        ("tgenabled", SqlType::Char(Some(1))),
+        ("tgisinternal", SqlType::Boolean),
+        ("tgconstraint", SqlType::Integer),
+        ("tgdeferrable", SqlType::Boolean),
+        ("tginitdeferred", SqlType::Boolean),
+        ("tgnargs", SqlType::SmallInt),
+        ("tgattr", SqlType::Text),
+        ("tgqual", SqlType::Text),
+    ];
+    let mut rows = Vec::new();
+    for table in catalog.tables() {
+        for trg in &table.triggers {
+            let fnoid = catalog
+                .find_function(Some(&trg.function_schema), &trg.function_name, 0)
+                .map(|f| f.oid as i32)
+                .unwrap_or(0);
+            let update_of: Vec<String> = trg
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    crate::relational::TriggerEventDef::Update { columns } => Some(columns),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|c| table.column_index(c).map(|i| (i + 1).to_string()))
+                .collect();
+            rows.push(vec![
+                i4(trg.oid as i32),
+                i4(table.oid as i32),
+                t(&trg.name),
+                i4(fnoid),
+                i2(crate::sql::trigger::tgtype(trg)),
+                t(if trg.enabled { "O" } else { "D" }),
+                b(false),
+                i4(0),
+                b(false),
+                b(false),
+                i2(0),
+                t(&update_of.join(" ")),
+                trg.when_expr.as_deref().map(t).unwrap_or_else(null),
+            ]);
+        }
+    }
+    rs(cols, rows)
+}
+
+fn pg_extension(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("oid", SqlType::Integer),
+        ("extname", SqlType::Text),
+        ("extowner", SqlType::Integer),
+        ("extnamespace", SqlType::Integer),
+        ("extrelocatable", SqlType::Boolean),
+        ("extversion", SqlType::Text),
+    ];
+    let pg = schema_oid(catalog, "pg_catalog");
+    let rows = catalog
+        .extensions()
+        .enumerate()
+        .map(|(i, (name, version))| {
+            vec![
+                i4(16384 + i as i32),
+                t(name),
+                i4(10),
+                i4(pg),
+                b(false),
+                t(version),
+            ]
+        })
+        .collect();
+    rs(cols, rows)
+}
+
+fn pg_available_extensions(catalog: &Catalog) -> RowSet {
+    // `runtime` is a GuardianDB extension column (PostgreSQL has no such
+    // concept): 'native' for engine-implemented extensions, 'sidecar' for
+    // extensions delegated to the managed PostgreSQL sidecar runtime.
+    let cols = &[
+        ("name", SqlType::Text),
+        ("default_version", SqlType::Text),
+        ("installed_version", SqlType::Text),
+        ("runtime", SqlType::Text),
+        ("comment", SqlType::Text),
+    ];
+    let rows = crate::sql::ext::available()
+        .iter()
+        .map(|d| {
+            vec![
+                t(d.name),
+                t(d.default_version),
+                catalog
+                    .extension_version(d.name)
+                    .map(t)
+                    .unwrap_or_else(null),
+                t(match d.strategy {
+                    crate::sql::ext::RuntimeStrategy::Native => "native",
+                    crate::sql::ext::RuntimeStrategy::SidecarPostgres => "sidecar",
+                }),
+                t(d.comment),
+            ]
+        })
+        .collect();
+    rs(cols, rows)
+}
+
+fn pg_available_extension_versions(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("name", SqlType::Text),
+        ("version", SqlType::Text),
+        ("installed", SqlType::Boolean),
+        ("superuser", SqlType::Boolean),
+        ("trusted", SqlType::Boolean),
+        ("relocatable", SqlType::Boolean),
+        ("requires", SqlType::Array(Box::new(SqlType::Text))),
+        ("comment", SqlType::Text),
+    ];
+    let rows = crate::sql::ext::available()
+        .iter()
+        .map(|d| {
+            vec![
+                t(d.name),
+                t(d.default_version),
+                b(catalog.extension_installed(d.name)),
+                b(!d.trusted),
+                b(d.trusted),
+                b(false),
+                if d.requires.is_empty() {
+                    null()
+                } else {
+                    SqlValue::Array(d.requires.iter().map(|r| t(r)).collect())
+                },
+                t(d.comment),
+            ]
+        })
+        .collect();
+    rs(cols, rows)
+}
+
+/// `pg_catalog.pg_depend`, restricted to the dependencies GuardianDB tracks:
+/// each installed extension depends on the `pg_catalog` namespace it lives in,
+/// and each table column of an extension-owned type depends on the extension's
+/// `pg_extension` row (the same relationship that blocks `DROP EXTENSION`).
+fn pg_depend(catalog: &Catalog) -> RowSet {
+    // PostgreSQL catalog class OIDs.
+    const PG_CLASS: i32 = 1259;
+    const PG_NAMESPACE: i32 = 2615;
+    const PG_EXTENSION: i32 = 3079;
+    let cols = &[
+        ("classid", SqlType::Integer),
+        ("objid", SqlType::Integer),
+        ("objsubid", SqlType::Integer),
+        ("refclassid", SqlType::Integer),
+        ("refobjid", SqlType::Integer),
+        ("refobjsubid", SqlType::Integer),
+        ("deptype", SqlType::Char(Some(1))),
+    ];
+    let pg = schema_oid(catalog, "pg_catalog");
+    // Extension row OIDs mirror the pg_extension view: 16384 + position.
+    let ext_oid: std::collections::HashMap<&str, i32> = catalog
+        .extensions()
+        .enumerate()
+        .map(|(i, (name, _))| (name, 16384 + i as i32))
+        .collect();
+    let mut rows: Vec<Tuple> = catalog
+        .extensions()
+        .enumerate()
+        .map(|(i, _)| {
+            vec![
+                i4(PG_EXTENSION),
+                i4(16384 + i as i32),
+                i4(0),
+                i4(PG_NAMESPACE),
+                i4(pg),
+                i4(0),
+                t("n"),
+            ]
+        })
+        .collect();
+    for dep in crate::sql::ext::column_dependencies(catalog) {
+        if let Some(&eoid) = ext_oid.get(dep.extension) {
+            rows.push(vec![
+                i4(PG_CLASS),
+                i4(dep.table_oid as i32),
+                i4(dep.attnum as i32),
+                i4(PG_EXTENSION),
+                i4(eoid),
+                i4(0),
+                t("n"),
+            ]);
+        }
+    }
+    rs(cols, rows)
 }
 
 fn pg_am() -> RowSet {
@@ -942,6 +1301,7 @@ fn relabel(mut rs: RowSet, alias: &str) -> RowSet {
     for f in &mut rs.schema.fields {
         f.table = Some(alias.to_string());
     }
+    rs.schema.rebuild_lookup();
     rs
 }
 

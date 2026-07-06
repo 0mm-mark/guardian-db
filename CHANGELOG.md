@@ -7,7 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-06-29
+
 ### Added
+- **Read-only replication with a cryptographic write guarantee** for iroh-docs-backed stores (KeyValue/Document), enabling a "one/two writers, many readers" topology where a reader cannot write — even if its software is compromised — because it never receives the namespace write secret.
+  - **Per-role ticket capability:** the ticket exchange now hands out a ticket matching the requester's authenticated role — a **read ticket** (`NamespaceId` only, no write secret) to readers and a **write ticket** (namespace secret) to write-authorized peers. The `TicketProvider` holds both pre-generated tickets and authorization returns the granted mode (`GrantedMode::Read`/`Write`), with `write` taking precedence over `read`.
+  - **`CreateDBOptions.read_only`:** opening a store read-only refuses local `put`/`delete` (fail-fast on the public `add_operation` write path and the inherent methods) and never creates a namespace (fail-closed when no ticket or cached namespace is available), so a reader cannot mint its own write secret.
+  - **Writability tracking:** each store records whether it holds the namespace secret (created locally, imported via a write vs read `DocTicket`, or reopened from a persisted flag); effective writability is `holds_secret && !read_only`.
+  - **`CreateAccessControllerOptions::read_only_replication(writers)`** helper to build the recommended ACL (`write: [writers]`, `read: ["*"]`).
+  - **Namespace rotation** support to truly revoke a provisioned writer (the namespace secret is symmetric and cannot be retracted via ACL edits): new `guardian_db::rotation::copy_key_value_state` helper to migrate state into a fresh namespace, plus a `docs/NAMESPACE_ROTATION.md` runbook.
+  - **Documentation:** `docs/READ_ONLY_REPLICATION.md` explaining the guarantee, the iroh-docs namespace-secret model, the enforcement layers, and usage.
+  - **Tests:** ticket-exchange per-role authorization (read-only peer never receives write, write precedence, no write-ticket leak), read-only fail-fast and no-create unit tests, rotation helper tests, and a two real-node integration test (`tests/integration_readonly.rs`) proving a reader replicates the writer's data but cannot write while the writer's state stays intact.
+
+### Changed
+- `IrohBackend::register_ticket_provider` now takes both a read and a write ticket (was a single write-capable ticket); KV/Document stores register via a new internal `share_tickets()` that generates both. `share_ticket()` is retained for compatibility and still returns a write-capable ticket.
+
+## [0.17.0] - 2026-06-24
+
+### Added
+- **PostgreSQL compatibility layer** — standard PostgreSQL clients (`psql`,
+  node-postgres, **TypeORM** with `type: "postgres"`, DBeaver) connect to
+  GuardianDB over the PostgreSQL wire protocol and run ordinary SQL with no
+  GuardianDB-specific client code.
+  - New feature-gated modules inside `guardian-db` (the engine is
+    storage-agnostic, driven through the `RelationalStorage` trait):
+    `guardian_db::relational` (PostgreSQL type system, value model, serializable
+    catalog, storage trait, BTree indexes, SQLSTATE errors) and
+    `guardian_db::sql` (sqlparser-based parser/planner/executor for DDL, DML with
+    RETURNING/ON CONFLICT, SELECT with joins/aggregates/subqueries/CTEs/set-ops,
+    expressions, local-atomic transactions, parameter binding, and
+    `information_schema`/`pg_catalog` introspection) behind the `sql` feature;
+    `guardian_db::pgwire` (wire-protocol server on `127.0.0.1:15432` with simple
+    + extended query, prepared statements and SQLSTATE errors) plus the
+    `guardian-pgwire` binary behind the `pgwire` feature.
+  - `sql` feature of `guardian-db` adds `guardian_db::sql`, a
+    `RelationalStorage` adapter over a replicated GuardianDB document store,
+    preserving the local-first / P2P model (verified on a real iroh node).
+  - A PostgreSQL-style **lock manager** for the single-node gateway: all eight
+    table-lock modes with the exact conflict matrix, row locks (`FOR UPDATE`/
+    `FOR SHARE` with `NOWAIT`/`SKIP LOCKED`), advisory locks (session/xact,
+    shared, try, two-key), `LOCK TABLE`, blocking waits with `lock_timeout`,
+    deadlock detection (`40P01`), transaction-abort semantics (`25P02`), and
+    `pg_catalog.pg_locks` monitoring.
+  - `examples/postgres-typeorm` (runnable TypeORM app with migration/seed/
+    queries/transactions), `packages/guardiandb-postgres-typeorm` (`GuardianDataSource`),
+    and `tests/postgres-compat` (node-postgres + TypeORM conformance, 16 tests).
+  - `docs/postgres-compat.md` with consistency/transaction/replication semantics
+    and a compatibility matrix; `tests/sql_conformance.rs`
+    pins documented gaps (clean-failure and `#[ignore]` tests).
+
+
 - **Optional ODM layer (`odm` feature)** for TypeORM/Mongoose-style document modeling on top of `DocumentStore`, without replacing GuardianDB's decentralized Iroh Docs/Willow storage model.
   - Added `guardian-db-derive` with `#[derive(Model)]`, `#[primary_key]`, `#[unique]`, `#[index]`, `#[model(collection = "...")]`, `#[model(timestamps)]`, flexible schemas, and schema version metadata.
   - Added typed and dynamic collection APIs with `insert_one`, batch `insert`, `find_one`, `find`, `find_by_id`, and first-match `update`.
@@ -15,13 +64,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added local validation for required fields, nullability, field types, strict schemas, immutable primary keys, primary-key uniqueness, unique constraints, and secondary indexes.
   - Added `GuardianDB::init_collection`, `GuardianDB::list_collections`, and `GuardianDB::model_collection::<T>()` helpers under the ODM feature.
   - Added local transaction/consistency API scaffolding (`TransactionContext`, `ConsistencyLevel`) that explicitly rejects unsupported replicated transaction semantics until a distributed coordinator exists.
-- **TypeScript ODM SDK scaffold** in `packages/guardiandb-odm` exposing `GuardianDB.init`, `GuardianDB.listDatabases`, `initCollection`, `listCollections`, and Mongoose-style collection CRUD through a `GuardianTransport` boundary.
+- **TypeScript ODM SDK scaffold** in `packages/guardiandb-odm-typescript` exposing `GuardianDB.init`, `GuardianDB.listDatabases`, `initCollection`, `listCollections`, and Mongoose-style collection CRUD through a `GuardianTransport` boundary.
   - Includes a process-local reference transport for deterministic SDK tests and future native Node/WASM/mobile bridge development.
 - **ODM documentation and tests**, including `docs/odm.md`, Rust ODM integration tests, and TypeScript SDK tests covering the issue #17 usage flow, uniqueness rollback, update operators, collection listing, and version-conflict behavior.
 
 ### Changed
+- **Upgraded to Iroh 1.0.** Bumped `iroh` 0.92 → **1.0.0**, `iroh-blobs` → **0.103**, `iroh-gossip` → **0.101**, `iroh-docs` → **0.101**, `iroh-io` → 0.6.1, and added **`iroh-mdns-address-lookup` 0.4** for LAN discovery (these crates remain separately versioned in 1.0).
+  - Migrated the API surface: `NodeId`→`EndpointId`, `NodeAddr`→`EndpointAddr` (with unified `TransportAddr`), `discovery()`→`address_lookup()` using the `N0` preset + mDNS, async `remote_info()`, `endpoint.id()`, `connection.remote_id()`, and the new `BlobsProtocol`/`Endpoint::builder(preset)` signatures.
+- **Unified randomness on a single `rand` crate.** Removed the direct `rand_core` 0.6.4 pin (no longer needed now that `SecretKey::generate()` takes no RNG), updated `rand` → **0.10**, and set `ed25519-dalek` → 2.2 with the `serde` feature.
 - `DocumentStore` opening is now idempotent for ODM collection initialization so repeated collection setup can reuse the underlying replicated document store safely.
 - Root README now documents the optional ODM layer, Rust model derive usage, TypeScript collection API shape, build/test commands, and the local-vs-replicated consistency boundary.
+
+### Removed
+- **Legacy `replicator` module and `ReplicationInfo` type** (OrbitDB lineage). Replication is handled natively by Iroh, so the vestigial progress-tracking surface was removed: the `Store::replication_status()` trait method and all implementations, the `BaseStore` replication field, and the dead `update/recalculate_replication_*` and `replication_load_complete` helpers.
+
+### Fixed
+- **ODM `$inc` now preserves integer types** (e.g. `1024 + 1` yields `1025`, not `1025.0`); it only falls back to floating-point arithmetic for fractional operands or i64 overflow. Fixes a failing ODM reliability test.
 
 ## [0.16.0] - 2026-03-01
 

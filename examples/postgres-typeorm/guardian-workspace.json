@@ -1,8 +1,0 @@
-{
-  "format": "guardiandesk.workspace.v1",
-  "nodeId": "935a93d254d86213675b2bcbb3495cc420f6d8bd2f2ad0ba378d55f9065957d4",
-  "profile": "development",
-  "createdAt": "2026-06-30T20:43:52.508Z",
-  "updatedAt": "2026-06-30T20:44:46.974Z",
-  "note": "GuardianDesk local workspace adapter. Native GuardianDB/Iroh stores use the Rust crate; this workspace is a JSON workbench format."
-}

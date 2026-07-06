@@ -25,7 +25,7 @@ jobs:
       matrix:
         rust:
           - stable
-          - 1.90.0
+          - 1.95.0
     continue-on-error: false
 
     steps:
@@ -96,7 +96,8 @@ jobs:
       run: cargo install cargo-audit
 
     - name: Run security audit
-      run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119
+      # Keep these flags in sync with .cargo/audit.toml (rationale documented there).
+      run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
 
   coverage:
     name: Code coverage

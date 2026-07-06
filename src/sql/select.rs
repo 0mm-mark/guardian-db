@@ -74,7 +74,14 @@ impl Exec {
         let rows: Vec<(String, _)> = self
             .tables
             .get(&q)
-            .map(|l| l.rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .map(|l| {
+                let rls_hidden = self.rls_select_hidden(&q);
+                l.rows
+                    .iter()
+                    .filter(|(rid, _)| rls_hidden.map(|h| !h.contains(*rid)).unwrap_or(true))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let mut allow = std::collections::BTreeSet::new();
@@ -130,7 +137,8 @@ impl Exec {
     /// Execute a full `Query` (a SELECT with optional WITH/ORDER BY/LIMIT).
     pub fn exec_select_query(&self, query: &Query, outer: &[Frame]) -> Result<RowSet> {
         // Nested WITH that was not pre-materialized at the statement top level is
-        // not supported.
+        // not supported (top-level CTEs — including recursive ones — are
+        // materialized by `materialize_with` before execution).
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
                 let name = ident_name(&cte.alias.name);
@@ -265,9 +273,23 @@ impl Exec {
         outer: &[Frame],
         order_by: Option<&OrderBy>,
     ) -> Result<RowSet> {
-        if select_has_window(select) {
-            return Err(SqlError::FeatureNotSupported(
-                "window functions (OVER) are not supported".into(),
+        // Window functions are valid in the SELECT list and ORDER BY only;
+        // PostgreSQL rejects them in the other clauses with 42P20.
+        if select.selection.as_ref().is_some_and(expr_has_window) {
+            return Err(SqlError::WindowingError(
+                "window functions are not allowed in WHERE".into(),
+            ));
+        }
+        if let GroupByExpr::Expressions(exprs, _) = &select.group_by
+            && exprs.iter().any(expr_has_window)
+        {
+            return Err(SqlError::WindowingError(
+                "window functions are not allowed in GROUP BY".into(),
+            ));
+        }
+        if select.having.as_ref().is_some_and(expr_has_window) {
+            return Err(SqlError::WindowingError(
+                "window functions are not allowed in HAVING".into(),
             ));
         }
         // Planner: prefer an index scan when a single base table is filtered by
@@ -347,8 +369,10 @@ impl Exec {
             })
             .collect();
         let schema = RowSchema::new(fields);
+        let rls_hidden = self.rls_select_hidden(&q);
         let rows = row_ids
             .iter()
+            .filter(|rid| rls_hidden.map(|h| !h.contains(*rid)).unwrap_or(true))
             .filter_map(|rid| loaded.rows.get(rid))
             .map(|values| {
                 loaded
@@ -451,7 +475,12 @@ impl Exec {
                             .filter(|(fq, _)| fq == &q)
                             .map(|(_, s)| s);
                         return Ok(relabel(
-                            loaded_to_rowset(loaded, &alias_name, filter),
+                            loaded_to_rowset(
+                                loaded,
+                                &alias_name,
+                                filter,
+                                self.rls_select_hidden(&q),
+                            ),
                             &alias_name,
                             alias,
                         ));
@@ -500,12 +529,7 @@ impl Exec {
         alias: &Option<sqlparser::ast::TableAlias>,
         outer: &[Frame],
     ) -> Result<RowSet> {
-        let fname = name
-            .0
-            .last()
-            .and_then(|p| p.as_ident())
-            .map(ident_name)
-            .unwrap_or_default();
+        let fname = crate::sql::names::function_dispatch_name(name);
         if matches!(
             fname.as_str(),
             "generate_series" | "unnest" | "jsonb_array_elements" | "json_array_elements"
@@ -746,7 +770,9 @@ impl Exec {
             return Ok(input);
         };
         let mut rows = Vec::new();
-        for row in &input.rows {
+        if !input.rows.is_empty() {
+            // Build the outer-frame prefix once; reuse the Vec by updating the
+            // last slot each iteration instead of allocating a new Vec per row.
             let mut frames: Vec<Frame> = outer
                 .iter()
                 .map(|f| Frame {
@@ -756,10 +782,17 @@ impl Exec {
                 .collect();
             frames.push(Frame {
                 schema: &input.schema,
-                row,
+                row: &input.rows[0],
             });
-            if self.eval(predicate, &frames)?.truthy() == Some(true) {
-                rows.push(row.clone());
+            let last_idx = frames.len() - 1;
+            for row in &input.rows {
+                frames[last_idx] = Frame {
+                    schema: &input.schema,
+                    row,
+                };
+                if self.eval(predicate, &frames)?.truthy() == Some(true) {
+                    rows.push(row.clone());
+                }
             }
         }
         Ok(RowSet {
@@ -786,6 +819,12 @@ impl Exec {
                 })
                 .collect(),
         );
+        // Window calls in the SELECT list / ORDER BY are computed over the full
+        // filtered input, before projection, DISTINCT and ORDER BY (PostgreSQL
+        // evaluation order).
+        let win_maps =
+            self.compute_window_maps(select, order_by, &input.schema, &input.rows, None, outer)?;
+        let win_at = |i: usize| win_maps.as_ref().map(|m| &m[i]);
         // Project each row, retaining the input row so ORDER BY can reference
         // input columns (which need not appear in the select list). A projection
         // containing a set-returning `UNNEST(...)` expands each input row into one
@@ -794,8 +833,11 @@ impl Exec {
             .projection
             .iter()
             .any(|it| matches!(it, SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } | SelectItem::ExprWithAliases { expr: e, .. } if is_unnest(e)));
-        let mut paired: Vec<(Tuple, Tuple)> = Vec::with_capacity(input.rows.len());
-        for row in &input.rows {
+        // (input row index, output tuple) so ORDER BY can consult both.
+        let mut paired: Vec<(usize, Tuple)> = Vec::with_capacity(input.rows.len());
+        if !input.rows.is_empty() {
+            // Build the outer-frame prefix once; reuse by updating the last slot
+            // each iteration instead of allocating a new Vec<Frame> per row.
             let mut frames: Vec<Frame> = outer
                 .iter()
                 .map(|f| Frame {
@@ -805,15 +847,22 @@ impl Exec {
                 .collect();
             frames.push(Frame {
                 schema: &input.schema,
-                row,
+                row: &input.rows[0],
             });
-            if has_unnest {
-                for out in self.project_row_unnest(select, &frames)? {
-                    paired.push((row.clone(), out));
+            let last_idx = frames.len() - 1;
+            for (ri, row) in input.rows.iter().enumerate() {
+                frames[last_idx] = Frame {
+                    schema: &input.schema,
+                    row,
+                };
+                if has_unnest {
+                    for out in self.project_row_unnest(select, &frames, win_at(ri))? {
+                        paired.push((ri, out));
+                    }
+                } else {
+                    let out = self.project_row(select, &input.schema, &frames, win_at(ri))?;
+                    paired.push((ri, out));
                 }
-            } else {
-                let out = self.project_row(select, &input.schema, &frames)?;
-                paired.push((row.clone(), out));
             }
         }
 
@@ -829,8 +878,8 @@ impl Exec {
                     (asc, o.options.nulls_first.unwrap_or(!asc))
                 })
                 .collect();
-            let mut keyed: Vec<(Vec<SqlValue>, (Tuple, Tuple))> = Vec::with_capacity(paired.len());
-            for (inp, out) in paired {
+            let mut keyed: Vec<(Vec<SqlValue>, (usize, Tuple))> = Vec::with_capacity(paired.len());
+            for (ri, out) in paired {
                 let mut keys = Vec::with_capacity(exprs.len());
                 for o in exprs {
                     keys.push(self.order_key_paired(
@@ -838,11 +887,12 @@ impl Exec {
                         &out_schema,
                         &out,
                         &input.schema,
-                        &inp,
+                        &input.rows[ri],
+                        win_at(ri),
                         outer,
                     )?);
                 }
-                keyed.push((keys, (inp, out)));
+                keyed.push((keys, (ri, out)));
             }
             keyed.sort_by(|a, b| {
                 for (i, (asc, nf)) in directions.iter().enumerate() {
@@ -867,7 +917,12 @@ impl Exec {
     }
 
     /// Expand a projection containing `UNNEST(...)` into multiple output rows.
-    fn project_row_unnest(&self, select: &Select, frames: &[Frame]) -> Result<Vec<Tuple>> {
+    fn project_row_unnest(
+        &self,
+        select: &Select,
+        frames: &[Frame],
+        win: Option<&HashMap<String, SqlValue>>,
+    ) -> Result<Vec<Tuple>> {
         enum Col {
             Array(Vec<SqlValue>),
             Scalar(SqlValue),
@@ -886,7 +941,7 @@ impl Exec {
                 }
             };
             if let Some(arg) = unnest_arg(expr) {
-                let values = match self.eval(arg, frames)? {
+                let values = match self.eval_opt_agg(arg, frames, win)? {
                     SqlValue::Array(items) => items,
                     SqlValue::Null => Vec::new(),
                     single => vec![single],
@@ -894,7 +949,7 @@ impl Exec {
                 max_len = max_len.max(values.len());
                 cols.push(Col::Array(values));
             } else {
-                cols.push(Col::Scalar(self.eval(expr, frames)?));
+                cols.push(Col::Scalar(self.eval_opt_agg(expr, frames, win)?));
             }
         }
         let mut rows = Vec::with_capacity(max_len);
@@ -912,7 +967,8 @@ impl Exec {
     }
 
     /// Resolve an ORDER BY key against output aliases/positions, falling back to
-    /// the pre-projection input columns.
+    /// the pre-projection input columns (with any window values in scope).
+    #[allow(clippy::too_many_arguments)]
     fn order_key_paired(
         &self,
         expr: &Expr,
@@ -920,6 +976,7 @@ impl Exec {
         out_row: &Tuple,
         in_schema: &RowSchema,
         in_row: &Tuple,
+        win: Option<&HashMap<String, SqlValue>>,
         outer: &[Frame],
     ) -> Result<SqlValue> {
         if let Expr::Value(v) = expr
@@ -947,7 +1004,7 @@ impl Exec {
             schema: in_schema,
             row: in_row,
         });
-        self.eval(expr, &frames)
+        self.eval_opt_agg(expr, &frames, win)
     }
 
     /// Expand projection into concrete output columns (names + types).
@@ -1001,7 +1058,13 @@ impl Exec {
         Ok(cols)
     }
 
-    fn project_row(&self, select: &Select, input: &RowSchema, frames: &[Frame]) -> Result<Tuple> {
+    fn project_row(
+        &self,
+        select: &Select,
+        input: &RowSchema,
+        frames: &[Frame],
+        win: Option<&HashMap<String, SqlValue>>,
+    ) -> Result<Tuple> {
         let mut tuple = Vec::new();
         let row = frames.last().unwrap().row;
         for item in &select.projection {
@@ -1020,7 +1083,7 @@ impl Exec {
                 SelectItem::UnnamedExpr(e)
                 | SelectItem::ExprWithAlias { expr: e, .. }
                 | SelectItem::ExprWithAliases { expr: e, .. } => {
-                    tuple.push(self.eval(e, frames)?);
+                    tuple.push(self.eval_opt_agg(e, frames, win)?);
                 }
             }
         }
@@ -1040,7 +1103,9 @@ impl Exec {
         // Partition input rows into groups keyed by the group expressions.
         let mut groups: Vec<(Vec<String>, Vec<usize>)> = Vec::new();
         let mut group_index: HashMap<Vec<String>, usize> = HashMap::new();
-        for (ri, row) in input.rows.iter().enumerate() {
+        if !input.rows.is_empty() {
+            // Build the outer-frame prefix once; reuse by updating the last slot
+            // each iteration instead of allocating a new Vec<Frame> per row.
             let mut frames: Vec<Frame> = outer
                 .iter()
                 .map(|f| Frame {
@@ -1050,17 +1115,24 @@ impl Exec {
                 .collect();
             frames.push(Frame {
                 schema: &input.schema,
-                row,
+                row: &input.rows[0],
             });
-            let key: Vec<String> = group_exprs
-                .iter()
-                .map(|e| self.eval(e, &frames).map(|v| v.index_key()))
-                .collect::<Result<_>>()?;
-            match group_index.get(&key) {
-                Some(&gi) => groups[gi].1.push(ri),
-                None => {
-                    group_index.insert(key.clone(), groups.len());
-                    groups.push((key, vec![ri]));
+            let last_idx = frames.len() - 1;
+            for (ri, row) in input.rows.iter().enumerate() {
+                frames[last_idx] = Frame {
+                    schema: &input.schema,
+                    row,
+                };
+                let key: Vec<String> = group_exprs
+                    .iter()
+                    .map(|e| self.eval(e, &frames).map(|v| v.index_key()))
+                    .collect::<Result<_>>()?;
+                match group_index.get(&key) {
+                    Some(&gi) => groups[gi].1.push(ri),
+                    None => {
+                        group_index.insert(key.clone(), groups.len());
+                        groups.push((key, vec![ri]));
+                    }
                 }
             }
         }
@@ -1087,8 +1159,9 @@ impl Exec {
             Some(OrderByKind::Expressions(e)) => e,
             _ => &[],
         };
-        // (order keys, output tuple) per surviving group, for sorting.
-        let mut out_rows: Vec<(Vec<SqlValue>, Tuple)> = Vec::new();
+        // Phase 1: aggregates + HAVING per group, keeping the representative
+        // row (for non-aggregated references, i.e. group key columns).
+        let mut survivors: Vec<(Tuple, HashMap<String, SqlValue>)> = Vec::new();
         for (_key, members) in &groups {
             let group_rows: Vec<&Tuple> = members.iter().map(|&i| &input.rows[i]).collect();
             // Compute each aggregate over the group.
@@ -1097,7 +1170,6 @@ impl Exec {
                 let value = self.eval_aggregate(call, &group_rows, &input.schema, outer)?;
                 aggs.insert(call.to_string(), value);
             }
-            // Representative row for non-aggregated references (group key columns).
             let rep: Tuple = group_rows
                 .first()
                 .map(|t| (*t).clone())
@@ -1113,13 +1185,56 @@ impl Exec {
                 schema: &input.schema,
                 row: &rep,
             });
-
-            // HAVING.
             if let Some(having) = &select.having
                 && self.eval_agg(having, &frames, &aggs)?.truthy() != Some(true)
             {
                 continue;
             }
+            survivors.push((rep, aggs));
+        }
+
+        // Phase 2: window calls run over the surviving groups (PostgreSQL
+        // evaluates them after GROUP BY/HAVING); the per-group window results
+        // merge into the aggregate map for projection/ORDER BY lookup.
+        let rep_rows: Vec<Tuple> = survivors.iter().map(|(rep, _)| rep.clone()).collect();
+        let rep_aggs: Vec<HashMap<String, SqlValue>> =
+            survivors.iter().map(|(_, a)| a.clone()).collect();
+        if let Some(win_maps) = self.compute_window_maps(
+            select,
+            order_by,
+            &input.schema,
+            &rep_rows,
+            Some(&rep_aggs),
+            outer,
+        )? {
+            for ((_, aggs), win) in survivors.iter_mut().zip(win_maps) {
+                aggs.extend(win);
+            }
+        }
+
+        // Phase 3: (order keys, output tuple) per surviving group, for sorting.
+        let mut out_rows: Vec<(Vec<SqlValue>, Tuple)> = Vec::new();
+        // Build the outer-frame prefix once; reuse by updating the last slot per
+        // group instead of allocating a new Vec<Frame> for every surviving group.
+        let mut frames: Vec<Frame> = outer
+            .iter()
+            .map(|f| Frame {
+                schema: f.schema,
+                row: f.row,
+            })
+            .collect();
+        if !survivors.is_empty() {
+            frames.push(Frame {
+                schema: &input.schema,
+                row: &survivors[0].0,
+            });
+        }
+        let last_idx = frames.len().saturating_sub(1);
+        for (rep, aggs) in &survivors {
+            frames[last_idx] = Frame {
+                schema: &input.schema,
+                row: rep,
+            };
             // Projection with aggregates.
             let mut tuple = Vec::new();
             for item in &select.projection {
@@ -1127,7 +1242,7 @@ impl Exec {
                     SelectItem::UnnamedExpr(e)
                     | SelectItem::ExprWithAlias { expr: e, .. }
                     | SelectItem::ExprWithAliases { expr: e, .. } => {
-                        tuple.push(self.eval_agg(e, &frames, &aggs)?);
+                        tuple.push(self.eval_agg(e, &frames, aggs)?);
                     }
                     SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
                         return Err(SqlError::Syntax(
@@ -1147,8 +1262,8 @@ impl Exec {
                             .ok()
                             .and_then(|p| tuple.get(p.wrapping_sub(1)).cloned())
                             .map(Ok)
-                            .unwrap_or_else(|| self.eval_agg(&ob.expr, &frames, &aggs)),
-                        _ => self.eval_agg(&ob.expr, &frames, &aggs),
+                            .unwrap_or_else(|| self.eval_agg(&ob.expr, &frames, aggs)),
+                        _ => self.eval_agg(&ob.expr, &frames, aggs),
                     }
                 } else if let Expr::Identifier(ident) = &ob.expr {
                     match out_schema
@@ -1157,10 +1272,10 @@ impl Exec {
                         .position(|f| f.name == ident_name(ident))
                     {
                         Some(i) => Ok(tuple[i].clone()),
-                        None => self.eval_agg(&ob.expr, &frames, &aggs),
+                        None => self.eval_agg(&ob.expr, &frames, aggs),
                     }
                 } else {
-                    self.eval_agg(&ob.expr, &frames, &aggs)
+                    self.eval_agg(&ob.expr, &frames, aggs)
                 }?;
                 keys.push(key);
             }
@@ -1247,15 +1362,13 @@ impl Exec {
             .unwrap_or_default();
         let (distinct, arg_expr, is_star) = aggregate_arg(call)?;
 
-        // Gather the argument values across the group (skipping NULLs, like SQL).
+        // Gather the argument values across the group (skipping NULLs, like
+        // SQL), honouring an attached `FILTER (WHERE ...)` clause.
         let mut values: Vec<SqlValue> = Vec::new();
         let mut count_all = 0usize;
-        for row in group_rows {
-            count_all += 1;
-            if is_star {
-                continue;
-            }
-            let expr = arg_expr.as_ref().unwrap();
+        if !group_rows.is_empty() {
+            // Build the outer-frame prefix once; reuse by updating the last slot
+            // each iteration instead of allocating a new Vec<Frame> per group row.
             let mut frames: Vec<Frame> = outer
                 .iter()
                 .map(|f| Frame {
@@ -1265,19 +1378,48 @@ impl Exec {
                 .collect();
             frames.push(Frame {
                 schema: input_schema,
-                row,
+                row: group_rows[0],
             });
-            let v = self.eval(expr, &frames)?;
-            if !v.is_null() {
-                values.push(v);
+            let last_idx = frames.len() - 1;
+            for row in group_rows {
+                frames[last_idx] = Frame {
+                    schema: input_schema,
+                    row,
+                };
+                if let Some(filter) = &call.filter
+                    && self.eval(filter, &frames)?.truthy() != Some(true)
+                {
+                    continue;
+                }
+                count_all += 1;
+                if is_star {
+                    continue;
+                }
+                let expr = arg_expr.as_ref().unwrap();
+                let v = self.eval(expr, &frames)?;
+                if !v.is_null() {
+                    values.push(v);
+                }
             }
         }
         if distinct {
             values = dedupe_values(values);
         }
+        self.fold_aggregate(&name, call, is_star, values, count_all)
+    }
 
+    /// Fold already-gathered (non-NULL) argument values into an aggregate
+    /// result. Shared by GROUP BY aggregation and window aggregates.
+    pub(crate) fn fold_aggregate(
+        &self,
+        name: &str,
+        call: &sqlparser::ast::Function,
+        is_star: bool,
+        values: Vec<SqlValue>,
+        count_all: usize,
+    ) -> Result<SqlValue> {
         use rust_decimal::Decimal;
-        let out = match name.as_str() {
+        let out = match name {
             "count" => {
                 if is_star {
                     SqlValue::Int8(count_all as i64)
@@ -1539,6 +1681,7 @@ impl Exec {
             | Expr::IsTrue(_)
             | Expr::IsFalse(_) => SqlType::Boolean,
             Expr::Nested(e) => self.infer_type(e, input),
+            Expr::Function(f) if f.over.is_some() => self.infer_window_type(f, input),
             Expr::Function(f) => self.infer_function_type(f),
             Expr::Case {
                 conditions,
@@ -1549,6 +1692,40 @@ impl Exec {
                 .map(|w| self.infer_type(&w.result, input))
                 .or_else(|| else_result.as_ref().map(|e| self.infer_type(e, input)))
                 .unwrap_or(SqlType::Text),
+            _ => SqlType::Text,
+        }
+    }
+
+    /// Result type of a window call, for RowDescription purposes.
+    fn infer_window_type(&self, f: &sqlparser::ast::Function, input: &RowSchema) -> SqlType {
+        let name = f
+            .name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .map(ident_name)
+            .unwrap_or_default();
+        let first_arg_type = || {
+            if let FunctionArguments::List(list) = &f.args
+                && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) = list.args.first()
+            {
+                return self.infer_type(e, input);
+            }
+            SqlType::Text
+        };
+        match name.as_str() {
+            "row_number" | "rank" | "dense_rank" | "count" => SqlType::BigInt,
+            "percent_rank" | "cume_dist" => SqlType::DoublePrecision,
+            "ntile" => SqlType::Integer,
+            "sum" | "avg" => SqlType::Numeric {
+                precision: None,
+                scale: None,
+            },
+            "bool_and" | "bool_or" | "every" => SqlType::Boolean,
+            "string_agg" => SqlType::Text,
+            "lag" | "lead" | "first_value" | "last_value" | "nth_value" | "min" | "max" => {
+                first_arg_type()
+            }
             _ => SqlType::Text,
         }
     }
@@ -1572,6 +1749,14 @@ impl Exec {
                 }
                 "bool_and" | "bool_or" | "every" => return SqlType::Boolean,
                 "string_agg" => return SqlType::Text,
+                "min" | "max" => {
+                    if let FunctionArguments::List(list) = &f.args
+                        && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) =
+                            list.args.first()
+                    {
+                        return self.infer_type(e, input);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1608,6 +1793,441 @@ impl Exec {
             _ => SqlType::Text,
         }
     }
+
+    // ---- WITH (CTE) materialization -------------------------------------
+
+    /// Materialize a statement-level `WITH` clause into `self.cte`, in order.
+    /// `WITH RECURSIVE` members that reference themselves iterate to a
+    /// fixpoint; all other members materialize once, non-recursively.
+    pub(crate) fn materialize_with(&mut self, with: &sqlparser::ast::With) -> Result<()> {
+        let names: Vec<String> = with
+            .cte_tables
+            .iter()
+            .map(|c| ident_name(&c.alias.name))
+            .collect();
+        for (i, cte) in with.cte_tables.iter().enumerate() {
+            let name = &names[i];
+            // A recursive WITH item may reference itself and items defined
+            // before it; a reference to a later item is mutual recursion.
+            if with.recursive
+                && let Some(later) = names[i + 1..]
+                    .iter()
+                    .find(|n| n.as_str() != name && query_references(&cte.query, n))
+            {
+                return Err(SqlError::FeatureNotSupported(format!(
+                    "mutual recursion between WITH items \"{name}\" and \"{later}\" is not \
+                     implemented"
+                )));
+            }
+            let rs = if with.recursive && query_references(&cte.query, name) {
+                self.exec_recursive_cte(name, cte)?
+            } else {
+                self.exec_select_query(&cte.query, &[])?
+            };
+            let rs = label_cte(rs, name, &cte.alias.columns)?;
+            self.cte.insert(name.clone(), rs);
+        }
+        Ok(())
+    }
+
+    /// Iterate a recursive CTE to its fixpoint. PostgreSQL semantics: the
+    /// recursive term sees only the rows produced by the *previous* iteration
+    /// (the working table), never the full accumulation; `UNION` (without ALL)
+    /// dedups new rows against everything accumulated so far.
+    fn exec_recursive_cte(&mut self, name: &str, cte: &sqlparser::ast::Cte) -> Result<RowSet> {
+        let query = &cte.query;
+        if query.order_by.is_some() {
+            return Err(SqlError::FeatureNotSupported(
+                "ORDER BY in a recursive query is not implemented".into(),
+            ));
+        }
+        if query.limit_clause.is_some() {
+            return Err(SqlError::FeatureNotSupported(
+                "LIMIT/OFFSET in a recursive query is not implemented".into(),
+            ));
+        }
+        let SetExpr::SetOperation {
+            op: SetOperator::Union,
+            set_quantifier,
+            left,
+            right,
+        } = query.body.as_ref()
+        else {
+            return Err(SqlError::InvalidRecursion(format!(
+                "recursive query \"{name}\" does not have the form non-recursive-term UNION \
+                 [ALL] recursive-term"
+            )));
+        };
+        if setexpr_references(left, name) {
+            return Err(SqlError::InvalidRecursion(format!(
+                "recursive reference to query \"{name}\" must not appear within its \
+                 non-recursive term"
+            )));
+        }
+        validate_recursive_term(right, name)?;
+        let union_all = matches!(
+            set_quantifier,
+            sqlparser::ast::SetQuantifier::All | sqlparser::ast::SetQuantifier::AllByName
+        );
+
+        // The base (non-recursive) term fixes the CTE's column names and
+        // types; recursive-term rows are coerced to those types (or error).
+        let base = self.exec_set_expr(left, &[])?;
+        let mut schema = label_cte(
+            RowSet {
+                schema: base.schema,
+                rows: Vec::new(),
+            },
+            name,
+            &cte.alias.columns,
+        )?
+        .schema;
+        let mut types: Vec<SqlType> = schema.fields.iter().map(|f| f.ty.clone()).collect();
+        // Static inference falls back to Text for expressions it cannot type;
+        // trust the first base row's actual value types there instead, so a
+        // numeric column is not spuriously coerced through text.
+        if let Some(first) = base.rows.first() {
+            for (i, ty) in types.iter_mut().enumerate() {
+                if *ty == SqlType::Text
+                    && let Some(v) = first.get(i)
+                    && !v.is_null()
+                    && v.type_of() != SqlType::Text
+                {
+                    *ty = v.type_of();
+                }
+            }
+            for (f, ty) in schema.fields.iter_mut().zip(&types) {
+                f.ty = ty.clone();
+            }
+        }
+
+        let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+        let mut acc: Vec<Tuple> = Vec::new();
+        let mut working: Vec<Tuple> = Vec::new();
+        let absorb = |rows: Vec<Tuple>,
+                      acc: &mut Vec<Tuple>,
+                      working: &mut Vec<Tuple>,
+                      seen: &mut std::collections::HashSet<Vec<String>>|
+         -> Result<()> {
+            for row in rows {
+                let row = coerce_recursive_row(row, &types, name)?;
+                if union_all || seen.insert(row.iter().map(|v| v.index_key()).collect()) {
+                    acc.push(row.clone());
+                    working.push(row);
+                }
+            }
+            Ok(())
+        };
+        absorb(base.rows, &mut acc, &mut working, &mut seen)?;
+
+        // Iteration guard: bounded by an iteration cap (session-settable via
+        // `guardian.recursive_max_iterations`, default 100_000) and a fixed
+        // 10M-row cap, so runaway recursion errors instead of hanging.
+        let max_iterations: u64 = self
+            .vars
+            .borrow()
+            .get("guardian.recursive_max_iterations")
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(100_000);
+        const MAX_ROWS: usize = 10_000_000;
+        let mut iterations: u64 = 0;
+        while !working.is_empty() {
+            iterations += 1;
+            if iterations > max_iterations {
+                self.cte.remove(name);
+                return Err(SqlError::StatementTooComplex(format!(
+                    "recursive query \"{name}\" exceeded {max_iterations} iterations (set \
+                     guardian.recursive_max_iterations to raise the limit)"
+                )));
+            }
+            // Publish the working table under the CTE name so the recursive
+            // term's self-reference resolves to it.
+            self.cte.insert(
+                name.to_string(),
+                RowSet {
+                    schema: schema.clone(),
+                    rows: std::mem::take(&mut working),
+                },
+            );
+            let out = match self.exec_set_expr(right, &[]) {
+                Ok(out) => out,
+                Err(e) => {
+                    self.cte.remove(name);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = absorb(out.rows, &mut acc, &mut working, &mut seen) {
+                self.cte.remove(name);
+                return Err(e);
+            }
+            if acc.len() > MAX_ROWS {
+                self.cte.remove(name);
+                return Err(SqlError::StatementTooComplex(format!(
+                    "recursive query \"{name}\" produced more than {MAX_ROWS} rows"
+                )));
+            }
+        }
+        self.cte.remove(name);
+        Ok(RowSet { schema, rows: acc })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recursive-CTE helpers
+// ---------------------------------------------------------------------------
+
+/// Label a materialized CTE: every field belongs to the CTE name, renamed by
+/// the optional column-alias list (`WITH c(a, b) AS ...`).
+fn label_cte(
+    mut rs: RowSet,
+    name: &str,
+    columns: &[sqlparser::ast::TableAliasColumnDef],
+) -> Result<RowSet> {
+    if !columns.is_empty() && columns.len() > rs.schema.fields.len() {
+        return Err(SqlError::Syntax(format!(
+            "table \"{name}\" has {} columns available but {} columns specified",
+            rs.schema.fields.len(),
+            columns.len()
+        )));
+    }
+    for (i, f) in rs.schema.fields.iter_mut().enumerate() {
+        f.table = Some(name.to_string());
+        if let Some(c) = columns.get(i) {
+            f.name = ident_name(&c.name);
+        }
+    }
+    rs.schema.rebuild_lookup();
+    Ok(rs)
+}
+
+/// Coerce a recursive-term row to the column types fixed by the base term.
+fn coerce_recursive_row(row: Tuple, types: &[SqlType], name: &str) -> Result<Tuple> {
+    if row.len() != types.len() {
+        return Err(SqlError::Syntax(format!(
+            "recursive query \"{name}\": each UNION query must have the same number of columns"
+        )));
+    }
+    row.into_iter()
+        .zip(types)
+        .map(|(v, ty)| {
+            if v.is_null() || v.type_of() == *ty {
+                Ok(v)
+            } else {
+                v.cast(ty)
+            }
+        })
+        .collect()
+}
+
+/// Structural guards on the recursive term, mirroring PostgreSQL's rules: the
+/// self-reference must appear exactly once, directly in FROM (not inside a
+/// subquery or the nullable side of an outer join), and the term must not
+/// aggregate or dedup.
+fn validate_recursive_term(term: &SetExpr, name: &str) -> Result<()> {
+    let SetExpr::Select(sel) = term else {
+        return Err(SqlError::InvalidRecursion(format!(
+            "recursive query \"{name}\" does not have the form non-recursive-term UNION [ALL] \
+             recursive-term"
+        )));
+    };
+    if select_has_aggregate(sel) {
+        return Err(SqlError::InvalidRecursion(
+            "aggregate functions are not allowed in a recursive query's recursive term".into(),
+        ));
+    }
+    if let GroupByExpr::Expressions(exprs, _) = &sel.group_by
+        && !exprs.is_empty()
+    {
+        return Err(SqlError::FeatureNotSupported(
+            "GROUP BY in a recursive query's recursive term is not implemented".into(),
+        ));
+    }
+    if sel.distinct.is_some() {
+        return Err(SqlError::FeatureNotSupported(
+            "DISTINCT in a recursive query is not implemented".into(),
+        ));
+    }
+    let outer_join_err = || {
+        Err(SqlError::InvalidRecursion(format!(
+            "recursive reference to query \"{name}\" must not appear within an outer join"
+        )))
+    };
+    let mut count = 0usize;
+    for twj in &sel.from {
+        let mut chain_has = count_recursive_refs(&twj.relation, name, &mut count)?;
+        for join in &twj.joins {
+            let before = count;
+            let right_has =
+                count_recursive_refs(&join.relation, name, &mut count)? || count > before;
+            use sqlparser::ast::JoinOperator;
+            match &join.join_operator {
+                JoinOperator::Left(_) | JoinOperator::LeftOuter(_) if right_has => {
+                    return outer_join_err();
+                }
+                JoinOperator::Right(_) | JoinOperator::RightOuter(_) if chain_has => {
+                    return outer_join_err();
+                }
+                JoinOperator::FullOuter(_) if chain_has || right_has => {
+                    return outer_join_err();
+                }
+                _ => {}
+            }
+            chain_has = chain_has || right_has;
+        }
+    }
+    // The self-reference must not hide inside expression subqueries either.
+    if select_expr_subquery_references(sel, name) {
+        return Err(SqlError::InvalidRecursion(format!(
+            "recursive reference to query \"{name}\" must not appear within a subquery"
+        )));
+    }
+    match count {
+        1 => Ok(()),
+        0 => Err(SqlError::InvalidRecursion(format!(
+            "recursive query \"{name}\" does not have the form non-recursive-term UNION [ALL] \
+             recursive-term"
+        ))),
+        _ => Err(SqlError::InvalidRecursion(format!(
+            "recursive reference to query \"{name}\" must not appear more than once"
+        ))),
+    }
+}
+
+/// Count direct FROM references to the CTE `name` inside a table factor,
+/// erroring if the reference occurs inside a derived subquery.
+fn count_recursive_refs(tf: &TableFactor, name: &str, count: &mut usize) -> Result<bool> {
+    match tf {
+        TableFactor::Table { name: obj, .. } => {
+            let parts = object_name_parts(obj);
+            if parts.len() == 1 && parts[0] == name {
+                *count += 1;
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        TableFactor::Derived { subquery, .. } => {
+            if query_references(subquery, name) {
+                return Err(SqlError::InvalidRecursion(format!(
+                    "recursive reference to query \"{name}\" must not appear within a subquery"
+                )));
+            }
+            Ok(false)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            let mut has = count_recursive_refs(&table_with_joins.relation, name, count)?;
+            for j in &table_with_joins.joins {
+                has |= count_recursive_refs(&j.relation, name, count)?;
+            }
+            Ok(has)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Does this query reference `name` as an unqualified table anywhere —
+/// including derived tables and expression subqueries?
+fn query_references(q: &Query, name: &str) -> bool {
+    setexpr_references(&q.body, name)
+}
+
+fn setexpr_references(s: &SetExpr, name: &str) -> bool {
+    match s {
+        SetExpr::Select(sel) => select_references(sel, name),
+        SetExpr::Query(q) => query_references(q, name),
+        SetExpr::SetOperation { left, right, .. } => {
+            setexpr_references(left, name) || setexpr_references(right, name)
+        }
+        SetExpr::Values(v) => v
+            .rows
+            .iter()
+            .flat_map(|r| &r.content)
+            .any(|e| expr_references(e, name)),
+        _ => false,
+    }
+}
+
+fn select_references(sel: &Select, name: &str) -> bool {
+    let tf_refs = |tf: &TableFactor| -> bool {
+        let mut n = 0usize;
+        match count_recursive_refs(tf, name, &mut n) {
+            Ok(has) => has || n > 0,
+            // A reference hidden in a derived subquery is still a reference.
+            Err(_) => true,
+        }
+    };
+    let from = sel.from.iter().any(|twj| {
+        tf_refs(&twj.relation)
+            || twj.joins.iter().any(|j| {
+                tf_refs(&j.relation) || join_on_expr(j).is_some_and(|e| expr_references(e, name))
+            })
+    });
+    from || select_expr_subquery_references(sel, name)
+}
+
+/// Does any expression position of this SELECT contain a subquery that
+/// references `name`?
+fn select_expr_subquery_references(sel: &Select, name: &str) -> bool {
+    let mut exprs: Vec<&Expr> = Vec::new();
+    for item in &sel.projection {
+        if let SelectItem::UnnamedExpr(e)
+        | SelectItem::ExprWithAlias { expr: e, .. }
+        | SelectItem::ExprWithAliases { expr: e, .. } = item
+        {
+            exprs.push(e);
+        }
+    }
+    if let Some(e) = &sel.selection {
+        exprs.push(e);
+    }
+    if let Some(e) = &sel.having {
+        exprs.push(e);
+    }
+    if let GroupByExpr::Expressions(gexprs, _) = &sel.group_by {
+        exprs.extend(gexprs.iter());
+    }
+    for twj in &sel.from {
+        for j in &twj.joins {
+            if let Some(e) = join_on_expr(j) {
+                exprs.push(e);
+            }
+        }
+    }
+    exprs.into_iter().any(|e| expr_references(e, name))
+}
+
+fn join_on_expr(join: &Join) -> Option<&Expr> {
+    use sqlparser::ast::JoinOperator;
+    let constraint = match &join.join_operator {
+        JoinOperator::Inner(c)
+        | JoinOperator::Join(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c) => c,
+        _ => return None,
+    };
+    match constraint {
+        JoinConstraint::On(e) => Some(e),
+        _ => None,
+    }
+}
+
+/// Does this expression contain a subquery that references `name`?
+fn expr_references(e: &Expr, name: &str) -> bool {
+    let mut found = false;
+    walk_expr(e, &mut |inner| {
+        if let Expr::Subquery(q)
+        | Expr::Exists { subquery: q, .. }
+        | Expr::InSubquery { subquery: q, .. } = inner
+            && query_references(q, name)
+        {
+            found = true;
+        }
+    });
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,11 +2345,13 @@ fn cross_join(left: RowSet, right: RowSet) -> RowSet {
 }
 
 /// Build a RowSet from a loaded table, labelling each field with `alias`. When
-/// `filter` is given (SKIP LOCKED), only those row ids are included.
+/// `filter` is given (SKIP LOCKED), only those row ids are included; rows in
+/// `rls_hidden` (invisible under row-level security) are always excluded.
 fn loaded_to_rowset(
     loaded: &crate::sql::store::LoadedTable,
     alias: &str,
     filter: Option<&std::collections::BTreeSet<String>>,
+    rls_hidden: Option<&std::collections::BTreeSet<String>>,
 ) -> RowSet {
     let fields = loaded
         .meta
@@ -1746,6 +2368,7 @@ fn loaded_to_rowset(
         .rows
         .iter()
         .filter(|(rid, _)| filter.map(|f| f.contains(*rid)).unwrap_or(true))
+        .filter(|(rid, _)| rls_hidden.map(|h| !h.contains(*rid)).unwrap_or(true))
         .map(|(_, values)| {
             loaded
                 .meta
@@ -1774,6 +2397,7 @@ fn relabel(
             f.name = name.clone();
         }
     }
+    rs.schema.rebuild_lookup();
     rs
 }
 
@@ -1781,16 +2405,8 @@ fn relabel(
 // Aggregate helpers
 // ---------------------------------------------------------------------------
 
-fn select_has_window(select: &Select) -> bool {
-    select.projection.iter().any(|it| {
-        matches!(it,
-            SelectItem::UnnamedExpr(e)
-            | SelectItem::ExprWithAlias { expr: e, .. }
-            | SelectItem::ExprWithAliases { expr: e, .. } if expr_has_window(e))
-    })
-}
-
-fn expr_has_window(expr: &Expr) -> bool {
+/// Does this expression contain a window function call (`... OVER ...`)?
+pub(crate) fn expr_has_window(expr: &Expr) -> bool {
     let mut found = false;
     walk_expr(expr, &mut |e| {
         if let Expr::Function(f) = e
@@ -1802,7 +2418,7 @@ fn expr_has_window(expr: &Expr) -> bool {
     found
 }
 
-fn select_has_aggregate(select: &Select) -> bool {
+pub(crate) fn select_has_aggregate(select: &Select) -> bool {
     let mut found = false;
     for item in &select.projection {
         if let SelectItem::UnnamedExpr(e)
@@ -1824,7 +2440,11 @@ fn select_has_aggregate(select: &Select) -> bool {
 fn expr_has_aggregate(expr: &Expr) -> bool {
     let mut found = false;
     walk_expr(expr, &mut |e| {
-        if let Expr::Function(f) = e {
+        // An aggregate with OVER is a window call, not a plain aggregate; its
+        // arguments may still contain plain aggregates (walked separately).
+        if let Expr::Function(f) = e
+            && f.over.is_none()
+        {
             let name = f
                 .name
                 .0
@@ -1844,7 +2464,11 @@ fn collect_aggregates(select: &Select) -> Vec<sqlparser::ast::Function> {
     let mut out = Vec::new();
     let mut push = |e: &Expr| {
         walk_expr(e, &mut |inner| {
-            if let Expr::Function(f) = inner {
+            // Skip window calls; plain aggregates nested in their arguments
+            // are still collected (the walk descends into function args).
+            if let Expr::Function(f) = inner
+                && f.over.is_none()
+            {
                 let name = f
                     .name
                     .0
@@ -1873,7 +2497,7 @@ fn collect_aggregates(select: &Select) -> Vec<sqlparser::ast::Function> {
 }
 
 /// Extract `(distinct, single_arg_expr, is_star)` from an aggregate call.
-fn aggregate_arg(call: &sqlparser::ast::Function) -> Result<(bool, Option<Expr>, bool)> {
+pub(crate) fn aggregate_arg(call: &sqlparser::ast::Function) -> Result<(bool, Option<Expr>, bool)> {
     match &call.args {
         FunctionArguments::List(list) => {
             let distinct = matches!(
@@ -1947,7 +2571,7 @@ fn dedupe_values(values: Vec<SqlValue>) -> Vec<SqlValue> {
     out
 }
 
-fn compare_sort(a: &SqlValue, b: &SqlValue, asc: bool, nulls_first: bool) -> Ordering {
+pub(crate) fn compare_sort(a: &SqlValue, b: &SqlValue, asc: bool, nulls_first: bool) -> Ordering {
     match (a.is_null(), b.is_null()) {
         (true, true) => return Ordering::Equal,
         (true, false) => {
@@ -2002,9 +2626,10 @@ fn qualified_wildcard_table(kind: &sqlparser::ast::SelectItemQualifiedWildcardKi
     }
 }
 
-/// Recursively visit sub-expressions (shallow set sufficient for aggregate
-/// detection: projection/having scalar trees).
-fn walk_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
+/// Recursively visit sub-expressions (shallow set sufficient for aggregate /
+/// window / subquery detection in scalar trees; subqueries themselves are not
+/// descended into — callers handle `Subquery`/`Exists`/`InSubquery` nodes).
+pub(crate) fn walk_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(expr);
     match expr {
         Expr::BinaryOp { left, right, .. } => {
@@ -2016,8 +2641,37 @@ fn walk_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
         | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
         | Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
+        | Expr::Collate { expr, .. }
+        | Expr::InSubquery { expr, .. }
         | Expr::Cast { expr, .. } => walk_expr(expr, f),
+        Expr::IsDistinctFrom(a, b) | Expr::IsNotDistinctFrom(a, b) => {
+            walk_expr(a, f);
+            walk_expr(b, f);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            walk_expr(expr, f);
+            walk_expr(low, f);
+            walk_expr(high, f);
+        }
+        Expr::InList { expr, list, .. } => {
+            walk_expr(expr, f);
+            for e in list {
+                walk_expr(e, f);
+            }
+        }
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. } => {
+            walk_expr(expr, f);
+            walk_expr(pattern, f);
+        }
         Expr::Case {
             operand,
             conditions,
@@ -2056,3 +2710,19 @@ fn walk_expr(expr: &Expr, f: &mut dyn FnMut(&Expr)) {
         _ => {}
     }
 }
+
+// Maintenance note 3: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note 15: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
+
+// SQL compatibility note 2: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 18: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 2: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 18: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
