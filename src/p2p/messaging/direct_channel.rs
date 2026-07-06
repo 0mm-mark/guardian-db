@@ -6,10 +6,9 @@ use crate::traits::{
 };
 use async_trait::async_trait;
 use futures::StreamExt;
-use iroh::NodeId;
+use iroh::EndpointId;
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
-use rand_core;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -20,7 +19,7 @@ use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::Span;
 
-type TopicMessageChannels = Arc<RwLock<HashMap<TopicId, broadcast::Sender<(NodeId, Vec<u8>)>>>>;
+type TopicMessageChannels = Arc<RwLock<HashMap<TopicId, broadcast::Sender<(EndpointId, Vec<u8>)>>>>;
 
 // Timeout para resposta de beacon (fração do CONNECTION_TIMEOUT)
 const BEACON_TIMEOUT: Duration = Duration::from_secs(CONNECTION_TIMEOUT.as_secs() / 6);
@@ -31,7 +30,7 @@ pub struct DirectChannelMessage {
     pub message_type: MessageType,
     pub payload: Vec<u8>,
     pub timestamp: u64,
-    pub sender: String, // NodeId as string
+    pub sender: String, // EndpointId as string
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,9 +43,9 @@ pub enum MessageType {
 #[async_trait]
 pub trait DirectChannelNetwork: Send + Sync {
     async fn publish_message(&self, topic: &TopicId, message: &[u8]) -> Result<()>;
-    async fn subscribe_topic(&self, topic: &TopicId, bootstrap_peers: Vec<NodeId>) -> Result<()>;
-    async fn get_connected_peers(&self) -> Vec<NodeId>;
-    async fn get_topic_peers(&self, topic: &TopicId) -> Vec<NodeId>;
+    async fn subscribe_topic(&self, topic: &TopicId, bootstrap_peers: Vec<EndpointId>) -> Result<()>;
+    async fn get_connected_peers(&self) -> Vec<EndpointId>;
+    async fn get_topic_peers(&self, topic: &TopicId) -> Vec<EndpointId>;
 
     /// Permite downcast para tipos concretos
     fn as_any(&self) -> &dyn std::any::Any;
@@ -58,10 +57,10 @@ pub struct IrohBridge {
     #[allow(dead_code)] // Mantido para referência futura
     backend: Arc<IrohBackend>,
     gossip: Gossip,
-    connected_peers: Arc<RwLock<Vec<NodeId>>>,
-    topic_peers: Arc<RwLock<HashMap<TopicId, Vec<NodeId>>>>,
+    connected_peers: Arc<RwLock<Vec<EndpointId>>>,
+    topic_peers: Arc<RwLock<HashMap<TopicId, Vec<EndpointId>>>>,
     subscribed_topics: Arc<RwLock<HashMap<TopicId, bool>>>,
-    own_node_id: NodeId,
+    own_node_id: EndpointId,
     // Canais de mensagens por tópico para event loops consumirem
     topic_message_channels: TopicMessageChannels,
     // Event loops ativos por tópico
@@ -77,7 +76,7 @@ impl IrohBridge {
             .as_ref()
             .ok_or_else(|| GuardianError::Other("Endpoint não disponível".to_string()))?
             .clone();
-        let own_node_id = endpoint.node_id();
+        let own_node_id = endpoint.id();
         drop(endpoint_lock);
 
         // Inicializa gossip
@@ -103,8 +102,8 @@ impl IrohBridge {
         &self.span
     }
 
-    /// Retorna o NodeId próprio
-    pub fn node_id(&self) -> NodeId {
+    /// Retorna o EndpointId próprio
+    pub fn node_id(&self) -> EndpointId {
         self.own_node_id
     }
 
@@ -115,7 +114,7 @@ impl IrohBridge {
     }
 
     /// Atualiza a lista de peers conectados
-    pub async fn update_connected_peers(&self, peers: Vec<NodeId>) {
+    pub async fn update_connected_peers(&self, peers: Vec<EndpointId>) {
         let _entered = self.span.enter();
         let mut connected = self.connected_peers.write().await;
         *connected = peers.clone();
@@ -124,7 +123,7 @@ impl IrohBridge {
     }
 
     /// Atualiza peers de um tópico específico
-    pub async fn update_topic_peers(&self, topic: TopicId, peers: Vec<NodeId>) {
+    pub async fn update_topic_peers(&self, topic: TopicId, peers: Vec<EndpointId>) {
         let mut topic_peers = self.topic_peers.write().await;
         topic_peers.insert(topic, peers.clone());
 
@@ -203,7 +202,7 @@ impl IrohBridge {
     pub async fn get_topic_receiver(
         &self,
         topic: &TopicId,
-    ) -> Option<broadcast::Receiver<(NodeId, Vec<u8>)>> {
+    ) -> Option<broadcast::Receiver<(EndpointId, Vec<u8>)>> {
         let channels = self.topic_message_channels.read().await;
         channels.get(topic).map(|sender| sender.subscribe())
     }
@@ -228,7 +227,7 @@ impl DirectChannelNetwork for IrohBridge {
         Ok(())
     }
 
-    async fn subscribe_topic(&self, topic: &TopicId, bootstrap_peers: Vec<NodeId>) -> Result<()> {
+    async fn subscribe_topic(&self, topic: &TopicId, bootstrap_peers: Vec<EndpointId>) -> Result<()> {
         tracing::debug!(
             "Inscrevendo no tópico: {} com {} bootstrap peers",
             topic.fmt_short(),
@@ -355,7 +354,7 @@ impl DirectChannelNetwork for IrohBridge {
         }
 
         // Cria canal de mensagens para este tópico (capacity: 100 mensagens)
-        let (message_tx, _message_rx) = broadcast::channel::<(NodeId, Vec<u8>)>(100);
+        let (message_tx, _message_rx) = broadcast::channel::<(EndpointId, Vec<u8>)>(100);
 
         {
             let mut channels = self.topic_message_channels.write().await;
@@ -442,14 +441,14 @@ impl DirectChannelNetwork for IrohBridge {
         Ok(())
     }
 
-    async fn get_connected_peers(&self) -> Vec<NodeId> {
+    async fn get_connected_peers(&self) -> Vec<EndpointId> {
         let peers = self.connected_peers.read().await;
         let peer_list = peers.clone();
         tracing::debug!("Retornando {} peers conectados", peer_list.len());
         peer_list
     }
 
-    async fn get_topic_peers(&self, topic: &TopicId) -> Vec<NodeId> {
+    async fn get_topic_peers(&self, topic: &TopicId) -> Vec<EndpointId> {
         tracing::debug!("Obtendo peers do tópico: {}", topic.fmt_short());
 
         let topic_peers = self.topic_peers.read().await;
@@ -472,7 +471,7 @@ impl DirectChannelNetwork for IrohBridge {
 #[derive(Debug, Clone)]
 struct ChannelState {
     #[allow(dead_code)]
-    node_id: NodeId,
+    node_id: EndpointId,
     topic: TopicId,
     connection_status: ConnectionStatus,
     last_activity: Instant,
@@ -492,29 +491,29 @@ enum ConnectionStatus {
 // Eventos internos do DirectChannel
 #[derive(Debug)]
 enum DirectChannelEvent {
-    PeerConnected(NodeId),
-    PeerDisconnected(NodeId),
+    PeerConnected(EndpointId),
+    PeerDisconnected(EndpointId),
     MessageReceived {
-        peer: NodeId,
+        peer: EndpointId,
         payload: Vec<u8>,
     },
     MessageSent {
-        peer: NodeId,
+        peer: EndpointId,
         success: bool,
         error: Option<String>,
     },
-    HeartbeatReceived(NodeId),
-    HeartbeatTimeout(NodeId),
+    HeartbeatReceived(EndpointId),
+    HeartbeatTimeout(EndpointId),
 }
 
 pub struct DirectChannel {
     span: Span,
     iroh_network: Arc<dyn DirectChannelNetwork>,
     emitter: Arc<dyn DirectChannelEmitter<Error = GuardianError>>,
-    channels: Arc<RwLock<HashMap<NodeId, ChannelState>>>,
+    channels: Arc<RwLock<HashMap<EndpointId, ChannelState>>>,
     event_sender: mpsc::UnboundedSender<DirectChannelEvent>,
     _event_receiver: Arc<Mutex<Option<mpsc::UnboundedReceiver<DirectChannelEvent>>>>,
-    own_node_id: NodeId,
+    own_node_id: EndpointId,
     running: Arc<Mutex<bool>>,
 }
 
@@ -524,7 +523,7 @@ impl DirectChannel {
         span: Span,
         iroh_network: Arc<dyn DirectChannelNetwork>,
         emitter: Arc<dyn DirectChannelEmitter<Error = GuardianError>>,
-        own_node_id: NodeId,
+        own_node_id: EndpointId,
     ) -> Self {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
 
@@ -541,7 +540,7 @@ impl DirectChannel {
     }
 
     // Gera o tópico único para comunicação com um peer específico
-    fn get_channel_topic(&self, peer: NodeId) -> TopicId {
+    fn get_channel_topic(&self, peer: EndpointId) -> TopicId {
         // Ordena os node IDs para garantir o mesmo tópico em ambos os lados
         let (first, second) = if self.own_node_id.as_bytes() < peer.as_bytes() {
             (self.own_node_id, peer)
@@ -611,7 +610,7 @@ impl DirectChannel {
                     break;
                 }
 
-                let peers_to_heartbeat: Vec<(NodeId, TopicId)> = {
+                let peers_to_heartbeat: Vec<(EndpointId, TopicId)> = {
                     let channels_map = channels.read().await;
                     channels_map
                         .iter()
@@ -642,7 +641,7 @@ impl DirectChannel {
                 }
 
                 // Verifica peers em estado de erro e tenta reconectar
-                let peers_to_reconnect: Vec<NodeId> = {
+                let peers_to_reconnect: Vec<EndpointId> = {
                     let channels_map = channels.read().await;
                     channels_map
                         .iter()
@@ -729,7 +728,7 @@ impl DirectChannel {
         event: DirectChannelEvent,
         emitter: &Arc<dyn DirectChannelEmitter<Error = GuardianError>>,
         _span: &Span,
-        channels: &Arc<RwLock<HashMap<NodeId, ChannelState>>>,
+        channels: &Arc<RwLock<HashMap<EndpointId, ChannelState>>>,
     ) -> Result<()> {
         match event {
             DirectChannelEvent::MessageReceived { peer, payload } => {
@@ -804,7 +803,7 @@ impl DirectChannel {
     }
 
     // Envia dados para um peer específico
-    pub async fn send_data(&self, peer: NodeId, payload: Vec<u8>) -> Result<()> {
+    pub async fn send_data(&self, peer: EndpointId, payload: Vec<u8>) -> Result<()> {
         if payload.len() > MAX_MESSAGE_SIZE {
             return Err(GuardianError::Other(format!(
                 "Mensagem muito grande: {} bytes (máximo: {})",
@@ -854,7 +853,7 @@ impl DirectChannel {
     }
 
     // Conecta a um peer específico
-    pub async fn connect_to_peer(&self, peer: NodeId) -> Result<()> {
+    pub async fn connect_to_peer(&self, peer: EndpointId) -> Result<()> {
         let topic = self.get_channel_topic(peer);
         let mut channels_map = self.channels.write().await;
 
@@ -916,7 +915,7 @@ impl DirectChannel {
             })?;
 
         // Obtém receiver para mensagens deste tópico
-        let Some(mut receiver): Option<broadcast::Receiver<(NodeId, Vec<u8>)>> =
+        let Some(mut receiver): Option<broadcast::Receiver<(EndpointId, Vec<u8>)>> =
             iroh_bridge.get_topic_receiver(&topic).await
         else {
             return Err(GuardianError::Other(format!(
@@ -999,7 +998,7 @@ impl DirectChannel {
     }
 
     // Estabelece conexão com um peer específico
-    async fn establish_peer_connection(&self, peer: NodeId, topic: TopicId) -> Result<()> {
+    async fn establish_peer_connection(&self, peer: EndpointId, topic: TopicId) -> Result<()> {
         tracing::debug!("Estabelecendo conexão com peer: {}", peer);
 
         // 1. Verifica se o peer já está nos peers conectados
@@ -1098,7 +1097,7 @@ impl DirectChannel {
     }
 
     // Envia mensagem de handshake para verificar conectividade
-    async fn send_handshake_message(&self, topic: &TopicId, target_peer: NodeId) -> Result<()> {
+    async fn send_handshake_message(&self, topic: &TopicId, target_peer: EndpointId) -> Result<()> {
         let handshake_msg = DirectChannelMessage {
             message_type: MessageType::Ack, // Usa ACK como handshake
             payload: format!("handshake:{}", self.own_node_id).into_bytes(),
@@ -1120,7 +1119,7 @@ impl DirectChannel {
     }
 
     // Envia beacon de descoberta para atrair peers
-    async fn send_discovery_beacon(&self, topic: &TopicId, target_peer: NodeId) -> Result<()> {
+    async fn send_discovery_beacon(&self, topic: &TopicId, target_peer: EndpointId) -> Result<()> {
         let beacon_msg = DirectChannelMessage {
             message_type: MessageType::Heartbeat, // Usa Heartbeat como beacon
             payload: format!("discovery_beacon:{}:{}", self.own_node_id, target_peer).into_bytes(),
@@ -1145,7 +1144,7 @@ impl DirectChannel {
     pub async fn handle_iroh_message(
         &self,
         message_data: &[u8],
-        sender_peer: NodeId,
+        sender_peer: EndpointId,
     ) -> Result<()> {
         // Decodifica a mensagem
         let decoded_msg: DirectChannelMessage = serde_cbor::from_slice(message_data)
@@ -1196,7 +1195,7 @@ impl DirectChannel {
     // Processa beacon de descoberta recebido
     async fn handle_discovery_beacon(
         &self,
-        sender_peer: NodeId,
+        sender_peer: EndpointId,
         beacon_payload: String,
     ) -> Result<()> {
         tracing::debug!(
@@ -1242,7 +1241,7 @@ impl DirectChannel {
     // Processa resposta de handshake
     async fn handle_handshake_response(
         &self,
-        sender_peer: NodeId,
+        sender_peer: EndpointId,
         handshake_payload: String,
     ) -> Result<()> {
         tracing::debug!(
@@ -1302,7 +1301,7 @@ impl DirectChannel {
         *running = false;
 
         // Desconecta todos os peers
-        let peers: Vec<NodeId> = {
+        let peers: Vec<EndpointId> = {
             let channels_map = self.channels.read().await;
             channels_map.keys().cloned().collect()
         };
@@ -1326,7 +1325,7 @@ impl DirectChannel {
     }
 
     // Lista peers conectados
-    pub async fn list_connected_peers(&self) -> Vec<NodeId> {
+    pub async fn list_connected_peers(&self) -> Vec<EndpointId> {
         let channels_map = self.channels.read().await;
         channels_map
             .iter()
@@ -1338,7 +1337,7 @@ impl DirectChannel {
     }
 
     // Obter estatísticas do canal
-    pub async fn get_channel_stats(&self) -> HashMap<NodeId, (u64, Duration)> {
+    pub async fn get_channel_stats(&self) -> HashMap<EndpointId, (u64, Duration)> {
         let channels_map = self.channels.read().await;
         channels_map
             .iter()
@@ -1373,12 +1372,12 @@ impl DirectChannel {
 impl crate::traits::DirectChannel for DirectChannel {
     type Error = GuardianError;
 
-    async fn connect(&mut self, peer: NodeId) -> std::result::Result<(), Self::Error> {
+    async fn connect(&mut self, peer: EndpointId) -> std::result::Result<(), Self::Error> {
         tracing::info!("Conectando ao peer: {}", peer);
         self.connect_to_peer(peer).await
     }
 
-    async fn send(&mut self, peer: NodeId, data: Vec<u8>) -> std::result::Result<(), Self::Error> {
+    async fn send(&mut self, peer: EndpointId, data: Vec<u8>) -> std::result::Result<(), Self::Error> {
         tracing::debug!("Enviando {} bytes para {}", data.len(), peer);
         self.send_data(peer, data).await
     }
@@ -1399,14 +1398,14 @@ impl crate::traits::DirectChannel for DirectChannel {
 pub struct HolderChannels {
     iroh_network: Arc<dyn DirectChannelNetwork>,
     span: Span,
-    own_node_id: NodeId,
+    own_node_id: EndpointId,
 }
 
 impl HolderChannels {
     pub fn new(
         span: Span,
         iroh_network: Arc<dyn DirectChannelNetwork>,
-        own_node_id: NodeId,
+        own_node_id: EndpointId,
     ) -> Self {
         Self {
             iroh_network,
@@ -1441,7 +1440,7 @@ impl HolderChannels {
 
 pub fn init_direct_channel_factory(
     span: Span,
-    own_node_id: NodeId,
+    own_node_id: EndpointId,
     backend: Arc<IrohBackend>,
 ) -> DirectChannelFactory {
     Arc::new(
@@ -1505,7 +1504,7 @@ pub async fn create_direct_channel_with_iroh(
     iroh_network: Arc<dyn DirectChannelNetwork>,
     emitter: Arc<dyn DirectChannelEmitter<Error = GuardianError>>,
     span: Span,
-    own_node_id: NodeId,
+    own_node_id: EndpointId,
 ) -> Result<DirectChannel> {
     let channel = DirectChannel::new(span.clone(), iroh_network, emitter, own_node_id);
 
@@ -1530,8 +1529,8 @@ pub async fn create_unified_iroh_interface(
     Ok(interface)
 }
 
-// Função para criar um NodeId de teste
-pub fn create_test_node_id() -> NodeId {
-    let secret_key = iroh::SecretKey::generate(rand_core::OsRng);
+// Função para criar um EndpointId de teste
+pub fn create_test_node_id() -> EndpointId {
+    let secret_key = iroh::SecretKey::generate();
     secret_key.public()
 }

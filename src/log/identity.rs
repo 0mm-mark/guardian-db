@@ -1,6 +1,6 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hex;
-use rand::RngCore;
+use rand::Rng;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 

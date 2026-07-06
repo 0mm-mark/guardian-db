@@ -1,6 +1,6 @@
 use crate::address::Address;
 use crate::log::entry::Entry;
-use iroh::NodeId;
+use iroh::EndpointId;
 use iroh_blobs::Hash;
 use std::sync::Arc;
 
@@ -284,11 +284,11 @@ impl EventWrite {
 /// Um evento enviado quando um novo peer é descoberto no canal pubsub.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventNewPeer {
-    pub peer: NodeId,
+    pub peer: EndpointId,
 }
 
 impl EventNewPeer {
-    pub fn new(p: NodeId) -> Self {
+    pub fn new(p: EndpointId) -> Self {
         Self { peer: p }
     }
 }

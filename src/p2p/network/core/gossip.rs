@@ -9,7 +9,7 @@ use crate::traits::{EventPubSubMessage, PubSubInterface, PubSubTopic};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
-use iroh::NodeId;
+use iroh::EndpointId;
 use iroh_gossip::api::GossipSender;
 use iroh_gossip::net::Gossip;
 use iroh_gossip::proto::TopicId;
@@ -42,9 +42,9 @@ pub struct IrohTopic {
     /// Canal para broadcast de mensagens recebidas
     message_sender: Arc<broadcast::Sender<Bytes>>,
     /// Peers conectados neste tópico
-    peers: Arc<RwLock<Vec<NodeId>>>,
+    peers: Arc<RwLock<Vec<EndpointId>>>,
     /// Bootstrap peers usados para formar o mesh
-    bootstrap_peers: Arc<RwLock<Vec<NodeId>>>,
+    bootstrap_peers: Arc<RwLock<Vec<EndpointId>>>,
     /// Canal para eventos de peers (join/leave)
     peer_events_sender: Arc<broadcast::Sender<crate::events::Event>>,
     /// Handle da task de event loop do gossip
@@ -98,7 +98,7 @@ impl EpidemicPubSub {
     pub async fn get_or_create_topic_with_peers(
         &self,
         topic: &str,
-        bootstrap_peers: Vec<NodeId>,
+        bootstrap_peers: Vec<EndpointId>,
     ) -> Result<Arc<IrohTopic>> {
         let topic_id = Self::topic_id_from_str(topic);
 
@@ -147,8 +147,8 @@ impl EpidemicPubSub {
                         "[JOIN_PEERS] Peers {:?} adicionados ao mesh do tópico {}",
                         bootstrap_peers
                             .iter()
-                            .map(|p| p.fmt_short())
-                            .collect::<Vec<_>>(),
+                            .map(|p| p.fmt_short().to_string())
+                            .collect::<Vec<String>>(),
                         topic
                     );
                 }
@@ -187,9 +187,9 @@ impl EpidemicPubSub {
                             retry_count * 100,
                             expected_peers
                                 .iter()
-                                .map(|p| p.fmt_short())
-                                .collect::<Vec<_>>(),
-                            connected.iter().map(|p| p.fmt_short()).collect::<Vec<_>>()
+                                .map(|p| p.fmt_short().to_string())
+                                .collect::<Vec<String>>(),
+                            connected.iter().map(|p| p.fmt_short().to_string()).collect::<Vec<String>>()
                         );
                         break;
                     }
@@ -367,7 +367,7 @@ impl EpidemicPubSub {
     pub async fn ensure_topic_with_peers(
         &self,
         topic: &str,
-        bootstrap_peers: Vec<NodeId>,
+        bootstrap_peers: Vec<EndpointId>,
     ) -> Result<Arc<IrohTopic>> {
         self.get_or_create_topic_with_peers(topic, bootstrap_peers)
             .await
@@ -378,7 +378,7 @@ impl EpidemicPubSub {
     pub async fn subscribe_with_peers(
         &self,
         topic: &str,
-        bootstrap_peers: Vec<NodeId>,
+        bootstrap_peers: Vec<EndpointId>,
     ) -> Result<Arc<IrohTopic>> {
         if bootstrap_peers.is_empty() {
             debug!(
@@ -451,13 +451,13 @@ impl IrohTopic {
     }
 
     /// Lista peers conectados ao tópico
-    pub async fn list_peers(&self) -> Vec<NodeId> {
+    pub async fn list_peers(&self) -> Vec<EndpointId> {
         let peers = self.peers.read().await;
         peers.clone()
     }
 }
 
-/// Implementação de PubSubTopic usando iroh-gossip nativo com NodeId
+/// Implementação de PubSubTopic usando iroh-gossip nativo com EndpointId
 #[async_trait]
 impl PubSubTopic for IrohTopic {
     type Error = GuardianError;
@@ -490,7 +490,7 @@ impl PubSubTopic for IrohTopic {
         Ok(())
     }
 
-    async fn peers(&self) -> std::result::Result<Vec<NodeId>, Self::Error> {
+    async fn peers(&self) -> std::result::Result<Vec<EndpointId>, Self::Error> {
         // Retorna lista de NodeIds diretamente sem conversão
         Ok(self.list_peers().await)
     }

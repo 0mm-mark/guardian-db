@@ -16,11 +16,10 @@ use crate::traits::{
     TracerWrapper,
 };
 use hex;
-use iroh::NodeId;
+use iroh::EndpointId;
 use iroh_blobs::Hash;
 use opentelemetry::global::BoxedTracer;
 use parking_lot::RwLock;
-use rand_core;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -38,7 +37,7 @@ type GuardianStore = dyn Store<Error = GuardianError> + Send + Sync;
 #[derive(Default)]
 pub struct NewGuardianDBOptions {
     pub id: Option<String>,
-    pub node_id: Option<NodeId>,
+    pub node_id: Option<EndpointId>,
     pub directory: Option<PathBuf>,
     pub keystore: Option<Box<dyn Keystore + Send + Sync>>,
     pub cache: Option<Arc<LevelDownCache>>,
@@ -55,7 +54,7 @@ pub struct NewGuardianDBOptions {
 pub struct GuardianDB {
     client: IrohClient,
     identity: Arc<RwLock<Identity>>,
-    id: Arc<RwLock<NodeId>>,
+    id: Arc<RwLock<EndpointId>>,
     keystore: Arc<RwLock<Option<Box<dyn Keystore + Send + Sync>>>>,
     close_keystore: CloseKeystoreFn,
     tracer: Arc<BoxedTracer>,
@@ -79,7 +78,7 @@ pub struct GuardianDB {
 
 #[derive(Clone)]
 pub struct EventExchangeHeads {
-    pub peer: NodeId,
+    pub peer: EndpointId,
     pub message: MessageExchangeHeads,
 }
 
@@ -210,7 +209,7 @@ impl Emitters {
 
 impl EventExchangeHeads {
     /// Cria uma nova instância de EventExchangeHeads.
-    pub fn new(p: NodeId, msg: MessageExchangeHeads) -> Self {
+    pub fn new(p: EndpointId, msg: MessageExchangeHeads) -> Self {
         Self {
             peer: p,
             message: msg,
@@ -318,8 +317,7 @@ impl GuardianDB {
 
         // Extrair node_id ou gerar aleatório
         let node_id = options.node_id.unwrap_or_else(|| {
-            use rand_core::OsRng;
-            iroh::SecretKey::generate(OsRng).public()
+            iroh::SecretKey::generate().public()
         });
 
         // Criar backend Iroh
@@ -513,7 +511,7 @@ impl GuardianDB {
         let instance = GuardianDB {
             client,
             identity: Arc::new(RwLock::new(identity.clone())),
-            id: Arc::new(RwLock::new(own_node_id)), // NodeId do IrohBackend
+            id: Arc::new(RwLock::new(own_node_id)), // EndpointId do IrohBackend
             pubsub: options.pubsub,
             cache: Arc::new(RwLock::new(cache)),
             directory,
@@ -610,9 +608,9 @@ impl GuardianDB {
         self.identity.read().clone()
     }
 
-    /// Retorna o NodeId da instância do GuardianDB.
-    /// `NodeId` implementa o trait `Copy`, então o valor é copiado, o que é muito eficiente.
-    pub fn node_id(&self) -> NodeId {
+    /// Retorna o EndpointId da instância do GuardianDB.
+    /// `EndpointId` implementa o trait `Copy`, então o valor é copiado, o que é muito eficiente.
+    pub fn node_id(&self) -> EndpointId {
         *self.id.read()
     }
 
@@ -683,11 +681,11 @@ impl GuardianDB {
     /// para iniciar a sincronização via exchange_heads.
     ///
     /// # Argumentos
-    /// * `peer_id` - NodeId do peer com quem sincronizar
+    /// * `peer_id` - EndpointId do peer com quem sincronizar
     ///
     /// # Retorna
     /// `Ok(())` se a sincronização foi iniciada com sucesso
-    pub async fn connect_to_peer(&self, peer_id: NodeId) -> Result<()> {
+    pub async fn connect_to_peer(&self, peer_id: EndpointId) -> Result<()> {
         tracing::info!(peer = %peer_id, "Establishing connection with peer");
 
         // PASSO 1: Estabelece conexão QUIC via gossip ALPN
@@ -1754,7 +1752,7 @@ impl GuardianDB {
             tracer: None, // Será configurado pela BaseStore
             pubsub,       // ***Verificar se o pubsub a ser usado é o EpidemicPubSub ou RawPubSub
             message_marshaler: Some(self.message_marshaler.clone()),
-            node_id: *self.id.read(), // NodeId da instância GuardianDB
+            node_id: *self.id.read(), // EndpointId da instância GuardianDB
             direct_channel: Some(self.direct_channel.clone()),
             close_func: None,
             store_specific_opts: None,
@@ -2684,7 +2682,7 @@ impl GuardianDB {
         // ETAPA 4: Verificação adicional de consistência da chave pública
         if let Some(_public_key) = identity.public_key() {
             // A chave pública já foi validada via Ed25519 acima
-            // NodeId do Iroh é derivado diretamente da chave pública Ed25519
+            // EndpointId do Iroh é derivado diretamente da chave pública Ed25519
             tracing::debug!(
                 identity_id = %identity.id(),
                 "Identity cryptographic verification completed successfully"

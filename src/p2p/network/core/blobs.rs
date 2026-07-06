@@ -8,7 +8,7 @@
 use crate::guardian::error::{GuardianError, Result};
 use bytes::Bytes;
 use futures::StreamExt;
-use iroh::NodeId;
+use iroh::EndpointId;
 use iroh::endpoint::Endpoint;
 use iroh_blobs::{Hash as BlobHash, HashAndFormat, store::fs::FsStore};
 use std::sync::Arc;
@@ -126,7 +126,7 @@ impl BlobStore {
     /// Se o blob não existe no store local e um peer provider é fornecido,
     /// tenta baixar do peer remoto usando o protocolo iroh-blobs.
     #[instrument(level = "debug", skip(self))]
-    pub async fn get_or_download(&self, hash: &BlobHash, providers: &[NodeId]) -> Result<Bytes> {
+    pub async fn get_or_download(&self, hash: &BlobHash, providers: &[EndpointId]) -> Result<Bytes> {
         // Tenta buscar localmente primeiro
         let store = self.store.read().await;
         match store.blobs().get_bytes(*hash).await {
@@ -175,7 +175,7 @@ impl BlobStore {
 
     /// Baixa um blob de peers remotos usando o Downloader do iroh-blobs
     #[instrument(level = "debug", skip(self))]
-    pub async fn download_from_peers(&self, hash: &BlobHash, providers: &[NodeId]) -> Result<()> {
+    pub async fn download_from_peers(&self, hash: &BlobHash, providers: &[EndpointId]) -> Result<()> {
         let endpoint = self.endpoint.as_ref().ok_or_else(|| {
             GuardianError::Other("Endpoint não disponível para download P2P de blobs".to_string())
         })?;
@@ -189,7 +189,7 @@ impl BlobStore {
         let store = self.store.read().await;
         let downloader = store.downloader(endpoint);
 
-        let providers_vec: Vec<NodeId> = providers.to_vec();
+        let providers_vec: Vec<EndpointId> = providers.to_vec();
         info!(
             "Iniciando download P2P do blob {} de {} provider(s)",
             hex::encode(hash.as_bytes()),

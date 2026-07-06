@@ -3,7 +3,7 @@
 /// Gerenciamento inteligente de conexões P2P com load balancing,
 /// circuit breaking e recuperação automática para maximizar throughput.
 use crate::guardian::error::{GuardianError, Result};
-use iroh::{NodeAddr, NodeId};
+use iroh::{EndpointAddr, EndpointId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -14,9 +14,9 @@ use tracing::{debug, error, info, instrument, warn};
 /// Pool de conexões otimizado para P2P
 pub struct OptimizedConnectionPool {
     /// Conexões ativas por peer
-    active_connections: Arc<RwLock<HashMap<NodeId, ConnectionInfo>>>,
+    active_connections: Arc<RwLock<HashMap<EndpointId, ConnectionInfo>>>,
     /// Pool de conexões disponíveis
-    connection_pool: Arc<RwLock<HashMap<NodeId, Vec<PooledConnection>>>>,
+    connection_pool: Arc<RwLock<HashMap<EndpointId, Vec<PooledConnection>>>>,
     /// Semáforo para controle de concorrência
     connection_semaphore: Arc<Semaphore>,
     /// Configuração do pool
@@ -24,7 +24,7 @@ pub struct OptimizedConnectionPool {
     /// Estatísticas de performance
     stats: Arc<RwLock<PoolStats>>,
     /// Circuit breakers por peer
-    circuit_breakers: Arc<RwLock<HashMap<NodeId, CircuitBreaker>>>,
+    circuit_breakers: Arc<RwLock<HashMap<EndpointId, CircuitBreaker>>>,
     /// Monitor de saúde das conexões
     health_monitor: Arc<RwLock<HealthMonitor>>,
     /// Canal para eventos de conexão
@@ -36,8 +36,8 @@ pub struct OptimizedConnectionPool {
 pub struct ConnectionInfo {
     /// ID da conexão
     pub connection_id: String,
-    /// Endereço do peer (Iroh NodeAddr)
-    pub peer_address: NodeAddr,
+    /// Endereço do peer (Iroh EndpointAddr)
+    pub peer_address: EndpointAddr,
     /// Timestamp da conexão
     pub connected_at: Instant,
     /// Último uso
@@ -164,12 +164,12 @@ pub enum CircuitState {
 #[derive(Debug)]
 pub struct HealthMonitor {
     /// Métricas de saúde por peer
-    peer_health: HashMap<NodeId, PeerHealthMetrics>,
+    peer_health: HashMap<EndpointId, PeerHealthMetrics>,
     /// Última verificação de saúde
     #[allow(dead_code)]
     last_health_check: Instant,
     /// Peers marcados como problemáticos
-    unhealthy_peers: HashMap<NodeId, Instant>,
+    unhealthy_peers: HashMap<EndpointId, Instant>,
 }
 
 /// Métricas de saúde de um peer
@@ -193,17 +193,17 @@ pub struct PeerHealthMetrics {
 #[derive(Debug, Clone)]
 pub enum ConnectionEvent {
     /// Nova conexão estabelecida
-    Connected { node_id: NodeId, latency_ms: f64 },
+    Connected { node_id: EndpointId, latency_ms: f64 },
     /// Conexão perdida
-    Disconnected { node_id: NodeId, reason: String },
+    Disconnected { node_id: EndpointId, reason: String },
     /// Conexão degradada
-    Degraded { node_id: NodeId, health_score: f64 },
+    Degraded { node_id: EndpointId, health_score: f64 },
     /// Conexão recuperada
-    Recovered { node_id: NodeId },
+    Recovered { node_id: EndpointId },
     /// Circuit breaker ativado
-    CircuitBreakerOpen { node_id: NodeId },
+    CircuitBreakerOpen { node_id: EndpointId },
     /// Circuit breaker fechado
-    CircuitBreakerClosed { node_id: NodeId },
+    CircuitBreakerClosed { node_id: EndpointId },
 }
 
 impl Default for PoolConfig {
@@ -248,7 +248,7 @@ impl OptimizedConnectionPool {
 
     /// Obtém ou cria uma conexão otimizada para um peer
     #[instrument(skip(self))]
-    pub async fn get_connection(&self, node_id: NodeId, address: NodeAddr) -> Result<String> {
+    pub async fn get_connection(&self, node_id: EndpointId, address: EndpointAddr) -> Result<String> {
         // Verifica circuit breaker
         if !self.check_circuit_breaker(node_id).await? {
             return Err(GuardianError::Other(format!(
@@ -275,7 +275,7 @@ impl OptimizedConnectionPool {
     }
 
     /// Tenta reutilizar conexão existente do pool
-    async fn try_reuse_connection(&self, node_id: NodeId) -> Result<Option<String>> {
+    async fn try_reuse_connection(&self, node_id: EndpointId) -> Result<Option<String>> {
         let mut pool = self.connection_pool.write().await;
 
         if let Some(connections) = pool.get_mut(&node_id) {
@@ -305,7 +305,7 @@ impl OptimizedConnectionPool {
     }
 
     /// Estabelece nova conexão com otimizações
-    async fn establish_new_connection(&self, node_id: NodeId, address: NodeAddr) -> Result<String> {
+    async fn establish_new_connection(&self, node_id: EndpointId, address: EndpointAddr) -> Result<String> {
         let connection_start = Instant::now();
         let connection_id = format!("conn_{}_{}", node_id, uuid::Uuid::new_v4());
 
@@ -397,7 +397,7 @@ impl OptimizedConnectionPool {
     }
 
     /// Estabelece conexão com peer usando Iroh
-    async fn establish_connection(&self, node_id: NodeId, address: NodeAddr) -> Result<f64> {
+    async fn establish_connection(&self, node_id: EndpointId, address: EndpointAddr) -> Result<f64> {
         let connection_start = Instant::now();
 
         debug!(
@@ -405,7 +405,7 @@ impl OptimizedConnectionPool {
             node_id, address
         );
 
-        // Valida o endereço NodeAddr
+        // Valida o endereço EndpointAddr
         if !self.validate_node_addr(&address) {
             return Err(GuardianError::Other(format!(
                 "Endereço inválido: {:?}",
@@ -449,20 +449,20 @@ impl OptimizedConnectionPool {
         }
     }
 
-    /// Valida se o endereço NodeAddr é válido e acessível
-    fn validate_node_addr(&self, address: &NodeAddr) -> bool {
-        // NodeAddr do Iroh contém node_id, relay_url (opcional) e direct_addresses
+    /// Valida se o endereço EndpointAddr é válido e acessível
+    fn validate_node_addr(&self, address: &EndpointAddr) -> bool {
+        // EndpointAddr do Iroh contém node_id, relay_url (opcional) e direct_addresses
         // Valida se tem pelo menos um endereço direto ou relay
-        address.direct_addresses().count() > 0 || address.relay_url().is_some()
+        address.ip_addrs().count() > 0 || address.relay_urls().next().is_some()
     }
 
     /// Mede latência fazendo ping para o endereço
-    async fn measure_peer_latency(&self, address: &NodeAddr) -> Result<f64> {
+    async fn measure_peer_latency(&self, address: &EndpointAddr) -> Result<f64> {
         // Tenta primeiro os endereços diretos
-        for socket_addr in address.direct_addresses() {
+        for socket_addr in address.ip_addrs() {
             let start_time = Instant::now();
 
-            match tokio::net::TcpStream::connect(socket_addr).await {
+            match tokio::net::TcpStream::connect(*socket_addr).await {
                 Ok(_stream) => {
                     let latency = start_time.elapsed();
                     return Ok(latency.as_millis() as f64);
@@ -483,8 +483,8 @@ impl OptimizedConnectionPool {
     /// Executa handshake de conexão com o peer
     async fn perform_connection_handshake(
         &self,
-        node_id: NodeId,
-        address: &NodeAddr,
+        node_id: EndpointId,
+        address: &EndpointAddr,
     ) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -493,7 +493,7 @@ impl OptimizedConnectionPool {
         let handshake_start = Instant::now();
 
         // Obtém o primeiro endereço direto disponível
-        let socket_addr = address.direct_addresses().next().ok_or_else(|| {
+        let socket_addr = address.ip_addrs().next().ok_or_else(|| {
             GuardianError::Other("Nenhum endereço direto disponível para handshake".to_string())
         })?;
         let socket_addr = *socket_addr;
@@ -597,18 +597,18 @@ impl OptimizedConnectionPool {
         }
         offset += protocol_version.len();
 
-        // Extrai e valida NodeId do peer (32 bytes)
+        // Extrai e valida EndpointId do peer (32 bytes)
         let received_node_id_bytes: [u8; 32] = response_buf[offset..offset + 32]
             .try_into()
-            .map_err(|_| GuardianError::Other("NodeId inválido recebido".to_string()))?;
-        let received_node_id = NodeId::from_bytes(&received_node_id_bytes)
-            .map_err(|e| GuardianError::Other(format!("Falha ao converter NodeId: {}", e)))?;
+            .map_err(|_| GuardianError::Other("EndpointId inválido recebido".to_string()))?;
+        let received_node_id = EndpointId::from_bytes(&received_node_id_bytes)
+            .map_err(|e| GuardianError::Other(format!("Falha ao converter EndpointId: {}", e)))?;
         offset += 32;
 
-        // Verifica se o NodeId bate
+        // Verifica se o EndpointId bate
         if received_node_id != node_id {
             return Err(GuardianError::Other(format!(
-                "NodeId mismatch: esperado {}, recebido {}",
+                "EndpointId mismatch: esperado {}, recebido {}",
                 node_id, received_node_id
             )));
         }
@@ -686,7 +686,7 @@ impl OptimizedConnectionPool {
     }
 
     /// Verifica estado do circuit breaker
-    async fn check_circuit_breaker(&self, node_id: NodeId) -> Result<bool> {
+    async fn check_circuit_breaker(&self, node_id: EndpointId) -> Result<bool> {
         let circuit_breakers = self.circuit_breakers.read().await;
 
         if let Some(breaker) = circuit_breakers.get(&node_id) {
@@ -723,7 +723,7 @@ impl OptimizedConnectionPool {
     }
 
     /// Registra sucesso para circuit breaker
-    async fn record_success(&self, node_id: NodeId) {
+    async fn record_success(&self, node_id: EndpointId) {
         let mut breakers = self.circuit_breakers.write().await;
 
         if let Some(breaker) = breakers.get_mut(&node_id) {
@@ -756,7 +756,7 @@ impl OptimizedConnectionPool {
     }
 
     /// Registra falha para circuit breaker
-    async fn record_failure(&self, node_id: NodeId) {
+    async fn record_failure(&self, node_id: EndpointId) {
         let mut breakers = self.circuit_breakers.write().await;
 
         let breaker = breakers.entry(node_id).or_insert_with(|| CircuitBreaker {
@@ -789,7 +789,7 @@ impl OptimizedConnectionPool {
     }
 
     /// Libera uma conexão de volta para o pool
-    pub async fn release_connection(&self, node_id: NodeId, connection_id: String) -> Result<()> {
+    pub async fn release_connection(&self, node_id: EndpointId, connection_id: String) -> Result<()> {
         let mut pool = self.connection_pool.write().await;
 
         if let Some(connections) = pool.get_mut(&node_id) {
@@ -898,9 +898,9 @@ impl OptimizedConnectionPool {
 
     /// Executa health check de uma conexão
     async fn perform_health_check(connection_info: &ConnectionInfo) -> f64 {
-        // Tenta fazer ping para verificar conectividade usando endereços diretos do NodeAddr
+        // Tenta fazer ping para verificar conectividade usando endereços diretos do EndpointAddr
         let connectivity_score =
-            if let Some(socket_addr) = connection_info.peer_address.direct_addresses().next() {
+            if let Some(socket_addr) = connection_info.peer_address.ip_addrs().next() {
                 let socket_addr = *socket_addr;
                 let ping_start = Instant::now();
 

@@ -4,7 +4,7 @@
 // Foca em iroh-blobs (armazenamento) e iroh-gossip (pubsub).
 // Usa discovery via Pkarr/DNS/mDNS.
 
-use iroh::NodeId;
+use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -22,7 +22,7 @@ pub struct ClientConfig {
     pub port: u16,
 
     /// Peers conhecidos para conectar inicialmente
-    pub known_peers: Vec<NodeId>,
+    pub known_peers: Vec<EndpointId>,
 
     /// Habilita descoberta via n0.computer (Pkarr + DNS)
     pub enable_discovery_n0: bool,
@@ -113,7 +113,7 @@ impl ClientConfig {
     }
 
     /// Adiciona um peer conhecido para conexão inicial
-    pub fn add_known_peer(&mut self, peer: NodeId) {
+    pub fn add_known_peer(&mut self, peer: EndpointId) {
         if !self.known_peers.contains(&peer) {
             self.known_peers.push(peer);
         }
@@ -420,10 +420,10 @@ mod tests {
     #[test]
     fn test_add_known_peer() {
         use iroh::SecretKey;
-        use rand_core::OsRng;
+        use rand::rngs::OsRng;
 
         let mut config = ClientConfig::default();
-        let secret = SecretKey::generate(OsRng);
+        let secret = SecretKey::generate();
         let peer = secret.public();
 
         config.add_known_peer(peer);

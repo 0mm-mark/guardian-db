@@ -10,7 +10,7 @@ use crate::p2p::EventBus;
 use crate::p2p::network::client::IrohClient;
 use crate::stores::{operation::Operation, replicator::replication_info::ReplicationInfo};
 use futures::stream::Stream;
-use iroh::NodeId;
+use iroh::EndpointId;
 use iroh_blobs::Hash;
 use opentelemetry::global::{BoxedSpan, BoxedTracer};
 use opentelemetry::trace::{Tracer, noop::NoopTracer};
@@ -886,8 +886,8 @@ pub struct NewStoreOptions {
     pub sort_fn: Option<SortFn>,
 
     // === NETWORKING & P2P ===
-    /// Identificador único do peer na rede P2P (usando NodeId do Iroh)
-    pub node_id: NodeId,
+    /// Identificador único do peer na rede P2P (usando EndpointId do Iroh)
+    pub node_id: EndpointId,
 
     /// Interface PubSub para comunicação distribuída
     pub pubsub: Option<Arc<dyn PubSubInterface<Error = GuardianError>>>,
@@ -937,7 +937,7 @@ pub struct NewStoreOptions {
 
 impl Default for NewStoreOptions {
     fn default() -> Self {
-        let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
+        let node_id = EndpointId::from_bytes(&[0u8; 32]).unwrap();
 
         Self {
             event_bus: None,
@@ -975,10 +975,10 @@ pub trait DirectChannel: Send + Sync + std::any::Any {
     type Error: Error + Send + Sync + 'static;
 
     /// Espera até que a conexão com o outro par seja estabelecida.
-    async fn connect(&mut self, peer: NodeId) -> Result<(), Self::Error>;
+    async fn connect(&mut self, peer: EndpointId) -> Result<(), Self::Error>;
 
     /// Envia dados para o outro par.
-    async fn send(&mut self, peer: NodeId, data: Vec<u8>) -> Result<(), Self::Error>;
+    async fn send(&mut self, peer: EndpointId, data: Vec<u8>) -> Result<(), Self::Error>;
 
     /// Fecha a conexão.
     async fn close(&mut self) -> Result<(), Self::Error>;
@@ -996,7 +996,7 @@ pub trait DirectChannel: Send + Sync + std::any::Any {
 #[derive(Debug, Clone)]
 pub struct EventPubSubPayload {
     pub payload: Vec<u8>,
-    pub peer: NodeId,
+    pub peer: EndpointId,
 }
 
 /// Uma trait usada para emitir eventos recebidos de um `DirectChannel`.
@@ -1073,8 +1073,8 @@ pub trait PubSubTopic: Send + Sync {
     /// Publica uma nova mensagem no tópico.
     async fn publish(&self, message: Vec<u8>) -> Result<(), Self::Error>;
 
-    /// Lista os pares (peers) conectados a este tópico usando NodeId do Iroh.
-    async fn peers(&self) -> Result<Vec<iroh::NodeId>, Self::Error>;
+    /// Lista os pares (peers) conectados a este tópico usando EndpointId do Iroh.
+    async fn peers(&self) -> Result<Vec<iroh::EndpointId>, Self::Error>;
 
     /// Observa os pares que entram e saem do tópico.
     async fn watch_peers(
@@ -1121,6 +1121,6 @@ pub struct PubSubSubscriptionOptions {
 /// em um tópico do canal Pub/Sub.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventPubSub {
-    Join { topic: String, peer: NodeId },
-    Leave { topic: String, peer: NodeId },
+    Join { topic: String, peer: EndpointId },
+    Leave { topic: String, peer: EndpointId },
 }

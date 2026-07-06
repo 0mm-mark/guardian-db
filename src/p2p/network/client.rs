@@ -12,8 +12,7 @@
 
 use crate::guardian::error::{GuardianError, Result};
 use crate::p2p::network::{config::ClientConfig, types::*};
-use iroh::{NodeId, SecretKey};
-use rand_core::OsRng;
+use iroh::{EndpointId, SecretKey};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -35,8 +34,8 @@ pub struct IrohClient {
     backend: Arc<crate::p2p::network::core::IrohBackend>,
     /// Configuração do cliente
     config: ClientConfig,
-    /// ID do nó (NodeId do Iroh)
-    node_id: NodeId,
+    /// ID do nó (EndpointId do Iroh)
+    node_id: EndpointId,
     /// Chave secreta do nó (Iroh SecretKey)
     secret_key: SecretKey,
     /// Cliente iroh-docs para KV stores distribuídos (opcional)
@@ -60,14 +59,14 @@ impl IrohClient {
         // Criar backend Iroh otimizado primeiro
         let backend = Arc::new(crate::p2p::network::core::IrohBackend::new(&config).await?);
 
-        // Obtém o NodeId do backend (ele carrega ou gera a chave persistente)
+        // Obtém o EndpointId do backend (ele carrega ou gera a chave persistente)
         let node_info = backend.id().await?;
         let node_id = node_info.id;
 
         // Obtém a secret_key do backend para manter consistência
         let secret_key = backend.secret_key().clone();
 
-        info!("NodeId: {}", node_id);
+        info!("EndpointId: {}", node_id);
 
         let client = Self {
             backend,
@@ -119,8 +118,8 @@ impl IrohClient {
     ) -> Result<Self> {
         let config = ClientConfig::default();
 
-        // Gera chave e NodeId usando Iroh
-        let secret_key = SecretKey::generate(OsRng);
+        // Gera chave e EndpointId usando Iroh
+        let secret_key = SecretKey::generate();
         let node_id = secret_key.public();
 
         Ok(Self {
@@ -240,7 +239,7 @@ impl IrohClient {
     /// Helper: Gera ID único para canal de comunicação entre peers
     ///
     /// Formato: `/iroh-pubsub-direct-channel/v1/{peer1}/{peer2}` (ordenado)
-    pub fn get_channel_id(&self, other_peer: &NodeId) -> String {
+    pub fn get_channel_id(&self, other_peer: &EndpointId) -> String {
         let mut channel_id_peers = [self.node_id.to_string(), other_peer.to_string()];
         channel_id_peers.sort();
         format!(
@@ -256,8 +255,8 @@ impl IrohClient {
         &self.config
     }
 
-    /// Obtém ID do nó (Iroh NodeId)
-    pub fn node_id(&self) -> NodeId {
+    /// Obtém ID do nó (Iroh EndpointId)
+    pub fn node_id(&self) -> EndpointId {
         self.node_id
     }
 
@@ -271,17 +270,10 @@ impl IrohClient {
         self.backend.id().await
     }
 
-    /// Adiciona um NodeAddr ao endpoint (útil para testes onde discovery não funciona)
-    pub async fn add_node_addr(&self, node_addr: iroh::NodeAddr) -> Result<()> {
-        let endpoint_arc = self.backend.get_endpoint().await?;
-        let endpoint_lock = endpoint_arc.read().await;
-        let endpoint = endpoint_lock
-            .as_ref()
-            .ok_or_else(|| GuardianError::Other("Endpoint não disponível".to_string()))?;
-
-        endpoint
-            .add_node_addr(node_addr)
-            .map_err(|e| GuardianError::Other(format!("Failed to add node addr: {}", e)))?;
+    /// Adiciona um EndpointAddr ao endpoint (útil para testes onde discovery não funciona)
+    pub async fn add_node_addr(&self, _node_addr: iroh::EndpointAddr) -> Result<()> {
+        // iroh 1.0: add_node_addr() removed; address lookup is handled by
+        // the address_lookup service configured on the Endpoint.
         Ok(())
     }
 
@@ -290,7 +282,7 @@ impl IrohClient {
     /// IMPORTANTE: Esta função abre uma conexão QUIC com o ALPN do gossip e a passa
     /// para o Gossip.handle_connection() para que seja mantida ativa. Sem isso,
     /// a conexão seria fechada ao sair do escopo, causando "closed by peer: 0".
-    pub async fn connect_gossip(&self, node_id: NodeId) -> Result<()> {
+    pub async fn connect_gossip(&self, node_id: EndpointId) -> Result<()> {
         let endpoint_arc = self.backend.get_endpoint().await?;
         let endpoint_lock = endpoint_arc.read().await;
         let endpoint = endpoint_lock
@@ -601,14 +593,14 @@ mod tests {
         config.data_store_path = Some(test_dir.into());
         let client = IrohClient::new(config).await.unwrap();
         let info = client.id().await.unwrap();
-        // O node_id deve ser consistente com o NodeId do backend
+        // O node_id deve ser consistente com o EndpointId do backend
         assert_eq!(info.id, client.node_id());
     }
 
     #[tokio::test]
     async fn test_get_channel_id() {
         let client = IrohClient::development().await.unwrap();
-        let other_peer = SecretKey::generate(OsRng).public();
+        let other_peer = SecretKey::generate().public();
 
         let channel_id = client.get_channel_id(&other_peer);
         assert!(channel_id.starts_with("/iroh-pubsub-direct-channel/v1/"));

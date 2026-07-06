@@ -8,7 +8,7 @@ use crate::traits::{
 };
 use async_trait::async_trait;
 use futures::stream::StreamExt;
-use iroh::NodeId;
+use iroh::EndpointId;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -29,7 +29,7 @@ impl DirectChannel for Channels {
     /// com o peer já não existir, cria um novo tópico no pubsub, inscreve-se nele,
     /// e inicia uma tarefa em segundo plano (`monitor_topic`) para escutar por mensagens.
     #[instrument(level = "debug", skip(self))]
-    async fn connect(&mut self, target: NodeId) -> std::result::Result<(), Self::Error> {
+    async fn connect(&mut self, target: EndpointId) -> std::result::Result<(), Self::Error> {
         let id = self.get_channel_id(&target);
         let mut subs = self.subs.write().await;
 
@@ -82,7 +82,7 @@ impl DirectChannel for Channels {
     /// Publica uma mensagem (slice de bytes) no canal de comunicação P2P
     /// estabelecido com o peer `p` via iroh-gossip.
     #[instrument(level = "debug", skip(self, head))]
-    async fn send(&mut self, p: NodeId, head: Vec<u8>) -> std::result::Result<(), Self::Error> {
+    async fn send(&mut self, p: EndpointId, head: Vec<u8>) -> std::result::Result<(), Self::Error> {
         // Obtém o tópico da subscrição ativa
         let topic = {
             let subs = self.subs.read().await;
@@ -154,8 +154,8 @@ struct SubscriptionInfo {
 // A struct principal que gerencia os canais
 #[derive(Clone)]
 pub struct Channels {
-    subs: Arc<RwLock<HashMap<NodeId, SubscriptionInfo>>>,
-    self_id: NodeId,
+    subs: Arc<RwLock<HashMap<EndpointId, SubscriptionInfo>>>,
+    self_id: EndpointId,
     emitter: Arc<dyn DirectChannelEmitter<Error = GuardianError> + Send + Sync>,
     epidemic_pubsub: Arc<EpidemicPubSub>,
     span: Span,
@@ -170,7 +170,7 @@ impl Channels {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn connect(&self, target: NodeId) -> Result<()> {
+    pub async fn connect(&self, target: EndpointId) -> Result<()> {
         let _entered = self.span.enter();
         let id = self.get_channel_id(&target);
         let mut subs = self.subs.write().await;
@@ -209,7 +209,7 @@ impl Channels {
     }
 
     #[instrument(level = "debug", skip(self, head))]
-    pub async fn send(&self, p: NodeId, head: &[u8]) -> Result<()> {
+    pub async fn send(&self, p: EndpointId, head: &[u8]) -> Result<()> {
         let _entered = self.span.enter();
 
         // Obtém o tópico da subscrição ativa
@@ -232,7 +232,7 @@ impl Channels {
     }
 
     #[instrument(level = "debug", skip(self))]
-    async fn wait_for_peers(&self, other_peer: NodeId, channel_id: &str) -> Result<()> {
+    async fn wait_for_peers(&self, other_peer: EndpointId, channel_id: &str) -> Result<()> {
         // Com iroh-gossip, os peers são descobertos automaticamente via Epidemic Broadcast Trees.
         // O protocolo gossip propaga mensagens mesmo sem peers imediatamente visíveis.
 
@@ -247,7 +247,7 @@ impl Channels {
     // Implementa lógica pura e determinística para criar IDs de canais one-on-one.
     // Garante que o mesmo ID seja gerado independente da ordem dos peers.
     #[instrument(level = "debug", skip(self))]
-    fn get_channel_id(&self, p: &NodeId) -> String {
+    fn get_channel_id(&self, p: &EndpointId) -> String {
         let mut channel_id_peers = [self.self_id.to_string(), p.to_string()];
         channel_id_peers.sort();
         format!("/{}/{}", PROTOCOL, channel_id_peers.join("/"))
@@ -257,7 +257,7 @@ impl Channels {
     async fn monitor_topic(
         &self,
         topic: Arc<dyn PubSubTopic<Error = GuardianError>>,
-        p: NodeId,
+        p: EndpointId,
         token: CancellationToken, // Recebe o token (filho)
     ) {
         // Obtém stream de mensagens do tópico via iroh-gossip

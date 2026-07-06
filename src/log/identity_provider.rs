@@ -2,7 +2,7 @@ use crate::guardian::error::Result;
 use crate::log::identity::Identity;
 use async_trait::async_trait;
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
-use iroh::{NodeId, SecretKey};
+use iroh::{EndpointId, SecretKey};
 use std::sync::Arc;
 
 /// Opções para criar uma identidade.
@@ -58,9 +58,8 @@ impl Default for GuardianDBIdentityProvider {
 
 impl GuardianDBIdentityProvider {
     pub fn new() -> Self {
-        use rand_core::OsRng;
         Self {
-            secret_key: SecretKey::generate(OsRng),
+            secret_key: SecretKey::generate(),
             provider_type: "GuardianDB".to_string(),
         }
     }
@@ -72,7 +71,7 @@ impl GuardianDBIdentityProvider {
         }
     }
 
-    pub fn public_key(&self) -> NodeId {
+    pub fn public_key(&self) -> EndpointId {
         self.secret_key.public()
     }
 
@@ -91,7 +90,7 @@ impl GuardianDBIdentityProvider {
 #[async_trait]
 impl IdentityProvider for GuardianDBIdentityProvider {
     async fn get_id(&self, _opts: &CreateIdentityOptions) -> Result<String> {
-        // Retorna o NodeId como string
+        // Retorna o EndpointId como string
         let node_id = self.secret_key.public();
         Ok(node_id.to_string())
     }

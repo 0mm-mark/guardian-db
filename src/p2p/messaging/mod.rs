@@ -4,7 +4,7 @@ use crate::p2p;
 use crate::p2p::network::core::gossip::EpidemicPubSub;
 use crate::traits::{EventPubSubMessage, PubSubInterface, PubSubTopic, TracerWrapper};
 use futures::Stream;
-use iroh::NodeId;
+use iroh::EndpointId;
 use opentelemetry::trace::noop::NoopTracer;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -27,7 +27,7 @@ pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024; // 1MB
 pub struct CoreApiPubSub {
     pub epidemic_pubsub: Arc<EpidemicPubSub>,
     pub span: Span,
-    pub id: NodeId,
+    pub id: EndpointId,
     pub poll_interval: Duration,
     pub tracer: Arc<TracerWrapper>,
     topics: Mutex<HashMap<String, Arc<PsTopic>>>,
@@ -93,7 +93,7 @@ pub struct PsTopic {
     ps: Arc<CoreApiPubSub>,
     /// Tópico do EpidemicPubSub para comunicação P2P
     inner_topic: Arc<dyn PubSubTopic<Error = GuardianError>>,
-    members: RwLock<Vec<NodeId>>,
+    members: RwLock<Vec<EndpointId>>,
     /// Token para cancelamento gracioso das operações deste tópico
     cancellation_token: CancellationToken,
 }
@@ -125,26 +125,26 @@ impl PsTopic {
     }
 
     #[instrument(level = "debug", skip(self))]
-    pub async fn peers(&self) -> crate::guardian::error::Result<Vec<NodeId>> {
+    pub async fn peers(&self) -> crate::guardian::error::Result<Vec<EndpointId>> {
         // Obtém peers do tópico via iroh-gossip
         self.inner_topic.peers().await
     }
 
     // Calcula diferença de peers (joining/leaving) via iroh-gossip
     #[instrument(level = "debug", skip(self))]
-    pub async fn peers_diff(&self) -> crate::guardian::error::Result<(Vec<NodeId>, Vec<NodeId>)> {
+    pub async fn peers_diff(&self) -> crate::guardian::error::Result<(Vec<EndpointId>, Vec<EndpointId>)> {
         let current_peers = self.inner_topic.peers().await?;
         let mut members_guard = self.members.write().await;
 
         // Identifica peers que entraram
-        let joining: Vec<NodeId> = current_peers
+        let joining: Vec<EndpointId> = current_peers
             .iter()
             .filter(|peer| !members_guard.contains(peer))
             .copied()
             .collect();
 
         // Identifica peers que saíram
-        let leaving: Vec<NodeId> = members_guard
+        let leaving: Vec<EndpointId> = members_guard
             .iter()
             .filter(|peer| !current_peers.contains(peer))
             .copied()
@@ -305,7 +305,7 @@ impl PubSubTopic for PsTopic {
     }
 
     #[instrument(level = "debug", skip(self))]
-    async fn peers(&self) -> crate::guardian::error::Result<Vec<NodeId>> {
+    async fn peers(&self) -> crate::guardian::error::Result<Vec<EndpointId>> {
         self.peers().await
     }
 
@@ -431,7 +431,7 @@ impl CoreApiPubSub {
     #[instrument(level = "debug", skip(epidemic_pubsub, span, tracer))]
     pub fn new(
         epidemic_pubsub: Arc<EpidemicPubSub>,
-        id: NodeId,
+        id: EndpointId,
         poll_interval: Duration,
         span: Option<Span>,
         tracer: Option<Arc<TracerWrapper>>,

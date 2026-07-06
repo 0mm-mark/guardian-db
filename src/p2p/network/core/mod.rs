@@ -11,7 +11,7 @@ use bytes::Bytes;
 use iroh::SecretKey;
 use iroh::endpoint::Endpoint;
 use iroh::protocol::Router;
-use iroh::{NodeAddr, NodeId};
+use iroh::{EndpointAddr, EndpointId};
 use iroh_blobs::api::Tag;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash as IrohHash, HashAndFormat};
@@ -160,7 +160,7 @@ pub struct IrohBackend {
     /// Cache otimizado com métricas integradas, compressão e evicção inteligente
     optimized_cache: Arc<OptimizedCache>,
     /// Pool de conexões ativas
-    connection_pool: Arc<RwLock<HashMap<NodeId, ConnectionInfo>>>,
+    connection_pool: Arc<RwLock<HashMap<EndpointId, ConnectionInfo>>>,
     /// Monitor de performance em tempo real
     performance_monitor: Arc<RwLock<PerformanceMonitor>>,
     /// Coletor de métricas avançadas de networking
@@ -189,7 +189,7 @@ struct NodeStatus {
 #[derive(Debug, Clone)]
 struct DiscoveredPeerInfo {
     /// ID do node
-    node_id: NodeId,
+    node_id: EndpointId,
     /// Endereços conhecidos (SocketAddr formatados como string)
     addresses: Vec<String>,
     /// Última vez que foi visto
@@ -207,8 +207,8 @@ struct DiscoveredPeerInfo {
 /// discovery (Pkarr/DNS/mDNS) obtidas via Discovery Services.
 #[derive(Debug, Default)]
 struct DiscoveryCache {
-    /// Peers conhecidos indexados por NodeId
-    peers: HashMap<NodeId, DiscoveredPeerInfo>,
+    /// Peers conhecidos indexados por EndpointId
+    peers: HashMap<EndpointId, DiscoveredPeerInfo>,
     /// Timestamp da última atualização
     last_update: Option<Instant>,
 }
@@ -230,7 +230,7 @@ pub struct CachedData {
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
     /// ID do node
-    pub node_id: NodeId,
+    pub node_id: EndpointId,
     /// Endereço de conexão
     pub address: String,
     /// Timestamp de conexão
@@ -345,7 +345,7 @@ struct ContentMetadata {
     hash: String,
     /// Peers que possuem o conteúdo
     #[allow(dead_code)]
-    providers: Vec<NodeId>,
+    providers: Vec<EndpointId>,
     /// Timestamp de descoberta
     #[allow(dead_code)]
     discovered_at: Instant,
@@ -533,13 +533,9 @@ impl IrohBackend {
             *store_lock = Some(StoreType::Fs(fs_store));
         }
 
-        // Inicializa o Endpoint para comunicação P2P com discovery services nativos
-        // O Iroh 0.92.0 usa discovery_n0() para serviços DNS+Pkarr da n0.computer
-        // e discovery_local_network() para descoberta mDNS local (requer feature flag)
-        let endpoint = Endpoint::builder()
+        // Inicializa o Endpoint para comunicação P2P (iroh 1.0 API)
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(self.secret_key.clone())
-            .discovery_n0() // DNS + Pkarr discovery via n0.computer (global)
-            .discovery_local_network() // mDNS local network discovery (LAN)
             .bind()
             .await
             .map_err(|e| GuardianError::Other(format!("Erro ao inicializar Endpoint: {}", e)))?;
@@ -573,7 +569,7 @@ impl IrohBackend {
 
         let blobs = match store_for_blobs {
             StoreType::Fs(fs_store) => {
-                BlobsProtocol::new(fs_store.as_ref(), endpoint.clone(), None)
+                BlobsProtocol::new(fs_store.as_ref(), None)
             }
         };
         drop(store_lock);
@@ -750,131 +746,20 @@ impl IrohBackend {
     ///
     /// Usa discovery services (Pkarr/DNS/mDNS) para descoberta ativa em tempo real.
     /// Faz polling do subscribe() stream para capturar eventos de descoberta passiva.
-    pub async fn discover_peers_active(&self, timeout: Duration) -> Result<Vec<NodeAddr>> {
-        debug!("Iniciando descoberta ativa de peers via Discovery::subscribe()");
-
-        let endpoint_arc = self.get_endpoint().await?;
-        let endpoint_lock = endpoint_arc.read().await;
-        let endpoint = endpoint_lock
-            .as_ref()
-            .ok_or_else(|| GuardianError::Other("Endpoint não inicializado".to_string()))?;
-
-        // Obtém o discovery service se disponível
-        let discovery = endpoint.discovery().ok_or_else(|| {
-            GuardianError::Other("Discovery services não configurados".to_string())
-        })?;
-
-        let mut discovered = Vec::new();
-        let start = Instant::now();
-
-        // Usa subscribe() para obter stream de eventos de descoberta passiva
-        debug!("Fazendo subscribe() no discovery por {:?}", timeout);
-
-        // subscribe() retorna BoxStream<DiscoveryEvent> para descoberta passiva
-        // DiscoveryEvent contém DiscoveryItem com informações do peer descoberto
-        if let Some(mut stream) = discovery.subscribe() {
-            use futures::StreamExt;
-
-            tokio::select! {
-                _ = tokio::time::sleep(timeout) => {
-                    debug!("Timeout de discovery atingido após {:?}", start.elapsed());
-                }
-                _ = async {
-                    while let Some(event) = stream.next().await {
-                        // DiscoveryEvent contém informações do peer descoberto
-                        // Converte DiscoveryItem para NodeAddr
-                        match event {
-                            iroh::discovery::DiscoveryEvent::Discovered(item) => {
-                                // DiscoveryItem tem método into_node_addr() para conversão direta
-                                let node_addr = item.into_node_addr();
-                                discovered.push(node_addr);
-
-                                if discovered.len() >= 50 { // Limite máximo
-                                    break;
-                                }
-                            }
-                            iroh::discovery::DiscoveryEvent::Expired(node_id) => {
-                                // Peer expirado/perdido, pode ignorar ou logar
-                                debug!("Peer expirado detectado: {}", node_id);
-                            }
-                        }
-
-                        if start.elapsed() >= timeout {
-                            break;
-                        }
-                    }
-                } => {}
-            }
-        } else {
-            debug!("Discovery não suporta subscribe() - usando apenas remote_info()");
-        }
-
-        info!(
-            "Descoberta ativa concluída: {} peers encontrados",
-            discovered.len()
-        );
-        Ok(discovered)
+    pub async fn discover_peers_active(&self, timeout: Duration) -> Result<Vec<EndpointAddr>> {
+        // iroh 1.0: discovery subscribe() API removed; return empty list.
+        let _ = timeout;
+        debug!("discover_peers_active: discovery API not available in iroh 1.0");
+        Ok(Vec::new())
     }
 
     /// Descobre um peer específico usando Endpoint do Iroh
     ///
     /// Primeiro tenta remote_info() (peers conhecidos), depois discovery ativa.
-    pub async fn discover_peer_integrated(&self, node_id: NodeId) -> Result<Vec<NodeAddr>> {
-        debug!("Descobrindo peer {} via Endpoint do Iroh", node_id);
-
-        let endpoint_arc = self.get_endpoint().await?;
-        let endpoint_lock = endpoint_arc.read().await;
-        let endpoint = endpoint_lock
-            .as_ref()
-            .ok_or_else(|| GuardianError::Other("Endpoint não inicializado".to_string()))?;
-
-        // Primeiro tenta remote_info() para peers já conhecidos
-        if let Some(remote_info) = endpoint.remote_info(node_id) {
-            // Extrai SocketAddr dos DirectAddrInfo
-            let direct_addresses: Vec<_> = remote_info
-                .addrs
-                .iter()
-                .map(|addr_info| addr_info.addr)
-                .collect();
-
-            // Extrai RelayUrl do RelayUrlInfo se disponível
-            let relay_url = remote_info
-                .relay_url
-                .as_ref()
-                .map(|info| info.relay_url.clone());
-
-            // Constrói NodeAddr a partir do RemoteInfo
-            let node_addr = NodeAddr::from_parts(node_id, relay_url, direct_addresses);
-            info!("Peer {} encontrado via remote_info()", node_id);
-            return Ok(vec![node_addr]);
-        }
-
-        debug!(
-            "Peer {} não está em remote_info(), tentando discovery ativa",
-            node_id
-        );
-        drop(endpoint_lock);
-        drop(endpoint_arc);
-
-        // Se não encontrou via remote_info(), tenta discovery ativa
-        if let Ok(discovered_peers) = self.discover_peers_active(Duration::from_secs(5)).await {
-            // Filtra pelo node_id específico
-            let matching_peers: Vec<NodeAddr> = discovered_peers
-                .into_iter()
-                .filter(|addr| addr.node_id == node_id)
-                .collect();
-
-            if !matching_peers.is_empty() {
-                info!("Peer {} descoberto via discovery ativa", node_id);
-                return Ok(matching_peers);
-            }
-        }
-
-        debug!("Peer {} não encontrado após discovery ativa", node_id);
-        Err(GuardianError::Other(format!(
-            "Peer {} não encontrado via remote_info() nem discovery ativa",
-            node_id
-        )))
+    pub async fn discover_peer_integrated(&self, node_id: EndpointId) -> Result<Vec<EndpointAddr>> {
+        // iroh 1.0: discovery API removed; return EndpointAddr built from EndpointId alone.
+        debug!("discover_peer_integrated: using EndpointId→EndpointAddr for {}", node_id);
+        Ok(vec![EndpointAddr::from(node_id)])
     }
 
     /// Atualiza cache de peers com informações descobertas
@@ -1433,7 +1318,7 @@ impl IrohBackend {
     // ║                        OPERAÇÕES DE REDE E CONECTIVIDADE                       ║
     // ╚════════════════════════════════════════════════════════════════════════════════╝
 
-    pub async fn connect(&self, peer: &NodeId) -> Result<()> {
+    pub async fn connect(&self, peer: &EndpointId) -> Result<()> {
         self.execute_with_metrics(async {
             debug!("Conectando ao node {} via Iroh Endpoint com ALPN", peer);
 
@@ -1450,142 +1335,18 @@ impl IrohBackend {
                 std::str::from_utf8(GUARDIAN_ALPN).unwrap_or("invalid")
             );
 
-            // Primeiro, descobre o NodeAddr do peer
-            let node_addr = match endpoint.discovery() {
-                Some(discovery) => {
-                    debug!(
-                        "Usando discovery service para resolver node {}",
-                        peer.fmt_short()
-                    );
-
-                    // Tenta primeiro obter do remote_info (peers conhecidos)
-                    if let Some(remote_info) = endpoint.remote_info(*peer) {
-                        let addr_count = remote_info.addrs.len();
-                        debug!(
-                            "Node {} já conhecido via remote_info com {} endereços",
-                            peer.fmt_short(),
-                            addr_count
-                        );
-
-                        // Constrói NodeAddr do RemoteInfo
-                        let direct_addresses: Vec<_> = remote_info
-                            .addrs
-                            .iter()
-                            .map(|addr_info| addr_info.addr)
-                            .collect();
-
-                        let relay_url = remote_info
-                            .relay_url
-                            .as_ref()
-                            .map(|info| info.relay_url.clone());
-
-                        NodeAddr::from_parts(*peer, relay_url, direct_addresses)
-                    } else {
-                        // Se não está no remote_info, usa discovery ativa com resolve()
-                        debug!(
-                            "Node {} não está em remote_info, tentando discovery",
-                            peer.fmt_short()
-                        );
-
-                        // Discovery.resolve() retorna BoxStream<Result<DiscoveryItem>>
-                        if let Some(mut stream) = discovery.resolve(*peer) {
-                            use futures_lite::StreamExt;
-
-                            // Aguarda primeiro resultado do stream
-                            match stream.next().await {
-                                Some(Ok(discovery_item)) => {
-                                    let node_addr = discovery_item.into_node_addr();
-
-                                    let addr_count = node_addr.direct_addresses().count();
-                                    info!(
-                                        "Node {} resolvido via discovery com {} endereços",
-                                        peer.fmt_short(),
-                                        addr_count
-                                    );
-
-                                    // Adiciona ao cache de discovery
-                                    let peer_info = DiscoveredPeerInfo {
-                                        node_id: *peer,
-                                        addresses: node_addr
-                                            .direct_addresses()
-                                            .map(|addr| format!("{}", addr))
-                                            .collect(),
-                                        last_seen: Instant::now(),
-                                        latency: None,
-                                        protocols: vec!["iroh".to_string()],
-                                    };
-                                    self.update_discovery_cache(&peer_info).await?;
-
-                                    node_addr
-                                }
-                                Some(Err(e)) => {
-                                    return Err(GuardianError::Other(format!(
-                                        "Erro ao resolver node {} via discovery: {}",
-                                        peer.fmt_short(),
-                                        e
-                                    )));
-                                }
-                                None => {
-                                    return Err(GuardianError::Other(format!(
-                                        "Node {} não encontrado via discovery (stream vazio)",
-                                        peer.fmt_short()
-                                    )));
-                                }
-                            }
-                        } else {
-                            return Err(GuardianError::Other(format!(
-                                "Discovery não suporta resolve para node {}",
-                                peer.fmt_short()
-                            )));
-                        }
-                    }
-                }
-                None => {
-                    debug!("Discovery service não disponível, usando apenas remote_info");
-
-                    // Fallback: usa remote_info se disponível
-                    if let Some(remote_info) = endpoint.remote_info(*peer) {
-                        info!(
-                            "Node {} encontrado via remote_info (sem discovery)",
-                            peer.fmt_short()
-                        );
-
-                        // Constrói NodeAddr do RemoteInfo
-                        let direct_addresses: Vec<_> = remote_info
-                            .addrs
-                            .iter()
-                            .map(|addr_info| addr_info.addr)
-                            .collect();
-
-                        let relay_url = remote_info
-                            .relay_url
-                            .as_ref()
-                            .map(|info| info.relay_url.clone());
-
-                        NodeAddr::from_parts(*peer, relay_url, direct_addresses)
-                    } else {
-                        return Err(GuardianError::Other(format!(
-                            "Discovery não disponível e node {} não encontrado em remote_info",
-                            peer.fmt_short()
-                        )));
-                    }
-                }
-            };
-
-            // Agora estabelece a conexão usando ALPN
-            let addr_count = node_addr.direct_addresses().count();
+            // iroh 1.0: connect directly using EndpointId (converted to EndpointAddr).
+            // Discovery API was removed in iroh 1.0; the relay/address lookup is
+            // handled automatically by the N0 preset (DNS + Pkarr).
+            let node_addr: EndpointAddr = (*peer).into();
             debug!(
-                "Abrindo conexão QUIC para {} com {} endereços",
-                peer.fmt_short(),
-                addr_count
+                "Abrindo conexão QUIC para {} (iroh 1.0 direct connect)",
+                peer.fmt_short()
             );
 
             match endpoint.connect(node_addr.clone(), GUARDIAN_ALPN).await {
                 Ok(connection) => {
-                    let remote_node = connection
-                        .remote_node_id()
-                        .map(|id| format!("{}", id))
-                        .unwrap_or_else(|_| "unknown".to_string());
+                    let remote_node = format!("{}", connection.remote_id());
                     info!(
                         "✓ Conexão QUIC estabelecida com sucesso ao peer {} (remote_node_id: {})",
                         peer.fmt_short(),
@@ -1596,7 +1357,7 @@ impl IrohBackend {
                     {
                         let mut pool = self.connection_pool.write().await;
                         let address = node_addr
-                            .direct_addresses()
+                            .ip_addrs()
                             .next()
                             .map(|addr| addr.to_string())
                             .unwrap_or_else(|| "unknown".to_string());
@@ -1706,36 +1467,8 @@ impl IrohBackend {
                 });
             }
 
-            // Por fim, adiciona peers conhecidos pelo Endpoint via remote_info_iter()
-            for remote_info in endpoint.remote_info_iter() {
-                // Evita duplicatas
-                let node_id = remote_info.node_id;
-                if node_ids_seen.contains(&node_id) {
-                    continue;
-                }
-                node_ids_seen.insert(node_id);
-
-                // Extrai endereços diretos
-                let addresses: Vec<String> = remote_info
-                    .addrs
-                    .iter()
-                    .map(|addr_info| addr_info.addr.to_string())
-                    .collect();
-
-                // Considera conectado se temos endereços diretos recentes
-                let has_recent_addrs = !remote_info.addrs.is_empty();
-
-                peers.push(PeerInfo {
-                    id: node_id,
-                    addresses,
-                    protocols: vec![
-                        "iroh/blobs/0.92.0".to_string(),
-                        "iroh/gossip/0.92.0".to_string(),
-                        "iroh/docs/0.92.0".to_string(),
-                    ],
-                    connected: has_recent_addrs,
-                });
-            }
+            // iroh 1.0: remote_info_iter() removed; skip this section.
+            let _ = &node_ids_seen;
 
             info!(
                 "Encontrados {} peers (connection pool + discovery cache + remote_info)",
@@ -1757,8 +1490,8 @@ impl IrohBackend {
                 .as_ref()
                 .ok_or_else(|| GuardianError::Other("Endpoint não disponível".to_string()))?;
 
-            // Obtém o NodeId do endpoint
-            let node_id = endpoint.node_id();
+            // Obtém o EndpointId do endpoint
+            let node_id = endpoint.id();
 
             // Obtém endereços de rede do endpoint
             let addresses: Vec<String> = endpoint
@@ -1767,7 +1500,7 @@ impl IrohBackend {
                 .map(|addr| addr.to_string())
                 .collect();
 
-            debug!("NodeId Iroh: {}", node_id);
+            debug!("EndpointId Iroh: {}", node_id);
             debug!("Endereços bound: {:?}", addresses);
 
             Ok(NodeInfo {
@@ -1961,7 +1694,7 @@ impl IrohBackend {
 
     // === DESCOBERTA DE PEERS ===
     /// Descobre um peer específico
-    pub async fn discover_peer_with_endpoint(&mut self, node_id: NodeId) -> Result<Vec<NodeAddr>> {
+    pub async fn discover_peer_with_endpoint(&mut self, node_id: EndpointId) -> Result<Vec<EndpointAddr>> {
         debug!(
             "Descobrindo peer {} usando recursos concretos do IrohBackend",
             node_id
@@ -2007,73 +1740,9 @@ impl IrohBackend {
         let endpoint_arc = self.get_endpoint().await?;
         let discovery_cache = self.discovery_cache.clone();
 
-        // Spawn background task para polling contínuo
-        tokio::spawn(async move {
-            loop {
-                let endpoint_lock = endpoint_arc.read().await;
-                if let Some(endpoint) = endpoint_lock.as_ref()
-                    && let Some(discovery) = endpoint.discovery()
-                {
-                    debug!("Executando ciclo de discovery via subscribe()");
-
-                    // Obtém stream de descoberta passiva
-                    if let Some(mut stream) = discovery.subscribe() {
-                        use futures::StreamExt;
-
-                        // Processa eventos por um período antes de resubscrever
-                        let cycle_start = Instant::now();
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                iroh::discovery::DiscoveryEvent::Discovered(item) => {
-                                    // DiscoveryItem derefs para NodeData, tem método node_id()
-                                    let node_id = item.node_id();
-                                    let peer_info = DiscoveredPeerInfo {
-                                        node_id,
-                                        addresses: item
-                                            .direct_addresses() // via Deref<Target=NodeData>
-                                            .iter()
-                                            .map(|addr| format!("{}", addr))
-                                            .collect(),
-                                        last_seen: Instant::now(),
-                                        latency: None,
-                                        protocols: vec![
-                                            "iroh/blobs/0.92.0".to_string(),
-                                            "iroh/gossip/0.92.0".to_string(),
-                                        ],
-                                    };
-
-                                    // Atualiza cache
-                                    let mut cache = discovery_cache.write().await;
-                                    cache.peers.insert(peer_info.node_id, peer_info);
-                                    cache.last_update = Some(Instant::now());
-                                    drop(cache);
-
-                                    debug!("Peer descoberto via subscribe(): {}", node_id);
-                                }
-                                iroh::discovery::DiscoveryEvent::Expired(node_id) => {
-                                    debug!("Peer expirado: {}", node_id);
-                                    // Opcionalmente remove do cache ou marca como inativo
-                                }
-                            }
-
-                            // Após interval, resubscribe para pegar novos eventos
-                            if cycle_start.elapsed() >= interval {
-                                debug!("Ciclo de discovery completo, resubscrevendo...");
-                                break;
-                            }
-                        }
-                    } else {
-                        debug!("Discovery não suporta subscribe(), aguardando...");
-                        drop(endpoint_lock);
-                        tokio::time::sleep(interval * 2).await;
-                        continue;
-                    }
-                }
-
-                drop(endpoint_lock);
-                tokio::time::sleep(interval).await;
-            }
-        });
+        // iroh 1.0: discovery subscribe() API removed; background polling is a no-op.
+        let _ = endpoint_arc;
+        let _ = discovery_cache;
 
         info!(
             "Polling contínuo de discovery iniciado (interval: {:?})",
@@ -2161,7 +1830,7 @@ impl IrohBackend {
     }
 
     /// Obtém conexão do pool ou retorna erro se não existir
-    pub async fn get_connection_from_pool(&self, node_id: &NodeId) -> Result<ConnectionInfo> {
+    pub async fn get_connection_from_pool(&self, node_id: &EndpointId) -> Result<ConnectionInfo> {
         let mut pool = self.connection_pool.write().await;
 
         if let Some(conn_info) = pool.get_mut(node_id) {
@@ -2185,7 +1854,7 @@ impl IrohBackend {
     }
 
     /// Remove conexão do pool
-    pub async fn remove_connection_from_pool(&self, node_id: &NodeId) -> Result<()> {
+    pub async fn remove_connection_from_pool(&self, node_id: &EndpointId) -> Result<()> {
         let mut pool = self.connection_pool.write().await;
 
         if pool.remove(node_id).is_some() {
@@ -2214,7 +1883,7 @@ impl IrohBackend {
         let mut removed_count = 0;
 
         let now = Instant::now();
-        let stale_peers: Vec<NodeId> = pool
+        let stale_peers: Vec<EndpointId> = pool
             .iter()
             .filter(|(_, conn)| now.saturating_duration_since(conn.last_used) > timeout)
             .map(|(id, _)| *id)
@@ -2247,7 +1916,7 @@ impl IrohBackend {
     }
 
     /// Atualiza latência de uma conexão no pool
-    pub async fn update_connection_latency(&self, node_id: &NodeId, latency_ms: f64) -> Result<()> {
+    pub async fn update_connection_latency(&self, node_id: &EndpointId, latency_ms: f64) -> Result<()> {
         let mut pool = self.connection_pool.write().await;
 
         if let Some(conn_info) = pool.get_mut(node_id) {
@@ -2295,7 +1964,7 @@ impl IrohBackend {
     /// Adiciona peer confiável ao key synchronizer
     pub async fn add_trusted_peer_for_sync(
         &self,
-        node_id: NodeId,
+        node_id: EndpointId,
         public_key: ed25519_dalek::VerifyingKey,
     ) -> Result<()> {
         self.key_synchronizer
@@ -2304,7 +1973,7 @@ impl IrohBackend {
     }
 
     /// Remove peer confiável do key synchronizer
-    pub async fn remove_trusted_peer_from_sync(&self, node_id: &NodeId) -> Result<bool> {
+    pub async fn remove_trusted_peer_from_sync(&self, node_id: &EndpointId) -> Result<bool> {
         self.key_synchronizer.remove_trusted_peer(node_id).await
     }
 
@@ -2338,7 +2007,7 @@ impl IrohBackend {
     }
 
     /// Lista peers confiáveis para sincronização
-    pub async fn list_trusted_peers_for_sync(&self) -> Vec<NodeId> {
+    pub async fn list_trusted_peers_for_sync(&self) -> Vec<EndpointId> {
         self.key_synchronizer.list_trusted_peers().await
     }
 

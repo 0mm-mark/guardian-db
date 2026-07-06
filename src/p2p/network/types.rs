@@ -5,7 +5,7 @@
 
 use crate::guardian::error::Result;
 use futures::stream::Stream;
-use iroh::NodeId;
+use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
@@ -50,8 +50,8 @@ impl AddResponse {
 /// Informações sobre o nó Iroh local (Endpoint)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeInfo {
-    /// ID único do nó (Iroh NodeId = PublicKey)
-    pub id: NodeId,
+    /// ID único do nó (Iroh EndpointId = PublicKey)
+    pub id: EndpointId,
     /// Chave pública em formato hex
     pub public_key: String,
     /// Endereços do endpoint Iroh
@@ -64,7 +64,7 @@ pub struct NodeInfo {
 
 impl NodeInfo {
     /// Cria informações básicas de nó para desenvolvimento/mock
-    pub fn mock(id: NodeId) -> Self {
+    pub fn mock(id: EndpointId) -> Self {
         Self {
             id,
             public_key: "mock_public_key".to_string(),
@@ -83,8 +83,8 @@ impl NodeInfo {
 /// Mensagem do sistema gossip (iroh-gossip)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PubsubMessage {
-    /// NodeId que enviou a mensagem
-    pub from: NodeId,
+    /// EndpointId que enviou a mensagem
+    pub from: EndpointId,
     /// Dados da mensagem
     pub data: Vec<u8>,
     /// Número de sequência (opcional)
@@ -97,7 +97,7 @@ pub struct PubsubMessage {
 
 impl PubsubMessage {
     /// Cria uma nova mensagem pubsub
-    pub fn new(from: NodeId, topic: String, data: Vec<u8>) -> Self {
+    pub fn new(from: EndpointId, topic: String, data: Vec<u8>) -> Self {
         Self {
             from,
             data,
@@ -134,8 +134,8 @@ pub type PubsubStream = Pin<Box<dyn Stream<Item = Result<PubsubMessage>> + Send>
 /// Informações sobre um peer conectado (via Iroh Endpoint)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PeerInfo {
-    /// NodeId do peer
-    pub id: NodeId,
+    /// EndpointId do peer
+    pub id: EndpointId,
     /// Endereços conhecidos do peer
     pub addresses: Vec<String>,
     /// Protocolos suportados pelo peer
@@ -146,7 +146,7 @@ pub struct PeerInfo {
 
 impl PeerInfo {
     /// Cria informações básicas de peer
-    pub fn new(id: NodeId) -> Self {
+    pub fn new(id: EndpointId) -> Self {
         Self {
             id,
             addresses: Vec::new(),
@@ -156,7 +156,7 @@ impl PeerInfo {
     }
 
     /// Cria peer mock/simulado
-    pub fn mock(id: NodeId, connected: bool) -> Self {
+    pub fn mock(id: EndpointId, connected: bool) -> Self {
         Self {
             id,
             addresses: vec![format!(
@@ -298,8 +298,8 @@ mod tests {
     #[test]
     fn test_node_info() {
         use iroh::SecretKey;
-        use rand_core::OsRng;
-        let secret = SecretKey::generate(OsRng);
+        use rand::rngs::OsRng;
+        let secret = SecretKey::generate();
         let node_id = secret.public();
         let info = NodeInfo::mock(node_id);
 
@@ -311,8 +311,8 @@ mod tests {
     #[test]
     fn test_pubsub_message() {
         use iroh::SecretKey;
-        use rand_core::OsRng;
-        let secret = SecretKey::generate(OsRng);
+        use rand::rngs::OsRng;
+        let secret = SecretKey::generate();
         let node_id = secret.public();
         let topic = "test-topic".to_string();
         let data = b"Hello, PubSub!".to_vec();
@@ -331,8 +331,8 @@ mod tests {
     #[test]
     fn test_peer_info() {
         use iroh::SecretKey;
-        use rand_core::OsRng;
-        let secret = SecretKey::generate(OsRng);
+        use rand::rngs::OsRng;
+        let secret = SecretKey::generate();
         let node_id = secret.public();
         let mut info = PeerInfo::new(node_id);
 

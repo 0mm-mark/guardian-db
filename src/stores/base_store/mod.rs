@@ -18,7 +18,7 @@ use crate::traits::{
     DirectChannel, MessageExchangeHeads, MessageMarshaler, NewStoreOptions, PubSubInterface,
     PubSubTopic, Store, StoreIndex, TracerWrapper,
 };
-use iroh::NodeId;
+use iroh::EndpointId;
 use iroh_blobs::Hash;
 use opentelemetry::trace::{TracerProvider, noop::NoopTracerProvider};
 use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock};
@@ -332,7 +332,7 @@ impl RetryMetrics {
 pub struct BaseStore {
     // --- Identificadores e Configuração Essencial ---
     id: String,
-    node_id: NodeId,
+    node_id: EndpointId,
     identity: Arc<Identity>,
     address: Arc<dyn Address + Send + Sync>,
     db_name: String,
@@ -1203,7 +1203,7 @@ impl BaseStore {
         Ok(())
     }
 
-    /// Este construtor é `async` porque precisa interagir com a rede (para obter o NodeId)
+    /// Este construtor é `async` porque precisa interagir com a rede (para obter o EndpointId)
     /// e inicia tarefas em background. Ele retorna um `Arc<Self>` para permitir o
     /// compartilhamento seguro da `store` com as tarefas que ela mesma cria.
     #[instrument(level = "debug", skip(client, identity, address, options))]
@@ -1229,7 +1229,7 @@ impl BaseStore {
             tracer: None,
             pubsub: None,
             message_marshaler: None,
-            node_id: iroh::SecretKey::generate(rand_core::OsRng).public(),
+            node_id: iroh::SecretKey::generate().public(),
             direct_channel: None,
             close_func: None,
             store_specific_opts: None,
@@ -1352,20 +1352,20 @@ impl BaseStore {
 
         // --- 3. Construção da Store  ---
 
-        // Deriva o NodeId a partir da identidade - implementação simplificada
+        // Deriva o EndpointId a partir da identidade - implementação simplificada
         let node_id = if let Some(public_key) = identity.public_key() {
-            // Usa hash Blake3 da chave pública para derivar NodeId determinístico (consistente com Iroh)
+            // Usa hash Blake3 da chave pública para derivar EndpointId determinístico (consistente com Iroh)
             let key_hash = blake3::hash(&public_key.to_bytes());
 
-            // Cria um NodeId determinístico baseado no hash
-            // NodeId requer exatamente 32 bytes
+            // Cria um EndpointId determinístico baseado no hash
+            // EndpointId requer exatamente 32 bytes
             let mut node_id_bytes = [0u8; 32];
             node_id_bytes.copy_from_slice(key_hash.as_bytes());
 
-            // NodeId::from_bytes não falha com 32 bytes válidos
-            NodeId::from_bytes(&node_id_bytes).unwrap_or_else(|_| {
-                warn!("Failed to create deterministic NodeId, using generated");
-                iroh::SecretKey::generate(rand_core::OsRng).public()
+            // EndpointId::from_bytes não falha com 32 bytes válidos
+            EndpointId::from_bytes(&node_id_bytes).unwrap_or_else(|_| {
+                warn!("Failed to create deterministic EndpointId, using generated");
+                iroh::SecretKey::generate().public()
             })
         } else {
             // Se não há chave pública, usa hash Blake3 da string da identidade (consistente com Iroh)
@@ -1374,9 +1374,9 @@ impl BaseStore {
             let mut node_id_bytes = [0u8; 32];
             node_id_bytes.copy_from_slice(id_hash.as_bytes());
 
-            NodeId::from_bytes(&node_id_bytes).unwrap_or_else(|_| {
-                warn!("Failed to create NodeId from identity string, using generated");
-                iroh::SecretKey::generate(rand_core::OsRng).public()
+            EndpointId::from_bytes(&node_id_bytes).unwrap_or_else(|_| {
+                warn!("Failed to create EndpointId from identity string, using generated");
+                iroh::SecretKey::generate().public()
             })
         };
 
@@ -2611,7 +2611,7 @@ impl BaseStore {
 
     /// Inicia a troca de "heads" com um peer recém-conectado.
     /// Inclui estratégias de retry, timeout e cancelamento.
-    pub async fn on_new_peer_joined(&self, peer: NodeId) -> Result<()> {
+    pub async fn on_new_peer_joined(&self, peer: EndpointId) -> Result<()> {
         debug!(
             "{:?}: New peer '{:?}' connected to {}",
             self.node_id, peer, self.id
@@ -2821,7 +2821,7 @@ impl BaseStore {
 
     /// Conecta-se a um peer via canal direto, carrega os "heads" locais
     /// do cache e os envia para o peer.
-    pub async fn exchange_heads(&self, peer: NodeId) -> Result<()> {
+    pub async fn exchange_heads(&self, peer: EndpointId) -> Result<()> {
         debug!("[EXCHANGE_HEADS] Starting exchange with peer: {:?}", peer);
 
         // **CORREÇÃO CRÍTICA**: Para sincronização completa, enviamos TODAS as entradas

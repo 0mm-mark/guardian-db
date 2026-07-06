@@ -317,11 +317,11 @@ impl GuardianDB {
     /// automática não é suficiente ou você quer forçar uma sincronização.
     ///
     /// # Argumentos
-    /// * `peer_id` - NodeId do peer com quem sincronizar
+    /// * `peer_id` - EndpointId do peer com quem sincronizar
     ///
     /// # Retorna
     /// `Ok(())` se a sincronização foi iniciada com sucesso
-    pub async fn connect_to_peer(&self, peer_id: iroh::NodeId) -> Result<()> {
+    pub async fn connect_to_peer(&self, peer_id: iroh::EndpointId) -> Result<()> {
         self.base.connect_to_peer(peer_id).await
     }
 }
@@ -367,11 +367,11 @@ impl EventLogStoreWrapper {
     /// automática não é suficiente ou você quer forçar uma sincronização.
     ///
     /// # Argumentos
-    /// * `peer_id` - NodeId do peer com quem sincronizar
+    /// * `peer_id` - EndpointId do peer com quem sincronizar
     ///
     /// # Retorna
     /// `Ok(())` se a sincronização foi iniciada com sucesso
-    pub async fn connect_to_peer(&self, peer_id: iroh::NodeId) -> Result<()> {
+    pub async fn connect_to_peer(&self, peer_id: iroh::EndpointId) -> Result<()> {
         if let Some(base_store) = self.try_get_basestore() {
             base_store.exchange_heads(peer_id).await
         } else {

@@ -233,7 +233,7 @@ pub fn decode_row_owned(
         .ok_or_else(|| SqlError::Storage("row document missing _id".into()))?
         .to_owned();
     let version = obj.get(F_VERSION).and_then(Json::as_i64).unwrap_or(1);
-    let mut values = BTreeMap::new();
+    let mut values = IndexMap::new();
     for col in &table.columns {
         let raw = obj.remove(&col.name).unwrap_or(Json::Null);
         let value = SqlValue::decode_json(&raw, &col.ty)?;

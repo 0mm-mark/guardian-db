@@ -1,7 +1,7 @@
 use crate::guardian::error::{GuardianError, Result};
 use crate::traits::{DirectChannelEmitter, EventPubSub, EventPubSubMessage, EventPubSubPayload};
 use async_trait::async_trait;
-use iroh::NodeId;
+use iroh::EndpointId;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -156,16 +156,16 @@ pub fn new_event_message(content: Vec<u8>) -> EventPubSubMessage {
 }
 
 /// Cria um novo evento de Payload.
-pub fn new_event_payload(payload: Vec<u8>, peer: NodeId) -> EventPubSubPayload {
+pub fn new_event_payload(payload: Vec<u8>, peer: EndpointId) -> EventPubSubPayload {
     EventPubSubPayload { payload, peer }
 }
 
 /// Cria um novo evento EventPubSubJoin.
-pub fn new_event_peer_join(peer: NodeId, topic: String) -> EventPubSub {
+pub fn new_event_peer_join(peer: EndpointId, topic: String) -> EventPubSub {
     EventPubSub::Join { peer, topic }
 }
 
 /// Cria um novo evento EventPubSubLeave.
-pub fn new_event_peer_leave(peer: NodeId, topic: String) -> EventPubSub {
+pub fn new_event_peer_leave(peer: EndpointId, topic: String) -> EventPubSub {
     EventPubSub::Leave { peer, topic }
 }

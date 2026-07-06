@@ -4,7 +4,7 @@
 // Gossipsub, Discovery e operações Iroh para otimizações futuras
 
 use crate::guardian::error::{GuardianError, Result};
-use iroh::NodeId;
+use iroh::EndpointId;
 use iroh_gossip::proto::TopicId;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -178,7 +178,7 @@ impl NetworkingMetricsCollector {
     }
 
     /// Registra conexão de peer
-    pub async fn record_peer_connected(&self, node_id: NodeId, latency_ms: Option<f64>) {
+    pub async fn record_peer_connected(&self, node_id: EndpointId, latency_ms: Option<f64>) {
         self.counters
             .connections_total
             .fetch_add(1, Ordering::Relaxed);
@@ -196,7 +196,7 @@ impl NetworkingMetricsCollector {
     }
 
     /// Registra desconexão de peer
-    pub async fn record_peer_disconnected(&self, node_id: NodeId) {
+    pub async fn record_peer_disconnected(&self, node_id: EndpointId) {
         self.counters
             .disconnections_total
             .fetch_add(1, Ordering::Relaxed);

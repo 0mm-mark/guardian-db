@@ -8,8 +8,8 @@ use crate::log::identity_provider::Keystore;
 use crate::p2p::network::config::ClientConfig;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use iroh::NodeId;
-use rand_core::OsRng;
+use iroh::EndpointId;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -69,7 +69,7 @@ pub struct KeyMetadata {
     /// Timestamp da última modificação
     pub last_modified: DateTime<Utc>,
     /// NodeID que criou a chave
-    pub creator: NodeId,
+    pub creator: EndpointId,
     /// Assinatura dos metadados
     pub signature: Vec<u8>,
     /// Algoritmo de criptografia usado
@@ -88,7 +88,7 @@ pub struct SyncMessage {
     /// Timestamp da mensagem
     pub timestamp: SystemTime,
     /// NodeID do remetente
-    pub sender: NodeId,
+    pub sender: EndpointId,
     /// Tipo de operação
     pub operation: SyncOperation,
     /// Metadados da chave
@@ -114,7 +114,7 @@ struct SyncQueueEntry {
     next_retry: SystemTime,
     /// Peers que devem receber a mensagem
     #[allow(dead_code)]
-    target_peers: Vec<NodeId>,
+    target_peers: Vec<EndpointId>,
 }
 
 /// Estatísticas de sincronização
@@ -146,7 +146,7 @@ pub struct KeySynchronizer {
     /// Keypair principal do nó (Ed25519)
     node_signing_key: SigningKey,
     /// NodeID do nó
-    node_id: NodeId,
+    node_id: EndpointId,
     /// Mapeamento de chaves sincronizadas
     synchronized_keys: Arc<RwLock<HashMap<String, KeyMetadata>>>,
     /// Status de sincronização por chave
@@ -158,7 +158,7 @@ pub struct KeySynchronizer {
     /// Estatísticas de sincronização
     statistics: Arc<RwLock<SyncStatistics>>,
     /// Chaves de confiança (peers autorizados)
-    trusted_peers: Arc<RwLock<HashMap<NodeId, VerifyingKey>>>,
+    trusted_peers: Arc<RwLock<HashMap<EndpointId, VerifyingKey>>>,
 }
 
 impl KeySynchronizer {
@@ -174,7 +174,8 @@ impl KeySynchronizer {
 
         // Carregar ou gerar keypair principal
         let node_signing_key = Self::load_or_generate_keypair(&local_keystore).await?;
-        let node_id = NodeId::from(node_signing_key.verifying_key());
+        let node_id = iroh::PublicKey::from_bytes(node_signing_key.verifying_key().as_bytes())
+            .map_err(|e| GuardianError::Other(format!("Key conversion error: {e}")))?;
 
         info!(
             "Inicializando sincronizador de chaves para NodeID: {}",
@@ -196,7 +197,7 @@ impl KeySynchronizer {
     }
 
     /// Retorna o NodeID do nó
-    pub fn node_id(&self) -> NodeId {
+    pub fn node_id(&self) -> EndpointId {
         self.node_id
     }
 
@@ -219,7 +220,9 @@ impl KeySynchronizer {
         }
 
         // Gerar novo keypair
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut secret_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut secret_bytes);
+        let signing_key = SigningKey::from_bytes(&secret_bytes);
         keystore
             .put(MAIN_KEYPAIR_KEY, signing_key.as_bytes())
             .await?;
@@ -229,7 +232,7 @@ impl KeySynchronizer {
     }
 
     /// Adiciona peer confiável para sincronização
-    pub async fn add_trusted_peer(&self, node_id: NodeId, public_key: VerifyingKey) -> Result<()> {
+    pub async fn add_trusted_peer(&self, node_id: EndpointId, public_key: VerifyingKey) -> Result<()> {
         let mut trusted = self.trusted_peers.write().await;
         trusted.insert(node_id, public_key);
         info!("Peer confiável adicionado: {}", node_id);
@@ -237,7 +240,7 @@ impl KeySynchronizer {
     }
 
     /// Remove peer confiável
-    pub async fn remove_trusted_peer(&self, node_id: &NodeId) -> Result<bool> {
+    pub async fn remove_trusted_peer(&self, node_id: &EndpointId) -> Result<bool> {
         let mut trusted = self.trusted_peers.write().await;
         let removed = trusted.remove(node_id).is_some();
         if removed {
@@ -612,7 +615,7 @@ impl KeySynchronizer {
     }
 
     /// Lista todos os peers confiáveis
-    pub async fn list_trusted_peers(&self) -> Vec<NodeId> {
+    pub async fn list_trusted_peers(&self) -> Vec<EndpointId> {
         let trusted = self.trusted_peers.read().await;
         trusted.keys().copied().collect()
     }
@@ -650,8 +653,8 @@ impl KeySynchronizer {
 /// Configuração para exportação
 #[derive(Debug, Serialize, Deserialize)]
 struct SyncExportConfig {
-    node_id: NodeId,
-    trusted_peers: HashMap<NodeId, VerifyingKey>,
+    node_id: EndpointId,
+    trusted_peers: HashMap<EndpointId, VerifyingKey>,
     synchronized_keys: HashMap<String, KeyMetadata>,
     statistics: SyncStatistics,
 }

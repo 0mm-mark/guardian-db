@@ -9,16 +9,16 @@
 /// - Concorrência e thread-safety
 /// - Limites de amostras e performance
 use crate::p2p::network::core::networking_metrics::NetworkingMetricsCollector;
-use iroh::NodeId;
+use iroh::EndpointId;
 use iroh_gossip::proto::TopicId;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, info};
 
-/// Helper para criar NodeId de teste
-fn create_test_node_id(seed: u8) -> NodeId {
-    // Usar SecretKey para gerar NodeId válido
+/// Helper para criar EndpointId de teste
+fn create_test_node_id(seed: u8) -> EndpointId {
+    // Usar SecretKey para gerar EndpointId válido
     use iroh::SecretKey;
     let mut bytes = [0u8; 32];
     bytes[0] = seed;

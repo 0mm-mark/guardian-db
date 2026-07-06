@@ -168,7 +168,7 @@ async fn test_backend_node_id() {
 
     let node_info = backend.id().await.expect("Failed to get node info");
 
-    // Verifica que o NodeId corresponde à chave pública
+    // Verifica que o EndpointId corresponde à chave pública
     let expected_id = backend.secret_key().public();
     assert_eq!(node_info.id, expected_id);
 }
@@ -382,7 +382,7 @@ async fn test_node_info() {
 async fn test_connect_to_invalid_peer() {
     let (backend, _temp_dir) = create_test_backend().await;
 
-    // Gera NodeId aleatório (peer que não existe)
+    // Gera EndpointId aleatório (peer que não existe)
     let fake_peer = SecretKey::generate(OsRng).public();
 
     let result = backend.connect(&fake_peer).await;
