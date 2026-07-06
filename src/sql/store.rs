@@ -49,7 +49,7 @@ impl LoadedTable {
         let mut rows = BTreeMap::new();
         let mut versions = BTreeMap::new();
         for (_rid, doc) in docs {
-            if let Some((id, values, version)) = decode_row(&meta, &doc)? {
+            if let Some((id, values, version)) = decode_row_owned(&meta, doc)? {
                 versions.insert(id.clone(), version);
                 rows.insert(id, values);
             }
@@ -194,6 +194,9 @@ fn describe_key(columns: &[String], values: &[SqlValue]) -> String {
 
 /// Decode a stored document into `(row_id, values, version)`. Returns `None` for
 /// tombstoned rows.
+///
+/// Borrows the document; each column value is read by reference so no intermediate
+/// `Json` clone is needed per column.
 pub fn decode_row(table: &Table, doc: &Json) -> Result<Option<(String, RowValues, i64)>> {
     let obj = doc
         .as_object()
@@ -205,11 +208,42 @@ pub fn decode_row(table: &Table, doc: &Json) -> Result<Option<(String, RowValues
         .get(F_ID)
         .and_then(Json::as_str)
         .ok_or_else(|| SqlError::Storage("row document missing _id".into()))?
-        .to_string();
+        .to_owned();
     let version = obj.get(F_VERSION).and_then(Json::as_i64).unwrap_or(1);
     let mut values = IndexMap::new();
     for col in &table.columns {
-        let raw = obj.get(&col.name).cloned().unwrap_or(Json::Null);
+        let value = SqlValue::decode_json(
+            obj.get(&col.name).unwrap_or(&Json::Null),
+            &col.ty,
+        )?;
+        values.insert(col.name.clone(), value);
+    }
+    Ok(Some((id, values, version)))
+}
+
+/// Decode a stored document into `(row_id, values, version)` consuming the owned
+/// document. Column values are extracted with [`Map::remove`] so no per-column
+/// `Json` clone is required. Returns `None` for tombstoned rows.
+pub fn decode_row_owned(
+    table: &Table,
+    doc: Json,
+) -> Result<Option<(String, RowValues, i64)>> {
+    let mut obj = match doc {
+        Json::Object(o) => o,
+        _ => return Err(SqlError::Storage("row document is not an object".into())),
+    };
+    if obj.get(F_DELETED).and_then(Json::as_bool).unwrap_or(false) {
+        return Ok(None);
+    }
+    let id = obj
+        .get(F_ID)
+        .and_then(Json::as_str)
+        .ok_or_else(|| SqlError::Storage("row document missing _id".into()))?
+        .to_owned();
+    let version = obj.get(F_VERSION).and_then(Json::as_i64).unwrap_or(1);
+    let mut values = BTreeMap::new();
+    for col in &table.columns {
+        let raw = obj.remove(&col.name).unwrap_or(Json::Null);
         let value = SqlValue::decode_json(&raw, &col.ty)?;
         values.insert(col.name.clone(), value);
     }
@@ -217,16 +251,21 @@ pub fn decode_row(table: &Table, doc: &Json) -> Result<Option<(String, RowValues
 }
 
 /// Encode a row's column values into a stored document.
+///
+/// Each column value is encoded directly from a reference — no intermediate
+/// `SqlValue` clone is needed per column.
 pub fn encode_row(table: &Table, row_id: &str, values: &RowValues, version: i64) -> Json {
     let mut obj = Map::new();
-    obj.insert(F_ID.into(), Json::String(row_id.to_string()));
+    obj.insert(F_ID.into(), Json::String(row_id.to_owned()));
     obj.insert(F_SCHEMA.into(), Json::String(table.schema.clone()));
     obj.insert(F_TABLE.into(), Json::String(table.name.clone()));
     obj.insert(F_VERSION.into(), Json::from(version));
     obj.insert(F_DELETED.into(), Json::Bool(false));
     for col in &table.columns {
-        let v = values.get(&col.name).cloned().unwrap_or(SqlValue::Null);
-        obj.insert(col.name.clone(), v.encode_json());
+        let v = values
+            .get(&col.name)
+            .map_or(Json::Null, SqlValue::encode_json);
+        obj.insert(col.name.clone(), v);
     }
     Json::Object(obj)
 }
