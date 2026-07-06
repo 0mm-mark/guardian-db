@@ -258,43 +258,48 @@ exposes them as strings — use `pg.types` parsers if you need `BigInt`).
 
 ### Constraints & indexes
 - `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`
-- `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` actions — declared,
-  introspectable **and enforced** (`MATCH SIMPLE`), see the "Foreign keys"
-  subsection below
+- `FOREIGN KEY` with `ON DELETE`/`ON UPDATE` actions, `MATCH SIMPLE`/`MATCH
+  FULL`, and `DEFERRABLE`/`INITIALLY DEFERRED` — declared, introspectable
+  **and enforced**, see the "Foreign keys" subsection below
 - real BTree indexes: primary-key, unique, secondary, composite; maintained on
   insert/update/delete; used for equality index scans (the planner chooses an
   index scan when a single base table is filtered by `col = const` on an indexed
   column, and falls back to a full scan otherwise — results are identical).
 
-#### Foreign keys: enforced (`MATCH SIMPLE`)
+#### Foreign keys: `MATCH SIMPLE`/`MATCH FULL`, `DEFERRABLE`, `SET CONSTRAINTS`
 
 Foreign-key constraints are parsed (column-level `REFERENCES` and table-level
 `FOREIGN KEY`, including `ON DELETE` / `ON UPDATE` actions), stored in the
-replicated catalog, fully introspectable, **and enforced at runtime** with
-PostgreSQL's default `MATCH SIMPLE` semantics (`src/sql/fk.rs`):
+replicated catalog, fully introspectable, **and enforced at runtime**
+(`src/sql/fk.rs`):
 
 - `INSERT` into the referencing table — and any `UPDATE` that changes an FK
   column's value — requires a parent row matching **all** referenced columns,
   else SQLSTATE `23503`
   (`insert or update on table "child" violates foreign key constraint "..."`,
-  with a PG-style `Key (...)=(...) is not present` detail). If **any** FK
-  column is NULL the constraint is satisfied (`MATCH SIMPLE`).
+  with a PG-style `Key (...)=(...) is not present` detail). The NULL-column
+  exemption depends on the constraint's `MATCH` mode:
+  - `MATCH SIMPLE` (PostgreSQL's default): **any** NULL FK column satisfies
+    the constraint.
+  - `MATCH FULL`: a composite key must be either all-NULL (exempt) or
+    all-non-NULL and matching a parent row — a row with *some but not all* FK
+    columns NULL is itself a `23503` violation ("MATCH FULL does not allow
+    mixing of null and nonnull key values."), never silently exempted.
+  - `MATCH PARTIAL` is rejected at DDL time (`0A000`). This is **parity with
+    upstream PostgreSQL, not a gap**: PostgreSQL's own `CREATE TABLE`
+    reference documents `MATCH PARTIAL` as not yet implemented, and real
+    PostgreSQL raises `MATCH PARTIAL not yet implemented` for it too.
 - `DELETE` of a referenced row, or an `UPDATE` that actually changes a
   referenced key column's value, executes the declared action:
 
   | action | behaviour |
   | ------ | --------- |
-  | `NO ACTION` (default), `RESTRICT` | `23503` (`update or delete on table "parent" violates foreign key constraint "..." on table "child"`) if a referencing row remains |
+  | `NO ACTION` (default) | `23503` (`update or delete on table "parent" violates foreign key constraint "..." on table "child"`) if a referencing row remains — checked per statement, or deferred to `COMMIT` if the constraint is currently `DEFERRED` (see below) |
+  | `RESTRICT` | the same `23503`, but **always checked per statement**, never deferred — see "Deferred checking" below |
   | `CASCADE` | deletes the referencing rows (or rewrites their FK columns to the new key), recursively applying *their* declared FK actions; self-referential chains terminate |
   | `SET NULL` | sets the FK columns to NULL (a NOT NULL column surfaces the usual `23502`) |
-  | `SET DEFAULT` | sets the FK columns to their column defaults, then re-checks the constraint against the remaining parent rows (`23503` if the defaults reference nothing; all-NULL defaults satisfy `MATCH SIMPLE`) |
+  | `SET DEFAULT` | sets the FK columns to their column defaults, then re-checks the constraint against the remaining parent rows (`23503` if the defaults reference nothing, subject to the same deferred timing as `NO ACTION`; all-NULL defaults satisfy `MATCH SIMPLE`) |
 
-- `NO ACTION` and `RESTRICT` are both checked **per statement** — after the
-  statement's own writes and cascades have applied — never deferred to
-  commit. Accordingly, `DEFERRABLE` / `INITIALLY DEFERRED` constraints are
-  rejected with `0A000` (`DEFERRABLE constraints are not supported`), as are
-  `MATCH FULL` / `MATCH PARTIAL` (only `MATCH SIMPLE` is implemented) and
-  `NOT ENFORCED`.
 - Referential actions run through the normal write path (row locks, staged
   storage mutations), so a failing statement leaves nothing behind and
   `ROLLBACK` undoes cascades atomically. Like PostgreSQL — which runs
@@ -309,6 +314,85 @@ PostgreSQL's default `MATCH SIMPLE` semantics (`src/sql/fk.rs`):
   (`42P01`/`42703`), and `REFERENCES parent` without a column list binds to
   the parent's primary key.
 
+##### Deferred checking (`DEFERRABLE` / `INITIALLY DEFERRED` / `SET CONSTRAINTS`)
+
+A foreign key's `[NOT] DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}]`
+declaration (`NOT DEFERRABLE` is PostgreSQL's default) is parsed and enforced,
+matching PostgreSQL's own combining rule for the clause (a bare `INITIALLY
+DEFERRED` with no explicit `DEFERRABLE`/`NOT DEFERRABLE` keyword implies
+`DEFERRABLE` too; `NOT DEFERRABLE` together with `INITIALLY DEFERRED` is a
+specific `42601` syntax error, "constraint declared INITIALLY DEFERRED must be
+DEFERRABLE"):
+
+- The child-side check and the `NO ACTION`/`SET DEFAULT` parent-side check
+  both **defer to `COMMIT`** instead of erroring per statement when the
+  constraint's *current* mode is `DEFERRED` — its own `INITIALLY DEFERRED`
+  declaration, or a `SET CONSTRAINTS` override earlier in the same
+  transaction. A deferred check is re-validated against live state at
+  `COMMIT` time (or forced early by `SET CONSTRAINTS ... IMMEDIATE`, see
+  below); if still violated, `COMMIT`/`SET CONSTRAINTS` itself fails with the
+  same `23503` and, for `COMMIT`, the whole transaction rolls back (nothing
+  was ever applied to storage).
+- **`RESTRICT` is never deferred**, regardless of the constraint's
+  `DEFERRABLE`/`INITIALLY DEFERRED` declaration — verified against
+  PostgreSQL's own source (`src/backend/utils/adt/ri_triggers.c`): the SQL
+  standard intends `RESTRICT` to fire exactly when the update/delete happens,
+  and PostgreSQL implements `NO ACTION` and `RESTRICT` identically except that
+  `RESTRICT`'s check is not deferrable.
+- `MATCH FULL`'s "no mixing of null and nonnull key values" shape check is
+  subject to the exact same deferred timing as the ordinary child-side
+  parent-existence check, not a fixed always-immediate check — verified
+  against a live PostgreSQL 16 instance: under `DEFERRABLE INITIALLY
+  DEFERRED`, inserting a partial-NULL `MATCH FULL` row succeeds immediately
+  and only `COMMIT` (or `SET CONSTRAINTS ... IMMEDIATE`) raises the `23503`.
+  This falls out of PostgreSQL's implementation, not this engine's design:
+  `RI_FKey_check` tests the `MATCH FULL` shape and the parent lookup in the
+  same deferrable AFTER ROW trigger invocation, so both share that trigger's
+  timing.
+- Outside an explicit transaction block, deferred/immediate is not tracked at
+  all: PostgreSQL's own per-statement implicit transaction commits right after
+  that one statement, so the two are observably identical there — every
+  foreign key just checks immediately, exactly as before this was
+  implemented.
+- `SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }` is
+  recognized and hand-parsed (sqlparser 0.62 has no AST for it, the same
+  situation `ALTER EXTENSION` is in), and follows PostgreSQL precisely:
+  - Name resolution and `DEFERRABLE`-ness validation (the `42704`/`42809`
+    errors below) apply whether or not an explicit transaction block is
+    open — verified against a live PostgreSQL 16 instance: an unknown name or
+    a non-deferrable name asked to go `DEFERRED` still raises the same error
+    with no `BEGIN` in effect. What outside a transaction block *is* a no-op
+    is the mode change itself, plus the retroactive re-check `IMMEDIATE`
+    would otherwise force (PostgreSQL: "emits a warning and otherwise has no
+    effect", since each autocommit statement is its own implicit transaction
+    with nothing for the setting to outlive).
+  - `ALL` sets the blanket mode for every deferrable constraint in the
+    transaction and forgets any earlier per-name overrides (PostgreSQL does
+    exactly this); it never errors, even when some constraint is `NOT
+    DEFERRABLE` (such a constraint is simply unaffected).
+  - A named constraint that does not exist anywhere reachable is `42704`
+    ("constraint ... does not exist"); one that is `NOT DEFERRABLE` errors
+    only when asked to go `DEFERRED` — `42809` ("constraint ... is not
+    deferrable", verified against PostgreSQL's `AfterTriggerSetState` in
+    `src/backend/commands/trigger.c` — **not** the `42704` "does not exist" a
+    first guess might reach for). Asking for `IMMEDIATE` on a `NOT
+    DEFERRABLE` constraint is a silent no-op (it is already always
+    immediate).
+  - Setting `IMMEDIATE` (`ALL` or named) retroactively re-validates every
+    currently pending deferred check the request covers right now, raising
+    the `23503` immediately if one is still unsatisfied (SQL99/PostgreSQL:
+    "the effects of the SET CONSTRAINTS command apply retroactively").
+  - Like `ALTER EXTENSION`, `SET CONSTRAINTS` is only supported over the
+    simple query protocol (a typed `42601` over the extended/prepared
+    protocol) since sqlparser cannot carry it through that pipeline.
+  - A deferred child-side check is keyed by the row's FK value at the time it
+    was queued, not by PostgreSQL's per-row tuple identity (this engine has
+    no stable row id available at that call site); see `src/sql/fk.rs`'s
+    module doc comment for exactly what that narrower-than-PostgreSQL
+    tracking does and does not cover — the common cases (fixing the
+    violation by inserting the missing parent row, or leaving it broken
+    through to `COMMIT`) behave exactly like PostgreSQL either way.
+
 Like uniqueness (§8), this is **local-replica** enforcement: checks and
 actions see the locally materialized state, and cross-replica convergence
 follows the same eventual rules as all other writes.
@@ -316,20 +400,37 @@ follows the same eventual rules as all other writes.
 Deliberate simplifications vs PostgreSQL, kept honest here: the referenced
 columns are not required to carry a `UNIQUE`/`PRIMARY KEY` constraint at DDL
 time (PostgreSQL's `42830`) — if duplicate parent keys exist, a key counts as
-still-present while any duplicate survives; and there is no deferral of any
-kind (see the `0A000` rejections above).
+still-present while any duplicate survives; `DEFERRABLE`/`INITIALLY DEFERRED`
+is only implemented for foreign keys, not `UNIQUE`/`PRIMARY KEY` (PostgreSQL's
+unique-index-backed deferred mechanism is a different feature this engine
+does not run — declaring one `DEFERRABLE` still fails typed, `0A000`); and
+`NOT ENFORCED` is rejected the same way.
 
-Introspection is unchanged: `pg_constraint` reports `contype = 'f'` with
+Introspection: `pg_constraint` reports `contype = 'f'` with
 `confupdtype`/`confdeltype` reflecting the declared actions
-(`a`/`r`/`c`/`n`/`d`), and `information_schema.table_constraints`,
-`key_column_usage`, `constraint_column_usage` and `referential_constraints`
-(with `update_rule`/`delete_rule`) all show them. `tests/sql_conformance.rs`
-pins the enforcement matrix (`foreign_keys_enforced_on_insert_and_child_update`,
+(`a`/`r`/`c`/`n`/`d`) and a `confmatchtype` column (`'f'` for `MATCH FULL`,
+`'s'` for `MATCH SIMPLE`) reflecting the declared `MATCH` mode, and
+`information_schema.table_constraints`, `key_column_usage`,
+`constraint_column_usage` and `referential_constraints` (with
+`update_rule`/`delete_rule`) all show them. Two known, display-only gaps
+remain — enforcement is correct in both, only introspection lags:
+`pg_constraint`'s `condeferrable`/`condeferred` columns are **not** wired to
+the new `DEFERRABLE`/`INITIALLY DEFERRED` state (they always report `false`,
+even for a constraint declared `DEFERRABLE`/actually checked as such); and,
+until the `confmatchtype` column above was added, `MATCH FULL` vs `MATCH
+SIMPLE` could not be introspected at all (PostgreSQL doesn't expose `MATCH`
+mode through `information_schema` either, so `pg_constraint.confmatchtype`
+is the only place either engine surfaces it).
+`tests/sql_conformance.rs` pins the enforcement matrix
+(`foreign_keys_enforced_on_insert_and_child_update`,
 `foreign_keys_restrict_and_no_action_block_parent_delete`,
 `foreign_key_on_delete_*`, `foreign_key_on_update_actions`,
 `foreign_key_cascade_is_atomic_and_rolls_back`,
 `composite_foreign_key_match_simple`,
-`referenced_parent_guarded_on_drop_and_truncate`).
+`referenced_parent_guarded_on_drop_and_truncate`,
+`match_partial_rejected_deferrable_and_match_full_accepted`);
+`tests/sql_fk_advanced.rs` pins `MATCH FULL`, `DEFERRABLE`/`INITIALLY
+DEFERRED`, and `SET CONSTRAINTS` end to end.
 
 ### Catalog / introspection
 Queryable `information_schema` (`tables`, `columns`, `schemata`,
@@ -835,7 +936,7 @@ Each gap has a conformance test in `tests/sql_conformance.rs`
 | Full-text search                     | ✓      | subset (tests in `tests/sql_fts.rs`): the `tsvector`/`tsquery` types (raw-parse `::tsvector`/`::tsquery` casts, PostgreSQL text output, table storage); `to_tsvector`, `to_tsquery` (full `&`/`\|`/`!`/parens syntax), `plainto_tsquery` — each `([config,] text)`; `@@` in all four PostgreSQL argument orders (incl. `text @@ text` via `to_tsvector`/`plainto_tsquery`); `ts_rank` (frequency formula with the `{0.1,0.2,0.4,1.0}` weight array; AND queries use the OR accumulation rather than PostgreSQL's pairwise-distance variant); `length`, `numnode`, `strip`. Configurations: `simple` and `english` (snowball stop words + Porter stemmer with snowball alignments); any other name → `42704`. Out of subset → *named* `0A000` (never `42883`, so never sidecar-routed): `setweight`, `ts_headline`, `ts_rank_cd`, `websearch_to_tsquery`, `phraseto_tsquery`, `tsquery_phrase`, `ts_rewrite`, `ts_stat`, `ts_delete`, `tsvector_to_array`, the `<->` phrase operator, tsvector/tsquery `\|\|` and `&&`, `:*` prefix matching, `A`/`B`/`C` weight labels, `ts_rank` normalization bitmasks ≠ 0, `to_tsvector`/`to_tsquery`/`plainto_tsquery` over `json`/`jsonb`, quoted multi-lexeme `to_tsquery` operands (they imply the phrase operator), and the introspection family (`querytree`, `ts_lexize`, `get_current_ts_config`, `array_to_tsvector`, `ts_filter`, `ts_parse`, `ts_token_type`, `ts_debug`, `tsvector_update_trigger*`). Documented divergences: the tokenizer covers PostgreSQL's compound token classes only partially (see `src/sql/fts.rs` module docs); words containing non-ASCII letters take the `simple` (unstemmed) path under `english`; `SET default_text_search_config` accepts any value and the `42704` surfaces at first use; a *typed* `text` value opposite a `tsvector`/`tsquery` in `@@` is raw-parsed like an unknown literal (PostgreSQL would reject the operator) |
 | Generated/computed columns           | ✗      | ignored test                           |
 | `SAVEPOINT` partial rollback         | partial| `SAVEPOINT`/`RELEASE` no-op; `ROLLBACK TO` collapses to full rollback |
-| `DEFERRABLE` constraints             | ✗      | error `0A000` — foreign keys are enforced immediately, per statement (see "Foreign keys" in §5); `MATCH FULL`/`MATCH PARTIAL` are `0A000` too |
+| `DEFERRABLE`/`MATCH FULL` foreign keys, `SET CONSTRAINTS` | ✓ | implemented — see "Foreign keys" in §5 for `MATCH SIMPLE`/`MATCH FULL`, `[NOT] DEFERRABLE [INITIALLY {DEFERRED\|IMMEDIATE}]`, deferred-to-`COMMIT` checking, and `SET CONSTRAINTS`. Remaining gaps, still `0A000`: `MATCH PARTIAL` (parity with upstream PostgreSQL, which has never implemented it either) and `DEFERRABLE` on `UNIQUE`/`PRIMARY KEY` (a different, unique-index-backed mechanism this engine does not run) |
 | `SERIALIZABLE` isolation             | ✗      | ignored test (read-committed only)     |
 | SSL/TLS transport                    | ✗      | negotiated-away, cleartext             |
 | Binary result encoding               | ✗      | results sent as text (node-postgres/psql use text) |
@@ -882,7 +983,12 @@ GuardianDB is local-first; SQL does not change that. Two modes are defined.
   statement). Autocommit wraps each statement in its own transaction.
 - Constraint checks (NOT NULL, unique, CHECK, foreign keys — including
   referential actions) run before the statement's writes are staged, so a
-  violating statement aborts without partial effects.
+  violating statement aborts without partial effects. The one exception is a
+  `DEFERRABLE` foreign key currently in `DEFERRED` mode (see §5 "Foreign
+  keys"): its check is queued instead and re-validated at `COMMIT` (or by
+  `SET CONSTRAINTS ... IMMEDIATE`), so the statement that produced the
+  (possibly temporary) violation succeeds; a still-unsatisfied deferred check
+  fails the `COMMIT` itself instead, rolling the whole transaction back.
 - Any error inside an explicit transaction **aborts** it: further statements
   fail with `25P02` until `ROLLBACK` (and `COMMIT` on an aborted block rolls
   back), matching PostgreSQL.
@@ -971,6 +1077,7 @@ Errors carry standard PostgreSQL SQLSTATE codes, surfaced to clients in the
 | `23502`  | not-null violation              |
 | `23503`  | foreign-key violation (see §5 "Foreign keys")   |
 | `23514`  | check violation                 |
+| `42809`  | wrong object type (`OVER` on a non-window function; `SET CONSTRAINTS` naming a `NOT DEFERRABLE` constraint — see §5 "Foreign keys") |
 | `22P02`  | invalid text representation     |
 | `22003`  | numeric value out of range      |
 | `22012`  | division by zero                |

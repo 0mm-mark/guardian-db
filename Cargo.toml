@@ -165,6 +165,11 @@ path = "tests/sql_fts.rs"
 required-features = ["sql"]
 
 [[test]]
+name = "sql_fk_advanced"
+path = "tests/sql_fk_advanced.rs"
+required-features = ["sql"]
+
+[[test]]
 name = "pgwire_wire"
 path = "tests/pgwire_wire.rs"
 required-features = ["pgwire"]

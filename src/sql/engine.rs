@@ -4,7 +4,7 @@
 use crate::relational::catalog::QualifiedName;
 use crate::relational::{Catalog, RelationalStorage, SqlValue};
 use crate::sql::error::{Result, SqlError};
-use crate::sql::exec::Exec;
+use crate::sql::exec::{ConstraintModes, DeferredFkCheck, Exec};
 use crate::sql::lock::{LockManager, LockMode, LockObject, LockScope, SessionId, WaitPolicy};
 use crate::sql::result::ExecResult;
 use crate::sql::store::{LoadedTable, Mutation};
@@ -123,6 +123,19 @@ struct Transaction {
     truncated: HashSet<String>,
     /// Set when a statement errors inside the block (PostgreSQL aborts the txn).
     aborted: bool,
+    /// This transaction's `SET CONSTRAINTS` state (see
+    /// [`ConstraintModes`]), read by every statement's [`Exec`] to decide
+    /// whether a deferrable foreign key currently checks immediately or
+    /// defers to `COMMIT`.
+    constraint_modes: ConstraintModes,
+    /// Foreign-key checks postponed by a `DEFERRABLE` constraint currently
+    /// running in `DEFERRED` mode (see [`DeferredFkCheck`]), accumulated
+    /// across every statement in this transaction so far. Drained and
+    /// re-validated at `COMMIT` (`Session::commit`) or by `SET CONSTRAINTS
+    /// ... IMMEDIATE` (`Session::exec_set_constraints`). Discarded along
+    /// with the rest of `Transaction` on `ROLLBACK` — there is no separate
+    /// cleanup step for it.
+    pending_deferred: Vec<DeferredFkCheck>,
 }
 
 /// A connection-scoped session.
@@ -193,6 +206,7 @@ impl<S: RelationalStorage> Session<S> {
         enum Piece {
             Statements(Vec<Statement>),
             AlterExtension(crate::sql::ext::alter::AlterExtension),
+            SetConstraints(SetConstraintsStmt),
         }
         let mut pieces = Vec::new();
         for segment in crate::sql::parser::split_statements(sql) {
@@ -200,6 +214,11 @@ impl<S: RelationalStorage> Session<S> {
                 pieces.push(Piece::AlterExtension(
                     crate::sql::ext::alter::parse_alter_extension(&segment)?,
                 ));
+            } else if is_set_constraints(&segment) {
+                // Like `ALTER EXTENSION`, sqlparser 0.62 has no AST for `SET
+                // CONSTRAINTS`, so it is recognized by prefix and hand-parsed
+                // here instead of going through the general parser.
+                pieces.push(Piece::SetConstraints(parse_set_constraints(&segment)?));
             } else if let Some(feature) = unsupported_by_prefix(&segment) {
                 // Truthfulness contract: statements the engine deliberately
                 // does not implement are recognized by keyword prefix *before*
@@ -225,6 +244,9 @@ impl<S: RelationalStorage> Session<S> {
                 Piece::AlterExtension(cmd) => {
                     results.push(self.execute_alter_extension(&cmd).await?);
                 }
+                Piece::SetConstraints(cmd) => {
+                    results.push(self.execute_set_constraints(&cmd).await?);
+                }
             }
         }
         Ok(results)
@@ -237,6 +259,14 @@ impl<S: RelationalStorage> Session<S> {
         if crate::sql::ext::alter::is_alter_extension(sql) {
             return Err(SqlError::Syntax(
                 "ALTER EXTENSION is only supported over the simple query protocol — \
+                 send it as an unprepared statement"
+                    .into(),
+            ));
+        }
+        // Same situation for `SET CONSTRAINTS` (see `is_set_constraints`).
+        if is_set_constraints(sql) {
+            return Err(SqlError::Syntax(
+                "SET CONSTRAINTS is only supported over the simple query protocol — \
                  send it as an unprepared statement"
                     .into(),
             ));
@@ -599,6 +629,10 @@ impl<S: RelationalStorage> Session<S> {
             self.session_id,
         );
         exec.vars = std::cell::RefCell::new(self.vars.clone());
+        // This transaction's `SET CONSTRAINTS` state, read-only for the
+        // statement (see `ConstraintModes`); `None` in autocommit, which
+        // always means "check every foreign key immediately".
+        exec.constraint_modes = self.txn.as_ref().map(|t| t.constraint_modes.clone());
         // Row security: compute per-table visibility once, before anything is
         // evaluated (CTEs, scans and DML snapshots all consult it).
         exec.init_rls(stmt)?;
@@ -634,14 +668,22 @@ impl<S: RelationalStorage> Session<S> {
         // Commit or stage the produced mutations / catalog changes.
         let mutations = std::mem::take(&mut *exec.mutations.lock().unwrap());
         let catalog_dirty = exec.catalog_dirty;
+        // Foreign-key checks this statement postponed (see `DeferredFkCheck`)
+        // because their constraint is currently running `DEFERRED`.
+        let new_deferred: Vec<_> = exec.deferred_checks.borrow_mut().drain(..).collect();
         let new_catalog = exec.catalog;
         match &mut self.txn {
             Some(txn) => {
                 txn.catalog = new_catalog;
                 txn.catalog_dirty |= catalog_dirty;
+                txn.pending_deferred.extend(new_deferred);
                 stage_mutations(txn, mutations);
             }
             None => {
+                // Autocommit: `exec.constraint_modes` was `None` above, which
+                // `Exec::fk_is_deferred` always treats as "check
+                // immediately", so `new_deferred` is always empty here —
+                // there is no transaction for it to survive into anyway.
                 self.apply_mutations(mutations).await?;
                 if catalog_dirty {
                     self.save_catalog(&new_catalog).await?;
@@ -788,6 +830,128 @@ impl<S: RelationalStorage> Session<S> {
                 },
             ))),
         }
+    }
+
+    /// Execute a hand-parsed `SET CONSTRAINTS`, mirroring `execute_one`'s
+    /// transaction semantics (ignored while aborted; an error aborts an open
+    /// block).
+    async fn execute_set_constraints(&mut self, cmd: &SetConstraintsStmt) -> Result<ExecResult> {
+        if self.txn.as_ref().map(|t| t.aborted).unwrap_or(false) {
+            return Err(SqlError::InFailedTransaction);
+        }
+        let outcome = self.set_constraints_inner(cmd).await;
+        if outcome.is_err() {
+            match &mut self.txn {
+                Some(txn) => txn.aborted = true,
+                None => self.db.locks.release_transaction(self.session_id),
+            }
+        }
+        outcome
+    }
+
+    /// `SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }`
+    /// (PostgreSQL semantics, verified against `sql-set-constraints.html` and
+    /// `AfterTriggerSetState` in `src/backend/commands/trigger.c`):
+    ///
+    /// * Name resolution and `DEFERRABLE`-ness validation (the `42704`/`42809`
+    ///   errors below) happen the same way whether or not an explicit
+    ///   transaction block is open — verified against a live PostgreSQL 16
+    ///   instance: `SET CONSTRAINTS bogus_name IMMEDIATE` with no `BEGIN`
+    ///   still raises `42704`, and naming a `NOT DEFERRABLE` constraint with
+    ///   `DEFERRED` outside a block still raises `42809`, each alongside
+    ///   PostgreSQL's own `WARNING: SET CONSTRAINTS can only be used in
+    ///   transaction blocks`.
+    /// * What *is* a no-op outside an explicit transaction block is the mode
+    ///   change itself, plus the retroactive re-check `IMMEDIATE` would
+    ///   otherwise force: there is no transaction-scoped `SET CONSTRAINTS`
+    ///   state to change there, and no deferred check could possibly be
+    ///   pending yet either (`Exec::constraint_modes` is `None` in
+    ///   autocommit, so `Exec::fk_is_deferred` never queues one) — so a
+    ///   *validated* request outside a block has nothing left to do, matching
+    ///   PostgreSQL's "otherwise has no effect."
+    /// * `ALL` sets the blanket mode for every deferrable constraint and
+    ///   forgets any earlier per-name overrides from this transaction
+    ///   (PostgreSQL does exactly this — see `AfterTriggerSetState`'s `ALL`
+    ///   branch) — it never errors, even when some constraint is `NOT
+    ///   DEFERRABLE` (such a constraint is simply unaffected either way).
+    /// * A named constraint that does not exist anywhere reachable is
+    ///   `42704` ("constraint ... does not exist"); a named constraint that
+    ///   is `NOT DEFERRABLE` errors only when asked to go `DEFERRED` —
+    ///   `42809` ("constraint ... is not deferrable", *not* the `42704`
+    ///   "does not exist" a first guess might reach for) — asking for
+    ///   `IMMEDIATE` on one is a silent no-op (it is already always
+    ///   immediate, matching PostgreSQL's own `AfterTriggerSetState`, which
+    ///   only raises that error on the `DEFERRED` branch).
+    /// * Setting `IMMEDIATE` (`ALL` or named) retroactively re-validates
+    ///   every currently pending deferred check the request covers right
+    ///   now, raising the FK violation error immediately if one is still
+    ///   unsatisfied (SQL99/PostgreSQL: "the effects of the SET CONSTRAINTS
+    ///   command apply retroactively").
+    async fn set_constraints_inner(&mut self, stmt: &SetConstraintsStmt) -> Result<ExecResult> {
+        // Resolve + validate against a snapshot first, so a `42704`/`42809`
+        // never partially applies a mode change -- and so validation happens
+        // identically whether or not an explicit transaction block is open
+        // (see the doc comment above).
+        let catalog = match &self.txn {
+            Some(txn) => txn.catalog.clone(),
+            None => self.load_catalog().await?,
+        };
+        let mut identities: Vec<(QualifiedName, String)> = Vec::new();
+        if let Some(names) = &stmt.names {
+            for (schema, name) in names {
+                let matches = catalog.foreign_keys_named(schema.as_deref(), name);
+                if matches.is_empty() {
+                    return Err(SqlError::UndefinedObject(format!(
+                        "constraint \"{name}\" does not exist"
+                    )));
+                }
+                for (table_q, fk) in matches {
+                    if stmt.deferred && !fk.deferrable.is_deferrable() {
+                        return Err(SqlError::WrongObjectType(format!(
+                            "constraint \"{}\" is not deferrable",
+                            fk.name
+                        )));
+                    }
+                    identities.push((table_q, fk.name));
+                }
+            }
+        }
+        // A validated request outside an explicit transaction block has
+        // nothing left to apply (see the doc comment above).
+        if self.txn.is_none() {
+            return Ok(ExecResult::empty_command("SET CONSTRAINTS"));
+        }
+        {
+            let txn = self.txn.as_mut().unwrap();
+            if stmt.names.is_none() {
+                txn.constraint_modes.named.clear();
+                txn.constraint_modes.all_deferred = Some(stmt.deferred);
+            } else {
+                for id in &identities {
+                    txn.constraint_modes.named.insert(id.clone(), stmt.deferred);
+                }
+            }
+        }
+        if !stmt.deferred {
+            let (to_run, keep): (Vec<DeferredFkCheck>, Vec<DeferredFkCheck>) = {
+                let txn = self.txn.as_mut().unwrap();
+                std::mem::take(&mut txn.pending_deferred)
+                    .into_iter()
+                    .partition(|c| {
+                        stmt.names.is_none() || {
+                            let (t, n) = c.identity();
+                            identities
+                                .iter()
+                                .any(|(it, iname)| it == t && iname.as_str() == n)
+                        }
+                    })
+            };
+            self.txn.as_mut().unwrap().pending_deferred = keep;
+            let txn = self.txn.as_ref().unwrap();
+            self.check_deferred(&catalog, &txn.overlay, &txn.truncated, to_run)
+                .await?;
+        }
+        Ok(ExecResult::empty_command("SET CONSTRAINTS"))
     }
 
     /// Persist a modified catalog the way `execute_inner`'s tail does: stage
@@ -952,17 +1116,36 @@ impl<S: RelationalStorage> Session<S> {
                 overlay: HashMap::new(),
                 truncated: HashSet::new(),
                 aborted: false,
+                constraint_modes: ConstraintModes::default(),
+                pending_deferred: Vec::new(),
             });
         }
         Ok(ExecResult::empty_command("BEGIN"))
     }
 
     async fn commit(&mut self) -> Result<ExecResult> {
-        if let Some(txn) = self.txn.take() {
+        if let Some(mut txn) = self.txn.take() {
             // Committing an aborted transaction rolls it back (PostgreSQL).
             if txn.aborted {
                 self.db.locks.release_transaction(self.session_id);
                 return Ok(ExecResult::empty_command("ROLLBACK"));
+            }
+            // PostgreSQL validates any still-`DEFERRED` constraint checks as
+            // the last step before a transaction actually commits; if one is
+            // still violated, `COMMIT` itself fails and the transaction rolls
+            // back (nothing below has run yet, so nothing needs undoing —
+            // `txn`'s writes just disappear with it, and the session has no
+            // transaction afterward, matching PostgreSQL: a re-issued
+            // `COMMIT`/`ROLLBACK` after a failed one finds none in progress).
+            if !txn.pending_deferred.is_empty() {
+                let checks = std::mem::take(&mut txn.pending_deferred);
+                if let Err(e) = self
+                    .check_deferred(&txn.catalog, &txn.overlay, &txn.truncated, checks)
+                    .await
+                {
+                    self.db.locks.release_transaction(self.session_id);
+                    return Err(e);
+                }
             }
             let watch = self.db.has_change_listeners();
             let at = chrono::Utc::now();
@@ -1066,6 +1249,94 @@ impl<S: RelationalStorage> Session<S> {
         Ok(Some(LoadedTable::build(table.clone(), docs, index_defs)?))
     }
 
+    /// Load `q` reflecting explicitly-given `overlay`/`truncated` writes —
+    /// the same merge [`Session::load_table`] does via `self.txn`, factored
+    /// out so it can also be used once a `Transaction` has already been
+    /// taken out of `self.txn` (see [`Session::check_deferred`], called from
+    /// `commit` after `self.txn.take()`).
+    async fn load_table_with_overlay(
+        &self,
+        catalog: &Catalog,
+        q: &QualifiedName,
+        overlay: &HashMap<String, HashMap<String, Option<Json>>>,
+        truncated: &HashSet<String>,
+    ) -> Result<Option<LoadedTable>> {
+        let Some(table) = catalog.get_table(q) else {
+            return Ok(None);
+        };
+        let collection = table.storage_collection.clone();
+        let mut docs = self.db.storage.scan(&collection).await?;
+        let is_truncated = truncated.contains(&collection);
+        let collection_overlay = overlay.get(&collection);
+        if is_truncated || collection_overlay.is_some() {
+            let mut map: std::collections::BTreeMap<String, Json> = if is_truncated {
+                std::collections::BTreeMap::new()
+            } else {
+                docs.into_iter().collect()
+            };
+            if let Some(ov) = collection_overlay {
+                for (rid, val) in ov {
+                    match val {
+                        Some(doc) => {
+                            map.insert(rid.clone(), doc.clone());
+                        }
+                        None => {
+                            map.remove(rid);
+                        }
+                    }
+                }
+            }
+            docs = map.into_iter().collect();
+        }
+        let index_defs = catalog
+            .indexes_for_table(&q.schema, &q.name)
+            .into_iter()
+            .cloned()
+            .collect();
+        Ok(Some(LoadedTable::build(table.clone(), docs, index_defs)?))
+    }
+
+    /// Re-validate every check in `checks` ([`DeferredFkCheck`]) against the
+    /// transaction's *current* state — `overlay`/`truncated` are its own
+    /// staged writes (not yet applied to storage), so this sees exactly what
+    /// the transaction itself would see, whether or not `self.txn` still
+    /// holds it. Loads only the tables the checks actually reference. Called
+    /// by `COMMIT` ([`Session::commit`], after taking the transaction out of
+    /// `self.txn` but before applying its writes) and by `SET CONSTRAINTS
+    /// ... IMMEDIATE` ([`Session::exec_set_constraints`], while `self.txn` is
+    /// still live).
+    async fn check_deferred(
+        &self,
+        catalog: &Catalog,
+        overlay: &HashMap<String, HashMap<String, Option<Json>>>,
+        truncated: &HashSet<String>,
+        checks: Vec<DeferredFkCheck>,
+    ) -> Result<()> {
+        if checks.is_empty() {
+            return Ok(());
+        }
+        let mut tables: HashMap<QualifiedName, LoadedTable> = HashMap::new();
+        for q in deferred_check_tables(&checks, catalog) {
+            if let Some(t) = self
+                .load_table_with_overlay(catalog, &q, overlay, truncated)
+                .await?
+            {
+                tables.insert(q, t);
+            }
+        }
+        let exec = Exec::new(
+            catalog.clone(),
+            tables,
+            Vec::new(),
+            chrono::Utc::now(),
+            self.db.name.clone(),
+            self.username.clone(),
+            self.db.locks.clone(),
+            self.session_id,
+        );
+        exec.fk_drain_deferred(checks)
+    }
+
     async fn apply_mutations(&self, mutations: Vec<Mutation>) -> Result<()> {
         let watch = self.db.has_change_listeners();
         let at = chrono::Utc::now();
@@ -1148,6 +1419,165 @@ fn push_change(
         new: new_live.cloned(),
         commit_time: at,
     });
+}
+
+/// A hand-recognized `SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED |
+/// IMMEDIATE }` — sqlparser 0.62 has no AST for it at all (`CONSTRAINTS`
+/// isn't even one of its keywords), the same situation `ALTER EXTENSION` is
+/// in (see `crate::sql::ext::alter`), so it is recognized by prefix
+/// ([`is_set_constraints`]) and hand-parsed ([`parse_set_constraints`])
+/// instead of going through the general parser.
+struct SetConstraintsStmt {
+    /// `None` = `ALL`; `Some(names)` = the explicit, possibly
+    /// schema-qualified constraint name list — `(schema, name)`, each
+    /// case-folded like any unquoted SQL identifier (quoted names kept
+    /// verbatim).
+    names: Option<Vec<(Option<String>, String)>>,
+    /// `true` = `DEFERRED`, `false` = `IMMEDIATE`.
+    deferred: bool,
+}
+
+/// Whether a statement's first two keywords are `SET CONSTRAINTS` (skipping
+/// leading whitespace and comments), the same by-prefix recognition
+/// `crate::sql::ext::alter::is_alter_extension` uses for `ALTER EXTENSION`.
+fn is_set_constraints(sql: &str) -> bool {
+    let words = leading_keywords(sql, 2);
+    words.first().map(String::as_str) == Some("SET")
+        && words.get(1).map(String::as_str) == Some("CONSTRAINTS")
+}
+
+/// A cursor over a non-whitespace token slice, for [`parse_set_constraints`].
+struct SetConstraintsCursor<'a> {
+    toks: &'a [sqlparser::tokenizer::Token],
+    pos: usize,
+}
+
+impl<'a> SetConstraintsCursor<'a> {
+    fn peek(&self) -> Option<&'a sqlparser::tokenizer::Token> {
+        self.toks.get(self.pos)
+    }
+
+    fn word(&self) -> Option<&str> {
+        match self.peek() {
+            Some(sqlparser::tokenizer::Token::Word(w)) => Some(w.value.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Consume a case-insensitive bare keyword, if next.
+    fn eat_kw(&mut self, kw: &str) -> bool {
+        if self
+            .word()
+            .map(|w| w.eq_ignore_ascii_case(kw))
+            .unwrap_or(false)
+        {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_comma(&mut self) -> bool {
+        if matches!(self.peek(), Some(sqlparser::tokenizer::Token::Comma)) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn eat_period(&mut self) -> bool {
+        if matches!(self.peek(), Some(sqlparser::tokenizer::Token::Period)) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// An identifier: unquoted words fold to lower case, quoted stay verbatim.
+    fn eat_ident(&mut self, what: &str) -> Result<String> {
+        match self.peek() {
+            Some(sqlparser::tokenizer::Token::Word(w)) => {
+                let v = if w.quote_style.is_some() {
+                    w.value.clone()
+                } else {
+                    w.value.to_ascii_lowercase()
+                };
+                self.pos += 1;
+                Ok(v)
+            }
+            other => Err(SqlError::Syntax(format!(
+                "SET CONSTRAINTS: expected {what}, found {}",
+                other
+                    .map(|t| format!("{t:?}"))
+                    .unwrap_or_else(|| "end of input".into())
+            ))),
+        }
+    }
+}
+
+/// Hand-parse one `SET CONSTRAINTS` statement (no trailing `;`), using
+/// sqlparser's own tokenizer for quote- and comment-aware identifier
+/// handling (the same approach `crate::sql::ext::alter` uses a bespoke
+/// lexer for; this borrows sqlparser's instead since the grammar here needs
+/// nothing beyond words/commas/periods).
+fn parse_set_constraints(sql: &str) -> Result<SetConstraintsStmt> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let dialect = sqlparser::dialect::PostgreSqlDialect {};
+    let body = sql.trim().trim_end_matches(';');
+    let tokens: Vec<Token> = Tokenizer::new(&dialect, body)
+        .tokenize()
+        .map_err(|e| SqlError::Syntax(format!("SET CONSTRAINTS: {e}")))?
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+
+    let mut c = SetConstraintsCursor {
+        toks: &tokens,
+        pos: 0,
+    };
+    if !c.eat_kw("SET") || !c.eat_kw("CONSTRAINTS") {
+        return Err(SqlError::Internal(
+            "parse_set_constraints called on non-SET-CONSTRAINTS input".into(),
+        ));
+    }
+    let names = if c.eat_kw("ALL") {
+        None
+    } else {
+        let mut names = Vec::new();
+        loop {
+            let first = c.eat_ident("a constraint name")?;
+            let name = if c.eat_period() {
+                let second = c.eat_ident("a constraint name after '.'")?;
+                (Some(first), second)
+            } else {
+                (None, first)
+            };
+            names.push(name);
+            if !c.eat_comma() {
+                break;
+            }
+        }
+        Some(names)
+    };
+    let deferred = if c.eat_kw("DEFERRED") {
+        true
+    } else if c.eat_kw("IMMEDIATE") {
+        false
+    } else {
+        return Err(SqlError::Syntax(
+            "SET CONSTRAINTS: expected DEFERRED or IMMEDIATE".into(),
+        ));
+    };
+    if c.pos != tokens.len() {
+        return Err(SqlError::Syntax(format!(
+            "SET CONSTRAINTS: unexpected trailing input near {:?}",
+            &tokens[c.pos..]
+        )));
+    }
+    Ok(SetConstraintsStmt { names, deferred })
 }
 
 /// Recognize statements the engine deliberately does not support by their
@@ -1491,6 +1921,31 @@ fn parse_timeout_ms(raw: &str) -> u64 {
     } else {
         raw.parse().unwrap_or(0)
     }
+}
+
+/// Every table a batch of [`DeferredFkCheck`]s references — both the child
+/// (declaring) table and its resolved parent — for preloading before
+/// [`Session::check_deferred`].
+fn deferred_check_tables(checks: &[DeferredFkCheck], catalog: &Catalog) -> Vec<QualifiedName> {
+    let mut set: std::collections::BTreeSet<QualifiedName> = std::collections::BTreeSet::new();
+    for c in checks {
+        match c {
+            DeferredFkCheck::Child { child, fk, .. } => {
+                set.insert(child.clone());
+                if let Some(p) = catalog.resolve_table_name(Some(&fk.ref_schema), &fk.ref_table) {
+                    set.insert(p);
+                }
+            }
+            DeferredFkCheck::Referenced { parent, child, .. } => {
+                set.insert(parent.clone());
+                set.insert(child.clone());
+            }
+            DeferredFkCheck::MatchFullNullMix { child, .. } => {
+                set.insert(child.clone());
+            }
+        }
+    }
+    set.into_iter().collect()
 }
 
 fn stage_mutations(txn: &mut Transaction, mutations: Vec<Mutation>) {
