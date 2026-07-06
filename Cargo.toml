@@ -121,6 +121,11 @@ name = "odm_benchmark"
 harness = false
 required-features = ["odm"]
 
+[[bench]]
+name = "sql_engine"
+harness = false
+required-features = ["sql"]
+
 [workspace]
 members = [
     "guardian-db-derive",
