@@ -250,6 +250,7 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
         "ts_rank" => crate::sql::fts::fn_ts_rank(&args)?,
         "numnode" => crate::sql::fts::fn_numnode(&args)?,
         "strip" => crate::sql::fts::fn_strip(&args)?,
+        "ts_headline" => crate::sql::fts::fn_ts_headline(exec, &args)?,
         // Out-of-subset FTS constructs stay *named*-unsupported: these are
         // PostgreSQL core functions, so "does not exist" (42883) would be
         // untruthful — and 42883 is sidecar-routable, which would silently
@@ -258,7 +259,6 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
         "phraseto_tsquery"
         | "websearch_to_tsquery"
         | "ts_rank_cd"
-        | "ts_headline"
         | "setweight"
         | "ts_delete"
         | "tsvector_to_array"
@@ -277,7 +277,7 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
         | "tsvector_update_trigger_column" => {
             return Err(SqlError::FeatureNotSupported(format!(
                 "{name} is not supported (out of the full-text-search subset: to_tsvector, \
-                 to_tsquery, plainto_tsquery, ts_rank, length, numnode, strip, @@)"
+                 to_tsquery, plainto_tsquery, ts_rank, ts_headline, length, numnode, strip, @@)"
             )));
         }
         // --- Supabase auth helpers (used by row-security policies) ---

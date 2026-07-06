@@ -1,6 +1,8 @@
 //! DML execution: INSERT / UPDATE / DELETE with RETURNING and ON CONFLICT.
 
-use crate::relational::catalog::{QualifiedName, Table, TriggerTiming};
+use crate::relational::catalog::{
+    QualifiedName, Table, TriggerEventDef, TriggerLevel, TriggerTiming,
+};
 use crate::relational::{SqlType, SqlValue, composite_key, ordered_key};
 use crate::sql::error::{Result, SqlError};
 use crate::sql::exec::{Exec, Frame};
@@ -40,6 +42,9 @@ impl Exec {
             .catalog
             .resolve_table_name(schema.as_deref(), &n)
             .ok_or_else(|| SqlError::UndefinedTable(n.clone()))?;
+        if self.catalog.get_view(&q).is_some() {
+            return self.exec_insert_on_view(&q, insert);
+        }
         let table = self.catalog.require_table(&q)?.clone();
 
         // Triggers. `UPDATE OF` matching for the ON CONFLICT DO UPDATE path
@@ -336,7 +341,14 @@ impl Exec {
                     conflict_set_cols.as_ref(),
                 )?;
             }
-            self.fire_statement_triggers(&table, TriggerTiming::After, TriggerOp::Insert, None)?;
+            self.fire_statement_triggers_ex(
+                &table,
+                TriggerTiming::After,
+                TriggerOp::Insert,
+                None,
+                &inserted_rows,
+                &[],
+            )?;
         }
 
         if let Some(returning) = &insert.returning {
@@ -469,8 +481,8 @@ impl Exec {
                 continue;
             }
             let key = ordered_key(&key_vals);
-            if let Some(rid) = idx.data.get(&key).into_iter().next() {
-                return Some(rid);
+            if let Some(rid) = idx.data.get(&key).iter().next() {
+                return Some(rid.clone());
             }
         }
         None
@@ -550,6 +562,9 @@ impl Exec {
 
     pub fn exec_update(&mut self, update: &sqlparser::ast::Update) -> Result<ExecResult> {
         let (alias, q) = self.resolve_target(&update.table.relation)?;
+        if self.catalog.get_view(&q).is_some() {
+            return self.exec_update_on_view(&q, update);
+        }
         let table = self.catalog.require_table(&q)?.clone();
         let collection = table.storage_collection.clone();
         let schema = table_schema(&table, &alias);
@@ -761,6 +776,9 @@ impl Exec {
                 .ok_or_else(|| SqlError::Syntax("DELETE without table".into()))?,
         };
         let (alias, q) = self.resolve_target(relation)?;
+        if self.catalog.get_view(&q).is_some() {
+            return self.exec_delete_on_view(&q, delete);
+        }
         let table = self.catalog.require_table(&q)?.clone();
         let collection = table.storage_collection.clone();
         let schema = table_schema(&table, &alias);
@@ -843,6 +861,7 @@ impl Exec {
                 .map(|row| crate::sql::fk::RiWork::Deleted {
                     table: q.clone(),
                     row: row.clone(),
+                    cascade_depth: 1,
                 })
                 .collect();
             self.fk_apply_referential_actions(work)?;
@@ -861,6 +880,275 @@ impl Exec {
 
         if let Some(returning) = &delete.returning {
             return self.returning_result(&table, deleted, returning);
+        }
+        Ok(ExecResult::empty_command(format!("DELETE {count}")))
+    }
+
+    // ---- INSTEAD OF view routing ---------------------------------------
+
+    /// Route an INSERT into a view by firing its INSTEAD OF INSERT triggers.
+    /// If no such triggers exist, mirrors PostgreSQL's 0A000 error.
+    fn exec_insert_on_view(&mut self, q: &QualifiedName, insert: &Insert) -> Result<ExecResult> {
+        let (view_cols, view_query_str, has_triggers) = {
+            let view = self
+                .catalog
+                .get_view(q)
+                .ok_or_else(|| SqlError::UndefinedTable(q.name.clone()))?;
+            let has = view.triggers.iter().any(|t| {
+                t.enabled
+                    && t.timing == TriggerTiming::InsteadOf
+                    && t.level == TriggerLevel::Row
+                    && t.events
+                        .iter()
+                        .any(|e| matches!(e, TriggerEventDef::Insert))
+            });
+            (view.columns.clone(), view.query.clone(), has)
+        };
+        if !has_triggers {
+            return Err(SqlError::FeatureNotSupported(format!(
+                "cannot insert into view \"{}\"",
+                q.name
+            )));
+        }
+
+        let target_cols: Vec<String> = if !insert.columns.is_empty() {
+            insert
+                .columns
+                .iter()
+                .map(|on| {
+                    on.0.last()
+                        .and_then(|p| p.as_ident())
+                        .map(ident_name)
+                        .unwrap_or_default()
+                })
+                .collect()
+        } else if !view_cols.is_empty() {
+            view_cols.clone()
+        } else {
+            // Derive column names from the view's SELECT query (no explicit
+            // column list was given at CREATE VIEW time).
+            let stmts = crate::sql::parser::parse_sql(&view_query_str)?;
+            let query = match stmts.into_iter().next() {
+                Some(sqlparser::ast::Statement::Query(q)) => q,
+                _ => return Err(SqlError::Internal("view definition is not a query".into())),
+            };
+            let rs = self.exec_select_query(&query, &[])?;
+            rs.schema.fields.iter().map(|f| f.name.clone()).collect()
+        };
+
+        let provided_rows: Vec<RowValues> = match &insert.source {
+            None => vec![RowValues::new()],
+            Some(src) => match src.body.as_ref() {
+                sqlparser::ast::SetExpr::Values(values) => {
+                    let mut out = Vec::new();
+                    for row in &values.rows {
+                        let content = &row.content;
+                        if content.len() != target_cols.len() {
+                            return Err(SqlError::Syntax(format!(
+                                "INSERT has {} target columns but {} values",
+                                target_cols.len(),
+                                content.len()
+                            )));
+                        }
+                        let mut map = RowValues::new();
+                        for (col, expr) in target_cols.iter().zip(content) {
+                            if !is_default_expr(expr) {
+                                map.insert(col.clone(), self.eval(expr, &[])?);
+                            }
+                        }
+                        out.push(map);
+                    }
+                    out
+                }
+                _ => {
+                    let rs = self.exec_select_query(src, &[])?;
+                    let mut out = Vec::new();
+                    for row in rs.rows {
+                        if row.len() != target_cols.len() {
+                            return Err(SqlError::Syntax(format!(
+                                "INSERT has {} target columns but {} values",
+                                target_cols.len(),
+                                row.len()
+                            )));
+                        }
+                        out.push(target_cols.iter().cloned().zip(row).collect());
+                    }
+                    out
+                }
+            },
+        };
+
+        let mut count = 0usize;
+        for new_row in provided_rows {
+            if self
+                .fire_instead_of_row(q, TriggerOp::Insert, None, Some(new_row), None)?
+                .is_some()
+            {
+                count += 1;
+            }
+        }
+        Ok(ExecResult::empty_command(format!("INSERT 0 {count}")))
+    }
+
+    /// Route an UPDATE targeting a view by firing its INSTEAD OF UPDATE triggers.
+    fn exec_update_on_view(
+        &mut self,
+        q: &QualifiedName,
+        update: &sqlparser::ast::Update,
+    ) -> Result<ExecResult> {
+        let (view_name, has_triggers) = {
+            let view = self
+                .catalog
+                .get_view(q)
+                .ok_or_else(|| SqlError::UndefinedTable(q.name.clone()))?;
+            let has = view.triggers.iter().any(|t| {
+                t.enabled
+                    && t.timing == TriggerTiming::InsteadOf
+                    && t.level == TriggerLevel::Row
+                    && t.events
+                        .iter()
+                        .any(|e| matches!(e, TriggerEventDef::Update { .. }))
+            });
+            (view.name.clone(), has)
+        };
+        if !has_triggers {
+            return Err(SqlError::FeatureNotSupported(format!(
+                "cannot update view \"{}\"",
+                view_name
+            )));
+        }
+
+        let set_cols: BTreeSet<String> = update
+            .assignments
+            .iter()
+            .map(|a| assignment_column(&a.target))
+            .collect::<Result<_>>()?;
+
+        let view_query = self.catalog.get_view(q).map(|v| v.query.clone()).unwrap();
+        let stmts = crate::sql::parser::parse_sql(&view_query)?;
+        let query = match stmts.into_iter().next() {
+            Some(sqlparser::ast::Statement::Query(q)) => q,
+            _ => return Err(SqlError::Internal("view definition is not a query".into())),
+        };
+        let rs = self.exec_select_query(&query, &[])?;
+
+        let mut row_pairs: Vec<(RowValues, RowValues)> = Vec::new();
+        for tuple in &rs.rows {
+            let matched = match &update.selection {
+                Some(sel) => {
+                    let frame = Frame {
+                        schema: &rs.schema,
+                        row: tuple,
+                    };
+                    self.eval(sel, &[frame])?.truthy() == Some(true)
+                }
+                None => true,
+            };
+            if !matched {
+                continue;
+            }
+            let old_row: RowValues = rs
+                .schema
+                .fields
+                .iter()
+                .zip(tuple.iter())
+                .map(|(f, v)| (f.name.clone(), v.clone()))
+                .collect();
+            let mut new_row = old_row.clone();
+            for a in &update.assignments {
+                let col = assignment_column(&a.target)?;
+                let frame = Frame {
+                    schema: &rs.schema,
+                    row: tuple,
+                };
+                let value = self.eval(&a.value, &[frame])?;
+                new_row.insert(col, value);
+            }
+            row_pairs.push((old_row, new_row));
+        }
+
+        let mut count = 0usize;
+        for (old_row, new_row) in row_pairs {
+            if self
+                .fire_instead_of_row(
+                    q,
+                    TriggerOp::Update,
+                    Some(&old_row),
+                    Some(new_row),
+                    Some(&set_cols),
+                )?
+                .is_some()
+            {
+                count += 1;
+            }
+        }
+        Ok(ExecResult::empty_command(format!("UPDATE {count}")))
+    }
+
+    /// Route a DELETE targeting a view by firing its INSTEAD OF DELETE triggers.
+    fn exec_delete_on_view(&mut self, q: &QualifiedName, delete: &Delete) -> Result<ExecResult> {
+        let (view_name, has_triggers) = {
+            let view = self
+                .catalog
+                .get_view(q)
+                .ok_or_else(|| SqlError::UndefinedTable(q.name.clone()))?;
+            let has = view.triggers.iter().any(|t| {
+                t.enabled
+                    && t.timing == TriggerTiming::InsteadOf
+                    && t.level == TriggerLevel::Row
+                    && t.events
+                        .iter()
+                        .any(|e| matches!(e, TriggerEventDef::Delete))
+            });
+            (view.name.clone(), has)
+        };
+        if !has_triggers {
+            return Err(SqlError::FeatureNotSupported(format!(
+                "cannot delete from view \"{}\"",
+                view_name
+            )));
+        }
+
+        let view_query = self.catalog.get_view(q).map(|v| v.query.clone()).unwrap();
+        let stmts = crate::sql::parser::parse_sql(&view_query)?;
+        let query = match stmts.into_iter().next() {
+            Some(sqlparser::ast::Statement::Query(q)) => q,
+            _ => return Err(SqlError::Internal("view definition is not a query".into())),
+        };
+        let rs = self.exec_select_query(&query, &[])?;
+
+        let mut old_rows: Vec<RowValues> = Vec::new();
+        for tuple in &rs.rows {
+            let matched = match &delete.selection {
+                Some(sel) => {
+                    let frame = Frame {
+                        schema: &rs.schema,
+                        row: tuple,
+                    };
+                    self.eval(sel, &[frame])?.truthy() == Some(true)
+                }
+                None => true,
+            };
+            if matched {
+                let old_row: RowValues = rs
+                    .schema
+                    .fields
+                    .iter()
+                    .zip(tuple.iter())
+                    .map(|(f, v)| (f.name.clone(), v.clone()))
+                    .collect();
+                old_rows.push(old_row);
+            }
+        }
+
+        let mut count = 0usize;
+        for old_row in old_rows {
+            if self
+                .fire_instead_of_row(q, TriggerOp::Delete, Some(&old_row), None, None)?
+                .is_some()
+            {
+                count += 1;
+            }
         }
         Ok(ExecResult::empty_command(format!("DELETE {count}")))
     }

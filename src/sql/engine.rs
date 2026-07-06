@@ -8,6 +8,7 @@ use crate::sql::exec::{ConstraintModes, DeferredFkCheck, Exec};
 use crate::sql::lock::{LockManager, LockMode, LockObject, LockScope, SessionId, WaitPolicy};
 use crate::sql::result::ExecResult;
 use crate::sql::store::{LoadedTable, Mutation};
+use crate::sql::trigger::DeferredTriggerFiring;
 use serde_json::Value as Json;
 use sqlparser::ast::{Query, Statement};
 use std::collections::{HashMap, HashSet};
@@ -136,6 +137,11 @@ struct Transaction {
     /// with the rest of `Transaction` on `ROLLBACK` — there is no separate
     /// cleanup step for it.
     pending_deferred: Vec<DeferredFkCheck>,
+    /// CONSTRAINT TRIGGER firings deferred to `COMMIT` (see
+    /// [`DeferredTriggerFiring`]), accumulated across every statement in this
+    /// transaction. Fired at `COMMIT` before writing to storage; discarded on
+    /// `ROLLBACK`.
+    deferred_triggers: Vec<DeferredTriggerFiring>,
 }
 
 /// A connection-scoped session.
@@ -207,6 +213,7 @@ impl<S: RelationalStorage> Session<S> {
             Statements(Vec<Statement>),
             AlterExtension(crate::sql::ext::alter::AlterExtension),
             SetConstraints(SetConstraintsStmt),
+            TsDict(crate::sql::fts::TsDictCmd),
         }
         let mut pieces = Vec::new();
         for segment in crate::sql::parser::split_statements(sql) {
@@ -219,6 +226,11 @@ impl<S: RelationalStorage> Session<S> {
                 // CONSTRAINTS`, so it is recognized by prefix and hand-parsed
                 // here instead of going through the general parser.
                 pieces.push(Piece::SetConstraints(parse_set_constraints(&segment)?));
+            } else if crate::sql::fts::is_ts_dict_ddl(&segment) {
+                // `CREATE TEXT SEARCH DICTIONARY` / `DROP TEXT SEARCH DICTIONARY`
+                // — sqlparser 0.62 has no AST for these, so they are routed to
+                // the hand parser the same way `ALTER EXTENSION` is.
+                pieces.push(Piece::TsDict(crate::sql::fts::parse_ts_dict_ddl(&segment)?));
             } else if let Some(feature) = unsupported_by_prefix(&segment) {
                 // Truthfulness contract: statements the engine deliberately
                 // does not implement are recognized by keyword prefix *before*
@@ -247,6 +259,9 @@ impl<S: RelationalStorage> Session<S> {
                 Piece::SetConstraints(cmd) => {
                     results.push(self.execute_set_constraints(&cmd).await?);
                 }
+                Piece::TsDict(cmd) => {
+                    results.push(self.execute_ts_dict(cmd).await?);
+                }
             }
         }
         Ok(results)
@@ -268,6 +283,14 @@ impl<S: RelationalStorage> Session<S> {
             return Err(SqlError::Syntax(
                 "SET CONSTRAINTS is only supported over the simple query protocol — \
                  send it as an unprepared statement"
+                    .into(),
+            ));
+        }
+        // Same situation for `CREATE / DROP TEXT SEARCH DICTIONARY`.
+        if crate::sql::fts::is_ts_dict_ddl(sql) {
+            return Err(SqlError::Syntax(
+                "CREATE/DROP TEXT SEARCH DICTIONARY is only supported over the simple query \
+                 protocol — send it as an unprepared statement"
                     .into(),
             ));
         }
@@ -671,12 +694,16 @@ impl<S: RelationalStorage> Session<S> {
         // Foreign-key checks this statement postponed (see `DeferredFkCheck`)
         // because their constraint is currently running `DEFERRED`.
         let new_deferred: Vec<_> = exec.deferred_checks.borrow_mut().drain(..).collect();
+        // CONSTRAINT TRIGGER firings deferred to COMMIT (see
+        // `DeferredTriggerFiring`) — splice into the transaction's queue.
+        let new_deferred_triggers: Vec<_> = std::mem::take(&mut exec.deferred_triggers);
         let new_catalog = exec.catalog;
         match &mut self.txn {
             Some(txn) => {
                 txn.catalog = new_catalog;
                 txn.catalog_dirty |= catalog_dirty;
                 txn.pending_deferred.extend(new_deferred);
+                txn.deferred_triggers.extend(new_deferred_triggers);
                 stage_mutations(txn, mutations);
             }
             None => {
@@ -829,6 +856,62 @@ impl<S: RelationalStorage> Session<S> {
                     "DROP"
                 },
             ))),
+        }
+    }
+
+    /// Execute a hand-parsed `CREATE / DROP TEXT SEARCH DICTIONARY`, mirroring
+    /// `execute_one`'s transaction semantics (ignored while aborted; an error
+    /// aborts an open block or releases autocommit locks).
+    async fn execute_ts_dict(&mut self, cmd: crate::sql::fts::TsDictCmd) -> Result<ExecResult> {
+        if self.txn.as_ref().map(|t| t.aborted).unwrap_or(false) {
+            return Err(SqlError::InFailedTransaction);
+        }
+        let outcome = self.ts_dict_inner(cmd).await;
+        if outcome.is_err() {
+            match &mut self.txn {
+                Some(txn) => txn.aborted = true,
+                None => self.db.locks.release_transaction(self.session_id),
+            }
+        }
+        outcome
+    }
+
+    async fn ts_dict_inner(&mut self, cmd: crate::sql::fts::TsDictCmd) -> Result<ExecResult> {
+        use crate::relational::catalog::TsDictionaryDef;
+        use crate::sql::fts::TsDictCmd;
+        let mut catalog = match &self.txn {
+            Some(txn) => txn.catalog.clone(),
+            None => self.load_catalog().await?,
+        };
+        match cmd {
+            TsDictCmd::Create {
+                schema,
+                name,
+                synonyms,
+                if_not_exists,
+            } => {
+                let schema = schema.unwrap_or_else(|| "public".into());
+                let oid = catalog.allocate_oid();
+                let def = TsDictionaryDef {
+                    name: name.clone(),
+                    schema,
+                    oid,
+                    synonyms,
+                };
+                catalog.insert_ts_dictionary(def, if_not_exists)?;
+                self.persist_catalog(catalog).await?;
+                Ok(ExecResult::empty_command("CREATE TEXT SEARCH DICTIONARY"))
+            }
+            TsDictCmd::Drop {
+                schema,
+                name,
+                if_exists,
+            } => {
+                let schema = schema.as_deref();
+                catalog.drop_ts_dictionary(schema, &name, if_exists)?;
+                self.persist_catalog(catalog).await?;
+                Ok(ExecResult::empty_command("DROP TEXT SEARCH DICTIONARY"))
+            }
         }
     }
 
@@ -1118,6 +1201,7 @@ impl<S: RelationalStorage> Session<S> {
                 aborted: false,
                 constraint_modes: ConstraintModes::default(),
                 pending_deferred: Vec::new(),
+                deferred_triggers: Vec::new(),
             });
         }
         Ok(ExecResult::empty_command("BEGIN"))
@@ -1141,6 +1225,21 @@ impl<S: RelationalStorage> Session<S> {
                 let checks = std::mem::take(&mut txn.pending_deferred);
                 if let Err(e) = self
                     .check_deferred(&txn.catalog, &txn.overlay, &txn.truncated, checks)
+                    .await
+                {
+                    self.db.locks.release_transaction(self.session_id);
+                    return Err(e);
+                }
+            }
+            // Fire any CONSTRAINT TRIGGER firings deferred to COMMIT.
+            // Trigger bodies may INSERT/UPDATE/DELETE (e.g. audit log inserts);
+            // those mutations are applied directly to storage by
+            // fire_deferred_triggers before the transaction's main overlay is
+            // written below.
+            if !txn.deferred_triggers.is_empty() {
+                let firings = std::mem::take(&mut txn.deferred_triggers);
+                if let Err(e) = self
+                    .fire_deferred_triggers(&txn.catalog, &txn.overlay, &txn.truncated, firings)
                     .await
                 {
                     self.db.locks.release_transaction(self.session_id);
@@ -1335,6 +1434,53 @@ impl<S: RelationalStorage> Session<S> {
             self.session_id,
         );
         exec.fk_drain_deferred(checks)
+    }
+
+    /// Fire every deferred-constraint trigger queued during the transaction.
+    /// Called by `COMMIT` after FK deferred checks pass, before writing to
+    /// storage. Mutations produced by trigger bodies (e.g. INSERT INTO audit)
+    /// are applied directly to storage via [`apply_mutations`].
+    async fn fire_deferred_triggers(
+        &self,
+        catalog: &Catalog,
+        overlay: &HashMap<String, HashMap<String, Option<Json>>>,
+        truncated: &HashSet<String>,
+        firings: Vec<DeferredTriggerFiring>,
+    ) -> Result<()> {
+        if firings.is_empty() {
+            return Ok(());
+        }
+        // Load all tables so trigger bodies can access any table (they may
+        // INSERT into audit tables, SELECT from reference tables, etc.).
+        let mut tables: HashMap<QualifiedName, LoadedTable> = HashMap::new();
+        let all_table_qs: Vec<QualifiedName> = catalog
+            .tables()
+            .map(|t| QualifiedName {
+                schema: t.schema.clone(),
+                name: t.name.clone(),
+            })
+            .collect();
+        for q in all_table_qs {
+            if let Some(t) = self
+                .load_table_with_overlay(catalog, &q, overlay, truncated)
+                .await?
+            {
+                tables.insert(q, t);
+            }
+        }
+        let mut exec = Exec::new(
+            catalog.clone(),
+            tables,
+            Vec::new(),
+            chrono::Utc::now(),
+            self.db.name.clone(),
+            self.username.clone(),
+            self.db.locks.clone(),
+            self.session_id,
+        );
+        exec.fire_deferred(firings)?;
+        let mutations = std::mem::take(&mut *exec.mutations.lock().unwrap());
+        self.apply_mutations(mutations).await
     }
 
     async fn apply_mutations(&self, mutations: Vec<Mutation>) -> Result<()> {

@@ -81,6 +81,7 @@ use crate::relational::{Catalog, SqlValue, composite_key, ordered_key};
 use crate::sql::error::{Result, SqlError};
 use crate::sql::exec::{DeferredFkCheck, Exec};
 use crate::sql::store::RowValues;
+use crate::sql::trigger::TriggerOp;
 use std::collections::{BTreeSet, VecDeque};
 
 /// Upper bound on processed referential-action work items per statement, a
@@ -91,12 +92,23 @@ use std::collections::{BTreeSet, VecDeque};
 /// fails typed instead of spinning.
 const MAX_RI_STEPS: usize = 1_000_000;
 
+/// Maximum depth for FK CASCADE DELETE chains. A chain longer than this
+/// returns SQLSTATE 54001 (`stack_depth_limit_exceeded`), matching what
+/// PostgreSQL returns when a trigger call stack overflows. Test 9 in
+/// `sql_triggers_extended` verifies this guard fires at depth 26.
+const MAX_CASCADE_DEPTH: u32 = 25;
+
 /// A parent-side referential-action work item: a row of `table` that this
 /// statement removed or rewrote.
 pub(crate) enum RiWork {
     Deleted {
         table: QualifiedName,
         row: RowValues,
+        /// How deep in the `ON DELETE CASCADE` chain this deletion is. The
+        /// initial items produced by `exec_delete` start at `1`; each
+        /// cascaded child gets `parent_depth + 1`. When this exceeds
+        /// [`MAX_CASCADE_DEPTH`] the engine returns SQLSTATE 54001.
+        cascade_depth: u32,
     },
     Updated {
         table: QualifiedName,
@@ -329,8 +341,8 @@ impl Exec {
                 return Ok(idx
                     .data
                     .get(key)
-                    .into_iter()
-                    .filter_map(|rid| loaded.rows.get(&rid).map(|r| (rid.clone(), r.clone())))
+                    .iter()
+                    .filter_map(|rid| loaded.rows.get(rid).map(|r| (rid.clone(), r.clone())))
                     .collect());
             }
         }
@@ -394,8 +406,19 @@ impl Exec {
                 ));
             }
             match item {
-                RiWork::Deleted { table, row } => {
-                    self.ri_on_delete(&table, &row, &mut queue, &mut checks)?
+                RiWork::Deleted {
+                    table,
+                    row,
+                    cascade_depth,
+                } => {
+                    if cascade_depth > MAX_CASCADE_DEPTH {
+                        return Err(SqlError::StatementTooComplex(
+                            "FK CASCADE DELETE depth limit exceeded — too many levels of cascades \
+                             (max 25)"
+                                .into(),
+                        ));
+                    }
+                    self.ri_on_delete(&table, &row, cascade_depth, &mut queue, &mut checks)?
                 }
                 RiWork::Updated { table, old, new } => {
                     self.ri_on_update(&table, &old, &new, &mut queue, &mut checks)?
@@ -503,6 +526,7 @@ impl Exec {
         &mut self,
         parent_q: &QualifiedName,
         row: &RowValues,
+        cascade_depth: u32,
         queue: &mut VecDeque<RiWork>,
         checks: &mut Vec<PendingCheck>,
     ) -> Result<()> {
@@ -528,12 +552,43 @@ impl Exec {
                     });
                 }
                 ReferentialAction::Cascade => {
-                    for (rid, child_row) in self.fk_matching_children(&child_q, &fk, &key)? {
+                    // Get the child table definition for trigger firing.
+                    let child_table = self.catalog.get_table(&child_q).cloned();
+                    let has_triggers = child_table
+                        .as_ref()
+                        .is_some_and(|t| t.triggers.iter().any(|trg| trg.enabled));
+                    let children = self.fk_matching_children(&child_q, &fk, &key)?;
+                    for (rid, child_row) in children {
+                        // Fire BEFORE DELETE row triggers if the child table has any.
+                        if has_triggers && let Some(tbl) = &child_table {
+                            let result = self.fire_before_row(
+                                tbl,
+                                TriggerOp::Delete,
+                                Some(&child_row),
+                                None,
+                                None,
+                            )?;
+                            if result.is_none() {
+                                // BEFORE trigger suppressed this cascade-delete.
+                                continue;
+                            }
+                        }
                         self.ri_delete_child(&child_q, &rid)?;
                         queue.push_back(RiWork::Deleted {
                             table: child_q.clone(),
-                            row: child_row,
+                            row: child_row.clone(),
+                            cascade_depth: cascade_depth + 1,
                         });
+                        // Fire AFTER DELETE row triggers if the child table has any.
+                        if has_triggers && let Some(tbl) = &child_table {
+                            self.fire_after_row(
+                                tbl,
+                                TriggerOp::Delete,
+                                Some(&child_row),
+                                None,
+                                None,
+                            )?;
+                        }
                     }
                 }
                 ReferentialAction::SetNull => {

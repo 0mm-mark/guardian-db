@@ -1301,6 +1301,7 @@ fn relabel(mut rs: RowSet, alias: &str) -> RowSet {
     for f in &mut rs.schema.fields {
         f.table = Some(alias.to_string());
     }
+    rs.schema.rebuild_lookup();
     rs
 }
 

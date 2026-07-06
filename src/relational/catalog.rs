@@ -9,7 +9,7 @@ use crate::relational::error::{RelError, Result};
 use crate::relational::types::SqlType;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// First OID handed out to user objects (mirrors PostgreSQL's `FirstNormalObjectId`).
 pub const FIRST_USER_OID: u32 = 16384;
@@ -252,12 +252,12 @@ pub struct Policy {
 }
 
 /// When a trigger fires relative to the triggering event (`BEFORE`/`AFTER`).
-/// `INSTEAD OF` is deliberately absent: views are SELECT-only here, so it is
-/// rejected at `CREATE TRIGGER` time with `0A000`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TriggerTiming {
     Before,
     After,
+    /// `INSTEAD OF` — only on views, always `FOR EACH ROW`.
+    InsteadOf,
 }
 
 impl TriggerTiming {
@@ -266,6 +266,7 @@ impl TriggerTiming {
         match self {
             TriggerTiming::Before => "BEFORE",
             TriggerTiming::After => "AFTER",
+            TriggerTiming::InsteadOf => "INSTEAD OF",
         }
     }
 }
@@ -288,8 +289,7 @@ impl TriggerLevel {
     }
 }
 
-/// One triggering event of a trigger definition (`INSERT OR UPDATE OF a, b OR
-/// DELETE`). `TRUNCATE` is deliberately absent (rejected `0A000`).
+/// One triggering event of a trigger definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TriggerEventDef {
     Insert,
@@ -300,6 +300,8 @@ pub enum TriggerEventDef {
         columns: Vec<String>,
     },
     Delete,
+    /// TRUNCATE event — only valid for `FOR EACH STATEMENT` triggers.
+    Truncate,
 }
 
 fn default_true() -> bool {
@@ -331,9 +333,28 @@ pub struct TriggerDef {
     /// the field deserialize as enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// True for `CREATE CONSTRAINT TRIGGER`. Must be AFTER FOR EACH ROW.
+    #[serde(default)]
+    pub is_constraint: bool,
+    /// Whether the constraint trigger is deferrable.
+    #[serde(default)]
+    pub deferrable: bool,
+    /// Whether the constraint trigger fires at end-of-transaction by default.
+    #[serde(default)]
+    pub initially_deferred: bool,
+    /// REFERENCING OLD TABLE AS <alias> (statement-level only).
+    #[serde(default)]
+    pub referencing_old: Option<String>,
+    /// REFERENCING NEW TABLE AS <alias> (statement-level only).
+    #[serde(default)]
+    pub referencing_new: Option<String>,
+    /// True when attached to a view (timing must be InsteadOf).
+    #[serde(default)]
+    pub on_view: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "TableDe")]
 pub struct Table {
     pub oid: u32,
     pub schema: String,
@@ -363,11 +384,72 @@ pub struct Table {
     /// keep loading unchanged.
     #[serde(default)]
     pub triggers: Vec<TriggerDef>,
+    /// O(1) column lookup by name. Not serialized; rebuilt from `columns` on
+    /// construction and after any structural column change.
+    #[serde(skip)]
+    pub(crate) column_map: HashMap<String, usize>,
+}
+
+/// Deserialization helper for [`Table`]. Mirrors all serialized fields; the
+/// `column_map` acceleration index is rebuilt via [`From<TableDe>`].
+#[derive(Deserialize)]
+struct TableDe {
+    oid: u32,
+    schema: String,
+    name: String,
+    columns: Vec<Column>,
+    primary_key: Option<PrimaryKey>,
+    uniques: Vec<UniqueConstraint>,
+    foreign_keys: Vec<ForeignKey>,
+    checks: Vec<CheckConstraint>,
+    storage_collection: String,
+    #[serde(default)]
+    rls_enabled: bool,
+    #[serde(default)]
+    rls_forced: bool,
+    #[serde(default)]
+    policies: Vec<Policy>,
+    #[serde(default)]
+    triggers: Vec<TriggerDef>,
+}
+
+impl From<TableDe> for Table {
+    fn from(d: TableDe) -> Self {
+        let mut t = Table {
+            oid: d.oid,
+            schema: d.schema,
+            name: d.name,
+            columns: d.columns,
+            primary_key: d.primary_key,
+            uniques: d.uniques,
+            foreign_keys: d.foreign_keys,
+            checks: d.checks,
+            storage_collection: d.storage_collection,
+            rls_enabled: d.rls_enabled,
+            rls_forced: d.rls_forced,
+            policies: d.policies,
+            triggers: d.triggers,
+            column_map: HashMap::new(),
+        };
+        t.rebuild_column_map();
+        t
+    }
 }
 
 impl Table {
+    /// Rebuild the O(1) `column_map` from `self.columns`.
+    ///
+    /// Must be called after any structural change to `self.columns` (push,
+    /// retain, rename, etc.) to keep the acceleration index in sync.
+    pub fn rebuild_column_map(&mut self) {
+        self.column_map.clear();
+        for (i, c) in self.columns.iter().enumerate() {
+            self.column_map.insert(c.name.clone(), i);
+        }
+    }
+
     pub fn column(&self, name: &str) -> Option<&Column> {
-        self.columns.iter().find(|c| c.name == name)
+        self.column_map.get(name).map(|&i| &self.columns[i])
     }
 
     pub fn policy(&self, name: &str) -> Option<&Policy> {
@@ -379,11 +461,14 @@ impl Table {
     }
 
     pub fn column_mut(&mut self, name: &str) -> Option<&mut Column> {
-        self.columns.iter_mut().find(|c| c.name == name)
+        // Resolve the index first (immutable borrow ends before the mutable
+        // borrow of self.columns begins, satisfying the borrow checker).
+        let idx = *self.column_map.get(name)?;
+        Some(&mut self.columns[idx])
     }
 
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name == name)
+        self.column_map.get(name).copied()
     }
 
     pub fn qualified(&self) -> QualifiedName {
@@ -428,6 +513,15 @@ pub struct View {
     /// The SQL text of the SELECT defining the view.
     pub query: String,
     pub columns: Vec<String>,
+    /// INSTEAD OF triggers attached to this view.
+    #[serde(default)]
+    pub triggers: Vec<TriggerDef>,
+}
+
+impl View {
+    pub fn trigger(&self, name: &str) -> Option<&TriggerDef> {
+        self.triggers.iter().find(|t| t.name == name)
+    }
 }
 
 /// The implementation language of a user-defined function body.
@@ -525,8 +619,23 @@ pub enum DropFunctionByName {
     Ambiguous,
 }
 
+/// A user-defined text search dictionary (currently: synonym type only).
+/// Persisted in the catalog so synonym expansions survive restarts and
+/// replicate to peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TsDictionaryDef {
+    pub name: String,
+    pub schema: String,
+    pub oid: u32,
+    /// Inline synonym map: word (lowercased) -> list of synonym strings.
+    /// Built from the `SYNONYMS = 'word:syn1,syn2;word2:syn3'` option at
+    /// CREATE TIME.
+    pub synonyms: BTreeMap<String, Vec<String>>,
+}
+
 /// The authoritative, serializable relational catalog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "CatalogRaw")]
 pub struct Catalog {
     pub database: String,
     schemas: BTreeMap<String, Schema>,
@@ -545,6 +654,61 @@ pub struct Catalog {
     /// the same backward-compatible pattern as `rls_enabled`.
     #[serde(default)]
     functions: Vec<FunctionDef>,
+    /// User-defined text search dictionaries (`CREATE TEXT SEARCH DICTIONARY`).
+    /// Serde-defaulted so catalogs predating this field keep loading.
+    #[serde(default)]
+    ts_dictionaries: Vec<TsDictionaryDef>,
+    /// Reverse map: (schema, table) -> list of index QualifiedNames for O(1)
+    /// `indexes_for_table` lookup. Not persisted — rebuilt on deserialization
+    /// and maintained by `insert_index` / `drop_index`.
+    #[serde(skip)]
+    table_to_indexes: HashMap<(String, String), Vec<QualifiedName>>,
+}
+
+/// Deserialization shim for [`Catalog`]. Mirrors all persisted fields;
+/// `table_to_indexes` is not stored — it is rebuilt via [`From<CatalogRaw>`].
+#[derive(Deserialize)]
+struct CatalogRaw {
+    database: String,
+    schemas: BTreeMap<String, Schema>,
+    tables: BTreeMap<QualifiedName, Table>,
+    indexes: BTreeMap<QualifiedName, Index>,
+    sequences: BTreeMap<QualifiedName, Sequence>,
+    views: BTreeMap<QualifiedName, View>,
+    next_oid: u32,
+    search_path: Vec<String>,
+    #[serde(default)]
+    extensions: BTreeMap<String, String>,
+    #[serde(default)]
+    functions: Vec<FunctionDef>,
+    #[serde(default)]
+    ts_dictionaries: Vec<TsDictionaryDef>,
+}
+
+impl From<CatalogRaw> for Catalog {
+    fn from(raw: CatalogRaw) -> Self {
+        let mut table_to_indexes: HashMap<(String, String), Vec<QualifiedName>> = HashMap::new();
+        for (q, idx) in &raw.indexes {
+            table_to_indexes
+                .entry((idx.schema.clone(), idx.table.clone()))
+                .or_default()
+                .push(q.clone());
+        }
+        Catalog {
+            database: raw.database,
+            schemas: raw.schemas,
+            tables: raw.tables,
+            indexes: raw.indexes,
+            sequences: raw.sequences,
+            views: raw.views,
+            next_oid: raw.next_oid,
+            search_path: raw.search_path,
+            extensions: raw.extensions,
+            functions: raw.functions,
+            ts_dictionaries: raw.ts_dictionaries,
+            table_to_indexes,
+        }
+    }
 }
 
 impl Catalog {
@@ -561,6 +725,8 @@ impl Catalog {
             search_path: vec!["public".to_string()],
             extensions: BTreeMap::new(),
             functions: Vec::new(),
+            ts_dictionaries: Vec::new(),
+            table_to_indexes: HashMap::new(),
         };
         // PostgreSQL databases have plpgsql installed by default.
         catalog
@@ -787,6 +953,7 @@ impl Catalog {
         if table.storage_collection.is_empty() {
             table.storage_collection = format!("__gdb_sql_rows_{}", table.oid);
         }
+        table.rebuild_column_map();
         self.tables.insert(q, table);
         Ok(())
     }
@@ -864,6 +1031,8 @@ impl Catalog {
         for k in idx_keys {
             self.indexes.remove(&k);
         }
+        self.table_to_indexes
+            .remove(&(q.schema.clone(), q.name.clone()));
         for col in &table.columns {
             if let Some(seq) = &col.identity_sequence {
                 let sk = QualifiedName::new(q.schema.clone(), seq.clone());
@@ -880,10 +1049,11 @@ impl Catalog {
     }
 
     pub fn indexes_for_table(&self, schema: &str, table: &str) -> Vec<&Index> {
-        self.indexes
-            .values()
-            .filter(|i| i.schema == schema && i.table == table)
-            .collect()
+        let key = (schema.to_string(), table.to_string());
+        self.table_to_indexes
+            .get(&key)
+            .map(|names| names.iter().filter_map(|q| self.indexes.get(q)).collect())
+            .unwrap_or_default()
     }
 
     pub fn get_index(&self, q: &QualifiedName) -> Option<&Index> {
@@ -895,6 +1065,10 @@ impl Catalog {
         if self.indexes.contains_key(&q) {
             return Err(RelError::DuplicateIndex(q.to_string_qualified()));
         }
+        self.table_to_indexes
+            .entry((index.schema.clone(), index.table.clone()))
+            .or_default()
+            .push(q.clone());
         self.indexes.insert(q, index);
         Ok(())
     }
@@ -920,7 +1094,15 @@ impl Catalog {
                 }
             }
         };
-        if self.indexes.remove(&q).is_none() && !if_exists {
+        if let Some(removed) = self.indexes.remove(&q) {
+            let tkey = (removed.schema.clone(), removed.table.clone());
+            if let Some(v) = self.table_to_indexes.get_mut(&tkey) {
+                v.retain(|iq| iq != &q);
+                if v.is_empty() {
+                    self.table_to_indexes.remove(&tkey);
+                }
+            }
+        } else if !if_exists {
             return Err(RelError::UndefinedIndex(q.to_string_qualified()));
         }
         Ok(())
@@ -978,6 +1160,10 @@ impl Catalog {
 
     pub fn get_view(&self, q: &QualifiedName) -> Option<&View> {
         self.views.get(q)
+    }
+
+    pub fn get_view_mut(&mut self, q: &QualifiedName) -> Option<&mut View> {
+        self.views.get_mut(q)
     }
 
     pub fn insert_view(&mut self, view: View) -> Result<()> {
@@ -1114,6 +1300,65 @@ impl Catalog {
             _ => DropFunctionByName::Ambiguous,
         }
     }
+
+    // ---- text search dictionaries --------------------------------------
+
+    /// All registered text search dictionaries.
+    pub fn ts_dictionaries(&self) -> impl Iterator<Item = &TsDictionaryDef> {
+        self.ts_dictionaries.iter()
+    }
+
+    /// `CREATE TEXT SEARCH DICTIONARY`. Returns `Ok(())` on `IF NOT EXISTS`
+    /// duplicates. Errors with `42710` on plain duplicates.
+    pub fn insert_ts_dictionary(
+        &mut self,
+        def: TsDictionaryDef,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        if self
+            .ts_dictionaries
+            .iter()
+            .any(|d| d.schema == def.schema && d.name == def.name)
+        {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(RelError::DuplicateObject(format!(
+                "text search dictionary \"{}.{}\"",
+                def.schema, def.name
+            )));
+        }
+        self.ts_dictionaries.push(def);
+        Ok(())
+    }
+
+    /// `DROP TEXT SEARCH DICTIONARY`. Returns `true` if removed.
+    pub fn drop_ts_dictionary(
+        &mut self,
+        schema: Option<&str>,
+        name: &str,
+        if_exists: bool,
+    ) -> Result<bool> {
+        let pos = self
+            .ts_dictionaries
+            .iter()
+            .position(|d| d.name == name && schema.map(|s| d.schema == s).unwrap_or(true));
+        match pos {
+            Some(i) => {
+                self.ts_dictionaries.remove(i);
+                Ok(true)
+            }
+            None => {
+                if if_exists {
+                    Ok(false)
+                } else {
+                    Err(RelError::UndefinedObject(format!(
+                        "text search dictionary \"{name}\""
+                    )))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1156,6 +1401,7 @@ mod tests {
             rls_forced: false,
             policies: vec![],
             triggers: vec![],
+            column_map: HashMap::new(),
         }
     }
 

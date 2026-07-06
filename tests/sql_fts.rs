@@ -453,15 +453,15 @@ async fn length_numnode_strip() {
 #[tokio::test]
 async fn unknown_config_is_42704() {
     let mut s = session().await;
-    let (code, msg) = err_info(&mut s, "SELECT to_tsvector('german', 'Haus')").await;
+    let (code, msg) = err_info(&mut s, "SELECT to_tsvector('klingon', 'Haus')").await;
     assert_eq!(code, "42704");
-    assert_eq!(msg, "text search configuration \"german\" does not exist");
+    assert_eq!(msg, "text search configuration \"klingon\" does not exist");
     assert_eq!(
-        err_code(&mut s, "SELECT to_tsquery('french', 'chat')").await,
+        err_code(&mut s, "SELECT to_tsquery('esperanto', 'chat')").await,
         "42704"
     );
     assert_eq!(
-        err_code(&mut s, "SELECT plainto_tsquery('spanish', 'gato')").await,
+        err_code(&mut s, "SELECT plainto_tsquery('klingon', 'gato')").await,
         "42704"
     );
     // The pg_catalog qualifier is accepted for the configs that do exist.
@@ -484,10 +484,6 @@ async fn excluded_functions_are_named_0a000() {
     let mut s = session().await;
     for (sql, needle) in [
         ("SELECT setweight(to_tsvector('cat'), 'A')", "setweight"),
-        (
-            "SELECT ts_headline('the cat', to_tsquery('cat'))",
-            "ts_headline",
-        ),
         (
             "SELECT ts_rank_cd(to_tsvector('cat'), to_tsquery('cat'))",
             "ts_rank_cd",
@@ -550,4 +546,243 @@ async fn excluded_operators_are_named_0a000() {
     assert_eq!(err_code(&mut s, "SELECT 'cat:A'::tsquery").await, "0A000");
     // Weight labels in raw tsvector input (A/B/C carry setweight semantics).
     assert_eq!(err_code(&mut s, "SELECT 'cat:3A'::tsvector").await, "0A000");
+}
+
+// ---------------------------------------------------------------------------
+// New language configurations (Snowball stemmers).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn german_config_stems_and_removes_stop_words() {
+    let mut s = session().await;
+    // "der" is a German stop word; "Katzen" → "katz" via German Snowball.
+    let tsv = scalar(&mut s, "SELECT to_tsvector('german', 'der Katzen')").await;
+    // "der" must have been removed (stop word), "katz" (stem) must appear.
+    assert!(
+        !tsv.contains("'der'"),
+        "german: stop word 'der' leaked: {tsv}"
+    );
+    assert!(
+        tsv.contains("'katz'"),
+        "german: expected 'katz' stem in: {tsv}"
+    );
+}
+
+#[tokio::test]
+async fn french_config_stems_text() {
+    let mut s = session().await;
+    let tsv = scalar(&mut s, "SELECT to_tsvector('french', 'les chats')").await;
+    // "les" is a French stop word; "chats" → "chat" via French Snowball.
+    assert!(
+        !tsv.contains("'les'"),
+        "french: stop word 'les' leaked: {tsv}"
+    );
+    assert!(
+        tsv.contains("'chat'"),
+        "french: expected 'chat' stem in: {tsv}"
+    );
+}
+
+#[tokio::test]
+async fn spanish_config_stems_text() {
+    let mut s = session().await;
+    let tsv = scalar(&mut s, "SELECT to_tsvector('spanish', 'los gatos')").await;
+    // "los" is a Spanish stop word; "gatos" → "gat" via Spanish Snowball.
+    assert!(
+        !tsv.contains("'los'"),
+        "spanish: stop word 'los' leaked: {tsv}"
+    );
+    assert!(
+        tsv.contains("'gat'"),
+        "spanish: expected 'gat' stem in: {tsv}"
+    );
+}
+
+#[tokio::test]
+async fn danish_config_stems_and_removes_stop_words() {
+    let mut s = session().await;
+    // "og" is a Danish stop word; "elsker" → "elsk" via Danish Snowball.
+    let tsv = scalar(&mut s, "SELECT to_tsvector('danish', 'og elsker')").await;
+    assert!(
+        !tsv.contains("'og'"),
+        "danish: stop word 'og' leaked: {tsv}"
+    );
+    assert!(
+        tsv.contains("'elsk'"),
+        "danish: expected 'elsk' stem in: {tsv}"
+    );
+}
+
+#[tokio::test]
+async fn portuguese_config_stems_and_removes_stop_words() {
+    let mut s = session().await;
+    // "de" is a Portuguese stop word; "amigos" → "amig" via Portuguese Snowball.
+    let tsv = scalar(&mut s, "SELECT to_tsvector('portuguese', 'de amigos')").await;
+    assert!(
+        !tsv.contains("'de'"),
+        "portuguese: stop word 'de' leaked: {tsv}"
+    );
+    assert!(
+        tsv.contains("'amig'"),
+        "portuguese: expected 'amig' stem in: {tsv}"
+    );
+}
+
+#[tokio::test]
+async fn swedish_config_stems_and_removes_stop_words() {
+    let mut s = session().await;
+    // "och" is a Swedish stop word; "abborrar" → "abborr" via Swedish Snowball.
+    let tsv = scalar(&mut s, "SELECT to_tsvector('swedish', 'och abborrar')").await;
+    assert!(
+        !tsv.contains("'och'"),
+        "swedish: stop word 'och' leaked: {tsv}"
+    );
+    assert!(
+        tsv.contains("'abborr'"),
+        "swedish: expected 'abborr' stem in: {tsv}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ts_headline — cover-density window selection.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ts_headline_basic_highlight() {
+    let mut s = session().await;
+    // ts_headline wraps matching lexemes in <b>…</b> by default.
+    let hl = scalar(
+        &mut s,
+        "SELECT ts_headline('english', 'The fat cats sat on the mat', \
+                            to_tsquery('english', 'cat'))",
+    )
+    .await;
+    assert!(
+        hl.contains("<b>cats</b>") || hl.contains("<b>cat</b>"),
+        "expected highlighted match in: {hl}"
+    );
+}
+
+#[tokio::test]
+async fn ts_headline_custom_selectors() {
+    let mut s = session().await;
+    // Custom StartSel/StopSel.
+    let hl = scalar(
+        &mut s,
+        "SELECT ts_headline('english', 'fat cats', to_tsquery('cat'), \
+                            'StartSel=<<, StopSel=>>')",
+    )
+    .await;
+    assert!(
+        hl.contains("<<cats>>") || hl.contains("<<cat>>"),
+        "custom selectors not applied: {hl}"
+    );
+}
+
+#[tokio::test]
+async fn ts_headline_no_match_returns_window() {
+    let mut s = session().await;
+    // When nothing matches, ts_headline still returns a text fragment (not NULL).
+    let hl = scalar(
+        &mut s,
+        "SELECT ts_headline('english', 'the quick brown fox', \
+                            to_tsquery('cat'))",
+    )
+    .await;
+    assert!(
+        !hl.is_empty(),
+        "expected non-empty headline for no-match: {hl}"
+    );
+}
+
+#[tokio::test]
+async fn ts_headline_null_propagation() {
+    let mut s = session().await;
+    // NULL document → NULL.
+    assert_eq!(
+        scalar(
+            &mut s,
+            "SELECT ts_headline('english', NULL::text, to_tsquery('cat'))"
+        )
+        .await,
+        "NULL"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Text search dictionaries (synonym support).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ts_dict_create_and_synonym_lookup() {
+    let mut s = session().await;
+    ok(
+        &mut s,
+        "CREATE TEXT SEARCH DICTIONARY my_syn (TEMPLATE = synonym, \
+         SYNONYMS = 'dog,hound,canine')",
+    )
+    .await;
+    // After synonym expansion, searching for "hound" should find "dog".
+    ok(&mut s, "CREATE TABLE docs (id INT, body TEXT)").await;
+    ok(
+        &mut s,
+        "INSERT INTO docs VALUES \
+         (1, 'the dog barks'), (2, 'a quick cat')",
+    )
+    .await;
+    // "hound" is a synonym for "dog", so the tsvector for row 1 should include it.
+    let matched = rows_text(
+        &mut s,
+        "SELECT id FROM docs \
+         WHERE to_tsvector('english', body) @@ plainto_tsquery('english', 'hound')",
+    )
+    .await;
+    assert_eq!(
+        matched,
+        vec![vec!["1".to_string()]],
+        "synonym 'hound'→'dog' should match row 1"
+    );
+}
+
+#[tokio::test]
+async fn ts_dict_if_not_exists() {
+    let mut s = session().await;
+    ok(
+        &mut s,
+        "CREATE TEXT SEARCH DICTIONARY syn1 (TEMPLATE = synonym, \
+         SYNONYMS = 'a,b')",
+    )
+    .await;
+    // IF NOT EXISTS should be a no-op (not an error).
+    ok(
+        &mut s,
+        "CREATE TEXT SEARCH DICTIONARY IF NOT EXISTS syn1 \
+         (TEMPLATE = synonym, SYNONYMS = 'a,b')",
+    )
+    .await;
+    // Without IF NOT EXISTS, duplicate is 42710.
+    let (code, _) = err_info(
+        &mut s,
+        "CREATE TEXT SEARCH DICTIONARY syn1 (TEMPLATE = synonym, \
+         SYNONYMS = 'a,b')",
+    )
+    .await;
+    assert_eq!(code, "42710");
+}
+
+#[tokio::test]
+async fn ts_dict_drop() {
+    let mut s = session().await;
+    ok(
+        &mut s,
+        "CREATE TEXT SEARCH DICTIONARY d1 (TEMPLATE = synonym, \
+         SYNONYMS = 'x,y')",
+    )
+    .await;
+    ok(&mut s, "DROP TEXT SEARCH DICTIONARY d1").await;
+    // IF EXISTS on a missing dict is a no-op.
+    ok(&mut s, "DROP TEXT SEARCH DICTIONARY IF EXISTS d1").await;
+    // Without IF EXISTS on a missing dict is 42704.
+    let (code, _) = err_info(&mut s, "DROP TEXT SEARCH DICTIONARY d1").await;
+    assert_eq!(code, "42704");
 }
