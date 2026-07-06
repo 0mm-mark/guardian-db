@@ -852,10 +852,9 @@ async fn trigger_error_inside_txn_aborts_transaction() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn fk_cascade_does_not_fire_child_triggers() {
-    // Documented divergence from PostgreSQL (see docs/postgres-compat.md §
-    // Triggers): cascaded referential actions bypass the child table's own
-    // triggers; direct DML on the child fires them.
+async fn fk_cascade_fires_child_triggers() {
+    // FK CASCADE DELETE fires the child table's own BEFORE/AFTER DELETE
+    // triggers for each cascaded row, matching PostgreSQL behaviour.
     let db = db();
     let mut s = session(&db);
     ok(&mut s, "CREATE TABLE parent (id int PRIMARY KEY)").await;
@@ -879,15 +878,15 @@ async fn fk_cascade_does_not_fire_child_triggers() {
     .await;
     ok(&mut s, "INSERT INTO parent VALUES (1)").await;
     ok(&mut s, "INSERT INTO child VALUES (1, 1), (2, 1)").await;
-    // Cascade removes the child rows without firing the child's triggers.
+    // Cascade removes the child rows AND fires the child's triggers (two rows).
     ok(&mut s, "DELETE FROM parent WHERE id = 1").await;
     assert_eq!(count(&mut s, "SELECT count(*) FROM child").await, 0);
-    assert_eq!(count(&mut s, "SELECT count(*) FROM audit").await, 0);
-    // Direct DELETE on the child does fire them.
+    assert_eq!(count(&mut s, "SELECT count(*) FROM audit").await, 2);
+    // Direct DELETE on the child also fires them.
     ok(&mut s, "INSERT INTO parent VALUES (2)").await;
     ok(&mut s, "INSERT INTO child VALUES (3, 2), (4, 2)").await;
     ok(&mut s, "DELETE FROM child").await;
-    assert_eq!(count(&mut s, "SELECT count(*) FROM audit").await, 2);
+    assert_eq!(count(&mut s, "SELECT count(*) FROM audit").await, 4);
 }
 
 #[tokio::test]
@@ -1595,33 +1594,30 @@ async fn unsupported_trigger_forms_are_typed_0a000() {
          LANGUAGE plpgsql",
     )
     .await;
+    // INSTEAD OF on a plain table (not a view) → 42809 wrong_object_type.
+    // INSTEAD OF on a view is now supported; TRUNCATE, CONSTRAINT TRIGGER, and
+    // REFERENCING are all supported as of this milestone — they are exercised
+    // in tests/sql_triggers_extended.rs.
+    {
+        let sql = "CREATE TRIGGER trg INSTEAD OF INSERT ON t FOR EACH ROW EXECUTE FUNCTION tfn()";
+        let (code, msg) = match s.execute(sql).await {
+            Ok(_) => panic!("expected `{sql}` to fail"),
+            Err(e) => (e.sqlstate().to_string(), e.to_string()),
+        };
+        assert_eq!(
+            code, "42809",
+            "INSTEAD OF on table should be 42809 (got {code}: {msg})"
+        );
+        assert!(
+            msg.contains("not a view"),
+            "message `{msg}` should mention \"not a view\""
+        );
+    }
     for (sql, needle) in [
-        (
-            "CREATE TRIGGER trg INSTEAD OF INSERT ON t FOR EACH ROW EXECUTE FUNCTION tfn()",
-            "INSTEAD OF",
-        ),
-        (
-            "CREATE TRIGGER trg AFTER TRUNCATE ON t FOR EACH STATEMENT EXECUTE FUNCTION tfn()",
-            "TRUNCATE",
-        ),
-        (
-            "CREATE CONSTRAINT TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION tfn()",
-            "CONSTRAINT TRIGGER",
-        ),
-        (
-            "CREATE TRIGGER trg AFTER INSERT ON t REFERENCING NEW TABLE AS nt \
-             FOR EACH STATEMENT EXECUTE FUNCTION tfn()",
-            "REFERENCING",
-        ),
         (
             "CREATE TEMPORARY TRIGGER trg BEFORE INSERT ON t FOR EACH ROW \
              EXECUTE FUNCTION tfn()",
             "TEMPORARY",
-        ),
-        (
-            "CREATE TRIGGER trg AFTER INSERT ON t DEFERRABLE INITIALLY DEFERRED \
-             FOR EACH ROW EXECUTE FUNCTION tfn()",
-            "DEFERRABLE",
         ),
         (
             "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH STATEMENT WHEN (1 = 1) \
@@ -1648,14 +1644,18 @@ async fn unsupported_trigger_forms_are_typed_0a000() {
             "message `{msg}` should name `{needle}`"
         );
     }
-    // PG-style literal trigger arguments do not parse in sqlparser 0.62 —
-    // a documented parser-level 42601, not 0A000 (see docs/postgres-compat.md).
-    assert_eq!(
-        err_code(
-            &mut s,
-            "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tfn('x')"
-        )
-        .await,
-        "42601"
-    );
+    // These return 42601 (syntax_error) matching PostgreSQL exactly.
+    // DEFERRABLE on a non-CONSTRAINT TRIGGER is a syntax-level rejection.
+    // PG-style literal trigger arguments do not parse in sqlparser 0.62 either.
+    for sql in [
+        "CREATE TRIGGER trg AFTER INSERT ON t DEFERRABLE INITIALLY DEFERRED \
+         FOR EACH ROW EXECUTE FUNCTION tfn()",
+        "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION tfn('x')",
+    ] {
+        let code = match s.execute(sql).await {
+            Ok(_) => panic!("expected `{sql}` to fail"),
+            Err(e) => e.sqlstate().to_string(),
+        };
+        assert_eq!(code, "42601", "for `{sql}` (got {code})");
+    }
 }

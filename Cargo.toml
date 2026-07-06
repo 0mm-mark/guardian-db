@@ -18,7 +18,7 @@ default = []
 odm = ["dep:guardian-db-derive", "uuid/v4"]
 # PostgreSQL-compatible SQL on top of GuardianDB's replicated document storage
 # (the `relational` + `sql` modules).
-sql = ["dep:sqlparser", "dep:rust_decimal", "uuid/v4", "uuid/v1", "uuid/v3", "uuid/v5", "uuid/v6", "uuid/v7", "dep:sha1", "dep:sha2", "dep:md-5", "dep:hmac", "dep:bcrypt", "dep:unicode-normalization"]
+sql = ["dep:sqlparser", "dep:rust_decimal", "uuid/v4", "uuid/v1", "uuid/v3", "uuid/v5", "uuid/v6", "uuid/v7", "dep:sha1", "dep:sha2", "dep:md-5", "dep:hmac", "dep:bcrypt", "dep:unicode-normalization", "dep:rust-stemmers"]
 # PostgreSQL wire-protocol server (the `pgwire` module + `guardian-pgwire` binary).
 pgwire = ["sql", "dep:pgwire"]
 # Supabase-compatible HTTP gateway (Kong-shaped REST + Auth) over the `sql`
@@ -76,6 +76,7 @@ md-5 = { version = "0.10", optional = true }
 hmac = { version = "0.12", optional = true }
 bcrypt = { version = "0.17", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
+rust-stemmers = { version = "1", optional = true }
 rust_decimal = { version = "1.37", features = ["serde"], optional = true }
 pgwire = { version = "0.40", optional = true }
 # Supabase-compatible HTTP gateway (the `supabase` feature). axum brings the
@@ -167,6 +168,11 @@ required-features = ["sql"]
 [[test]]
 name = "sql_fk_advanced"
 path = "tests/sql_fk_advanced.rs"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_triggers_extended"
+path = "tests/sql_triggers_extended.rs"
 required-features = ["sql"]
 
 [[test]]

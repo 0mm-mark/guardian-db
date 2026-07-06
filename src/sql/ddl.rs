@@ -14,6 +14,7 @@ use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef, ColumnOption, CreateExtension,
     CreateIndex, CreateTable, DropExtension, Statement, TableConstraint,
 };
+use std::collections::HashMap;
 
 impl Exec {
     pub fn exec_create_table(&mut self, ct: &CreateTable) -> Result<ExecResult> {
@@ -93,6 +94,7 @@ impl Exec {
             rls_forced: false,
             policies: Vec::new(),
             triggers: Vec::new(),
+            column_map: HashMap::new(),
         };
         self.catalog.insert_table(table)?;
 
@@ -442,6 +444,7 @@ impl Exec {
             name,
             query: cv.query.to_string(),
             columns,
+            triggers: Vec::new(),
         })?;
         self.catalog_dirty = true;
         Ok(ExecResult::empty_command("CREATE VIEW"))
@@ -556,6 +559,15 @@ impl Exec {
                 }
             }
             for q in &targets {
+                // Fire BEFORE TRUNCATE triggers (FOR EACH STATEMENT).
+                let table_snap = self.catalog.require_table(q)?.clone();
+                self.fire_statement_triggers(
+                    &table_snap,
+                    crate::relational::catalog::TriggerTiming::Before,
+                    crate::sql::trigger::TriggerOp::Truncate,
+                    None,
+                )?;
+
                 let collection = self.catalog.require_table(q)?.storage_collection.clone();
                 self.mutations
                     .lock()
@@ -565,6 +577,15 @@ impl Exec {
                     loaded.rows.clear();
                     loaded.rebuild_indexes();
                 }
+
+                // Fire AFTER TRUNCATE triggers.
+                let table_snap = self.catalog.require_table(q)?.clone();
+                self.fire_statement_triggers(
+                    &table_snap,
+                    crate::relational::catalog::TriggerTiming::After,
+                    crate::sql::trigger::TriggerOp::Truncate,
+                    None,
+                )?;
             }
         }
         Ok(ExecResult::empty_command("TRUNCATE TABLE"))
@@ -623,6 +644,7 @@ impl Exec {
                     ));
                 }
                 table.columns.push(column);
+                table.rebuild_column_map();
             }
             AlterTableOperation::DropColumn {
                 column_names,
@@ -643,6 +665,7 @@ impl Exec {
                         c.ordinal = i;
                     }
                 }
+                table.rebuild_column_map();
                 let names: Vec<String> = column_names.iter().map(ident_name).collect();
                 // Drop indexes referencing removed columns.
                 let drop_idx: Vec<String> = self
@@ -978,6 +1001,7 @@ impl Exec {
                     }
                 }
             }
+            table.rebuild_column_map();
         }
         // Update index metadata.
         let idx_names: Vec<String> = self

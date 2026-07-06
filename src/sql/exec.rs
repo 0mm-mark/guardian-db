@@ -213,6 +213,11 @@ pub struct Exec {
     /// transaction's `pending_deferred` queue, the same way `pending_locks`
     /// is drained into the lock manager.
     pub deferred_checks: RefCell<Vec<DeferredFkCheck>>,
+    /// CONSTRAINT TRIGGER firings that were deferred (`DEFERRABLE INITIALLY
+    /// DEFERRED`) during this statement. Drained by the engine after the
+    /// statement runs and collected into the transaction's deferred trigger
+    /// queue; fired at `COMMIT` (see `engine::Transaction::deferred_triggers`).
+    pub deferred_triggers: Vec<crate::sql::trigger::DeferredTriggerFiring>,
 }
 
 impl Exec {
@@ -247,6 +252,7 @@ impl Exec {
             trigger_depth: Arc::new(AtomicU32::new(0)),
             constraint_modes: None,
             deferred_checks: RefCell::new(Vec::new()),
+            deferred_triggers: Vec::new(),
         }
     }
 

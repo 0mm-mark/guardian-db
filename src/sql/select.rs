@@ -770,7 +770,9 @@ impl Exec {
             return Ok(input);
         };
         let mut rows = Vec::new();
-        for row in &input.rows {
+        if !input.rows.is_empty() {
+            // Build the outer-frame prefix once; reuse the Vec by updating the
+            // last slot each iteration instead of allocating a new Vec per row.
             let mut frames: Vec<Frame> = outer
                 .iter()
                 .map(|f| Frame {
@@ -780,10 +782,17 @@ impl Exec {
                 .collect();
             frames.push(Frame {
                 schema: &input.schema,
-                row,
+                row: &input.rows[0],
             });
-            if self.eval(predicate, &frames)?.truthy() == Some(true) {
-                rows.push(row.clone());
+            let last_idx = frames.len() - 1;
+            for row in &input.rows {
+                frames[last_idx] = Frame {
+                    schema: &input.schema,
+                    row,
+                };
+                if self.eval(predicate, &frames)?.truthy() == Some(true) {
+                    rows.push(row.clone());
+                }
             }
         }
         Ok(RowSet {
@@ -826,7 +835,9 @@ impl Exec {
             .any(|it| matches!(it, SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } | SelectItem::ExprWithAliases { expr: e, .. } if is_unnest(e)));
         // (input row index, output tuple) so ORDER BY can consult both.
         let mut paired: Vec<(usize, Tuple)> = Vec::with_capacity(input.rows.len());
-        for (ri, row) in input.rows.iter().enumerate() {
+        if !input.rows.is_empty() {
+            // Build the outer-frame prefix once; reuse by updating the last slot
+            // each iteration instead of allocating a new Vec<Frame> per row.
             let mut frames: Vec<Frame> = outer
                 .iter()
                 .map(|f| Frame {
@@ -836,15 +847,22 @@ impl Exec {
                 .collect();
             frames.push(Frame {
                 schema: &input.schema,
-                row,
+                row: &input.rows[0],
             });
-            if has_unnest {
-                for out in self.project_row_unnest(select, &frames, win_at(ri))? {
+            let last_idx = frames.len() - 1;
+            for (ri, row) in input.rows.iter().enumerate() {
+                frames[last_idx] = Frame {
+                    schema: &input.schema,
+                    row,
+                };
+                if has_unnest {
+                    for out in self.project_row_unnest(select, &frames, win_at(ri))? {
+                        paired.push((ri, out));
+                    }
+                } else {
+                    let out = self.project_row(select, &input.schema, &frames, win_at(ri))?;
                     paired.push((ri, out));
                 }
-            } else {
-                let out = self.project_row(select, &input.schema, &frames, win_at(ri))?;
-                paired.push((ri, out));
             }
         }
 
@@ -1085,7 +1103,9 @@ impl Exec {
         // Partition input rows into groups keyed by the group expressions.
         let mut groups: Vec<(Vec<String>, Vec<usize>)> = Vec::new();
         let mut group_index: HashMap<Vec<String>, usize> = HashMap::new();
-        for (ri, row) in input.rows.iter().enumerate() {
+        if !input.rows.is_empty() {
+            // Build the outer-frame prefix once; reuse by updating the last slot
+            // each iteration instead of allocating a new Vec<Frame> per row.
             let mut frames: Vec<Frame> = outer
                 .iter()
                 .map(|f| Frame {
@@ -1095,17 +1115,24 @@ impl Exec {
                 .collect();
             frames.push(Frame {
                 schema: &input.schema,
-                row,
+                row: &input.rows[0],
             });
-            let key: Vec<String> = group_exprs
-                .iter()
-                .map(|e| self.eval(e, &frames).map(|v| v.index_key()))
-                .collect::<Result<_>>()?;
-            match group_index.get(&key) {
-                Some(&gi) => groups[gi].1.push(ri),
-                None => {
-                    group_index.insert(key.clone(), groups.len());
-                    groups.push((key, vec![ri]));
+            let last_idx = frames.len() - 1;
+            for (ri, row) in input.rows.iter().enumerate() {
+                frames[last_idx] = Frame {
+                    schema: &input.schema,
+                    row,
+                };
+                let key: Vec<String> = group_exprs
+                    .iter()
+                    .map(|e| self.eval(e, &frames).map(|v| v.index_key()))
+                    .collect::<Result<_>>()?;
+                match group_index.get(&key) {
+                    Some(&gi) => groups[gi].1.push(ri),
+                    None => {
+                        group_index.insert(key.clone(), groups.len());
+                        groups.push((key, vec![ri]));
+                    }
                 }
             }
         }
@@ -1187,18 +1214,27 @@ impl Exec {
 
         // Phase 3: (order keys, output tuple) per surviving group, for sorting.
         let mut out_rows: Vec<(Vec<SqlValue>, Tuple)> = Vec::new();
-        for (rep, aggs) in &survivors {
-            let mut frames: Vec<Frame> = outer
-                .iter()
-                .map(|f| Frame {
-                    schema: f.schema,
-                    row: f.row,
-                })
-                .collect();
+        // Build the outer-frame prefix once; reuse by updating the last slot per
+        // group instead of allocating a new Vec<Frame> for every surviving group.
+        let mut frames: Vec<Frame> = outer
+            .iter()
+            .map(|f| Frame {
+                schema: f.schema,
+                row: f.row,
+            })
+            .collect();
+        if !survivors.is_empty() {
             frames.push(Frame {
                 schema: &input.schema,
-                row: rep,
+                row: &survivors[0].0,
             });
+        }
+        let last_idx = frames.len().saturating_sub(1);
+        for (rep, aggs) in &survivors {
+            frames[last_idx] = Frame {
+                schema: &input.schema,
+                row: rep,
+            };
             // Projection with aggregates.
             let mut tuple = Vec::new();
             for item in &select.projection {
@@ -1330,7 +1366,9 @@ impl Exec {
         // SQL), honouring an attached `FILTER (WHERE ...)` clause.
         let mut values: Vec<SqlValue> = Vec::new();
         let mut count_all = 0usize;
-        for row in group_rows {
+        if !group_rows.is_empty() {
+            // Build the outer-frame prefix once; reuse by updating the last slot
+            // each iteration instead of allocating a new Vec<Frame> per group row.
             let mut frames: Vec<Frame> = outer
                 .iter()
                 .map(|f| Frame {
@@ -1340,21 +1378,28 @@ impl Exec {
                 .collect();
             frames.push(Frame {
                 schema: input_schema,
-                row,
+                row: group_rows[0],
             });
-            if let Some(filter) = &call.filter
-                && self.eval(filter, &frames)?.truthy() != Some(true)
-            {
-                continue;
-            }
-            count_all += 1;
-            if is_star {
-                continue;
-            }
-            let expr = arg_expr.as_ref().unwrap();
-            let v = self.eval(expr, &frames)?;
-            if !v.is_null() {
-                values.push(v);
+            let last_idx = frames.len() - 1;
+            for row in group_rows {
+                frames[last_idx] = Frame {
+                    schema: input_schema,
+                    row,
+                };
+                if let Some(filter) = &call.filter
+                    && self.eval(filter, &frames)?.truthy() != Some(true)
+                {
+                    continue;
+                }
+                count_all += 1;
+                if is_star {
+                    continue;
+                }
+                let expr = arg_expr.as_ref().unwrap();
+                let v = self.eval(expr, &frames)?;
+                if !v.is_null() {
+                    values.push(v);
+                }
             }
         }
         if distinct {
@@ -1951,6 +1996,7 @@ fn label_cte(
             f.name = ident_name(&c.name);
         }
     }
+    rs.schema.rebuild_lookup();
     Ok(rs)
 }
 
@@ -2351,6 +2397,7 @@ fn relabel(
             f.name = name.clone();
         }
     }
+    rs.schema.rebuild_lookup();
     rs
 }
 

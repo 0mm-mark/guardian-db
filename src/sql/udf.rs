@@ -1014,6 +1014,9 @@ fn new_sub_exec(exec: &Exec, params: Vec<SqlValue>) -> Exec {
     sub.mutations = exec.mutations.clone();
     sub.udf_depth = exec.udf_depth.clone();
     sub.trigger_depth = exec.trigger_depth.clone();
+    // Copy CTE entries so trigger bodies can access transition tables
+    // (REFERENCING NEW TABLE / OLD TABLE) injected by the firing engine.
+    sub.cte = exec.cte.clone();
     sub
 }
 
