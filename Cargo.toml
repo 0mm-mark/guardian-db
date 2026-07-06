@@ -18,9 +18,15 @@ default = []
 odm = ["dep:guardian-db-derive", "uuid/v4"]
 # PostgreSQL-compatible SQL on top of GuardianDB's replicated document storage
 # (the `relational` + `sql` modules).
-sql = ["dep:sqlparser", "dep:rust_decimal", "uuid/v4"]
+sql = ["dep:sqlparser", "dep:rust_decimal", "uuid/v4", "uuid/v1", "uuid/v3", "uuid/v5", "uuid/v6", "uuid/v7", "dep:sha1", "dep:sha2", "dep:md-5", "dep:hmac", "dep:bcrypt", "dep:unicode-normalization", "dep:rust-stemmers"]
 # PostgreSQL wire-protocol server (the `pgwire` module + `guardian-pgwire` binary).
 pgwire = ["sql", "dep:pgwire"]
+# Supabase-compatible HTTP gateway (Kong-shaped REST + Auth) over the `sql`
+# engine (the `supabase` module + `guardian-supabase` binary). Reuses the
+# hmac/sha2/base64/bcrypt crypto already pulled in by `sql`.
+# `graphql-parser` (pure Rust, tiny dep tree) parses GraphQL documents for the
+# pg_graphql-compatible `/graphql/v1` endpoint.
+supabase = ["sql", "dep:axum", "dep:tower", "dep:graphql-parser"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -64,8 +70,23 @@ guardian-db-derive = { version = "0.17.0", path = "guardian-db-derive", optional
 # PostgreSQL compatibility layer (the `relational` + `sql` + `pgwire` modules);
 # pulled in only by the `sql` / `pgwire` features.
 sqlparser = { version = "0.62", optional = true }
+sha1 = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+md-5 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
+bcrypt = { version = "0.17", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
+rust-stemmers = { version = "1", optional = true }
 rust_decimal = { version = "1.37", features = ["serde"], optional = true }
 pgwire = { version = "0.40", optional = true }
+# Supabase-compatible HTTP gateway (the `supabase` feature). axum brings the
+# http/hyper/tower stack already present transitively; `tower`'s `util` feature
+# powers the in-process `oneshot` integration tests.
+axum = { version = "0.8", optional = true, features = ["ws"] }
+tower = { version = "0.5", optional = true, features = ["util"] }
+# Spec-compliant GraphQL document parser for the pg_graphql-compatible endpoint
+# (fragments, variables, directives — what GraphiQL's introspection query uses).
+graphql-parser = { version = "0.4", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -77,6 +98,9 @@ crossterm = "0.29.0"
 base64 = "0.22.1"
 # Real PostgreSQL client used by the `pgwire` wire-protocol tests.
 tokio-postgres = "0.7"
+# Real WebSocket client used by the Supabase realtime tests (same version
+# axum's `ws` feature builds on).
+tokio-tungstenite = "0.28"
 
 [[bin]]
 name = "guardian-admin"
@@ -87,6 +111,12 @@ path = "src/bin/guardian_administration_panel.rs"
 name = "guardian-pgwire"
 path = "src/bin/guardian-pgwire.rs"
 required-features = ["pgwire"]
+
+# Supabase-compatible HTTP gateway binary; only built with the `supabase` feature.
+[[bin]]
+name = "guardian-supabase"
+path = "src/bin/guardian-supabase.rs"
+required-features = ["supabase"]
 
 # Iroh-backed PostgreSQL gateway example (replicated, local-first).
 [[example]]
@@ -111,9 +141,59 @@ path = "tests/sql_replication.rs"
 required-features = ["sql"]
 
 [[test]]
+name = "sql_extensions"
+path = "tests/sql_extensions.rs"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_rls"
+path = "tests/sql_rls.rs"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_functions"
+path = "tests/sql_functions.rs"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_triggers"
+path = "tests/sql_triggers.rs"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_fts"
+path = "tests/sql_fts.rs"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_fk_advanced"
+path = "tests/sql_fk_advanced.rs"
+required-features = ["sql"]
+
+[[test]]
+name = "sql_triggers_extended"
+path = "tests/sql_triggers_extended.rs"
+required-features = ["sql"]
+
+[[test]]
 name = "pgwire_wire"
 path = "tests/pgwire_wire.rs"
 required-features = ["pgwire"]
+
+[[test]]
+name = "supabase_gateway"
+path = "tests/supabase_gateway.rs"
+required-features = ["supabase"]
+
+[[test]]
+name = "supabase_storage_realtime"
+path = "tests/supabase_storage_realtime.rs"
+required-features = ["supabase"]
+
+[[test]]
+name = "supabase_graphql"
+path = "tests/supabase_graphql.rs"
+required-features = ["supabase"]
 
 [[bench]]
 name = "iroh_gossipsub_performance"

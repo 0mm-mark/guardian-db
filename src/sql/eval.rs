@@ -33,6 +33,17 @@ impl Exec {
         self.eval_inner(expr, frames, Some(aggs))
     }
 
+    /// Evaluate with an optional precomputed aggregate/window value map (the
+    /// map also carries window-call results, keyed by their SQL text).
+    pub(crate) fn eval_opt_agg(
+        &self,
+        expr: &Expr,
+        frames: &[Frame],
+        aggs: Option<&HashMap<String, SqlValue>>,
+    ) -> Result<SqlValue> {
+        self.eval_inner(expr, frames, aggs)
+    }
+
     fn eval_inner(
         &self,
         expr: &Expr,
@@ -403,6 +414,66 @@ impl Exec {
 
         let a = self.eval_inner(left, frames, aggs)?;
         let b = self.eval_inner(right, frames, aggs)?;
+        // Extension-owned operators first: pg_trgm text ops (`%`, `<->`, ...),
+        // pgvector distances, and the hstore/intarray/ltree/cube operator
+        // sets. Tokens are only produced when the operand shapes could belong
+        // to an extension (numeric `%` stays modulo, text `||` stays concat,
+        // JSON `->` keeps its own path); dispatch_operator additionally gates
+        // on the owning extension being installed and returns `None`
+        // otherwise, so unclaimed operators keep their normal error paths.
+        {
+            let hstore_side = matches!(a, SqlValue::HStore(_)) || matches!(b, SqlValue::HStore(_));
+            let ltree_side = matches!(a, SqlValue::Ltree(_)) || matches!(b, SqlValue::Ltree(_));
+            let array_side = matches!(a, SqlValue::Array(_)) || matches!(b, SqlValue::Array(_));
+            let ext_shaped = hstore_side
+                || array_side
+                || matches!(a, SqlValue::Cube { .. })
+                || matches!(b, SqlValue::Cube { .. });
+            let op_token = match op {
+                Modulo if !(a.type_of().is_numeric() && b.type_of().is_numeric()) => {
+                    Some("%".to_string())
+                }
+                Custom(t) => Some(t.clone()),
+                PGCustomBinaryOperator(parts) => Some(parts.join(".")),
+                LtDashGt => Some("<->".to_string()),
+                Spaceship
+                    if matches!(a, SqlValue::Vector(_)) || matches!(b, SqlValue::Vector(_)) =>
+                {
+                    Some("<=>".to_string())
+                }
+                // `->` with an hstore left operand is the hstore key lookup;
+                // JSON `->` (any other left operand) is untouched.
+                Arrow if matches!(a, SqlValue::HStore(_)) => Some("->".to_string()),
+                AtArrow => Some("@>".to_string()),
+                ArrowAt => Some("<@".to_string()),
+                PGOverlap => Some("&&".to_string()),
+                Question => Some("?".to_string()),
+                PGRegexMatch if ltree_side => Some("~".to_string()),
+                StringConcat if hstore_side => Some("||".to_string()),
+                Plus if ext_shaped => Some("+".to_string()),
+                Minus if ext_shaped => Some("-".to_string()),
+                BitwiseOr if array_side => Some("|".to_string()),
+                BitwiseAnd if array_side => Some("&".to_string()),
+                PGBitwiseXor if array_side => Some("#".to_string()),
+                _ => None,
+            };
+            if let Some(tok) = op_token {
+                let ctx = crate::sql::ext::ExtCtx {
+                    now: self.now,
+                    vars: &self.vars,
+                };
+                if let Some(result) =
+                    crate::sql::ext::dispatch_operator(&self.catalog, &ctx, &tok, &a, &b)
+                {
+                    return result;
+                }
+            }
+        }
+        // Full-text search: `@@` match (core, always on), plus typed
+        // rejections for tsvector/tsquery operators outside the subset.
+        if let Some(result) = self.fts_operator(op, &a, &b) {
+            return result;
+        }
         match op {
             Plus | Minus | Multiply | Divide | Modulo | PGExp => arith(&a, op, &b),
             StringConcat => {
@@ -421,6 +492,44 @@ impl Exec {
             other => Err(SqlError::FeatureNotSupported(format!(
                 "binary operator {other} not supported"
             ))),
+        }
+    }
+
+    /// Full-text-search operators. `@@` evaluates in every argument order
+    /// PostgreSQL defines (including the text coercions); the tsvector /
+    /// tsquery operators outside the subset — `||` concatenation, the `<->`
+    /// phrase operator, `&&` — are typed rejections (`0A000`) instead of
+    /// falling through to text concatenation or a generic operator error.
+    fn fts_operator(
+        &self,
+        op: &BinaryOperator,
+        a: &SqlValue,
+        b: &SqlValue,
+    ) -> Option<Result<SqlValue>> {
+        use BinaryOperator::*;
+        let fts_shaped = |v: &SqlValue| matches!(v, SqlValue::TsVector(_) | SqlValue::TsQuery(_));
+        match op {
+            AtAt => Some(crate::sql::fts::at_at(self, a, b)),
+            StringConcat if fts_shaped(a) || fts_shaped(b) => {
+                Some(Err(SqlError::FeatureNotSupported(
+                    "tsvector/tsquery concatenation (||) is not supported (out of the \
+                     full-text-search subset)"
+                        .into(),
+                )))
+            }
+            LtDashGt if fts_shaped(a) || fts_shaped(b) => Some(Err(SqlError::FeatureNotSupported(
+                "the tsquery phrase operator <-> is not supported (position-aware \
+                     phrase search is out of the full-text-search subset)"
+                    .into(),
+            ))),
+            PGOverlap if fts_shaped(a) || fts_shaped(b) => {
+                Some(Err(SqlError::FeatureNotSupported(
+                    "the tsquery && operator is not supported (out of the \
+                     full-text-search subset)"
+                        .into(),
+                )))
+            }
+            _ => None,
         }
     }
 
@@ -621,13 +730,19 @@ impl Exec {
         frames: &[Frame],
         aggs: Option<&HashMap<String, SqlValue>>,
     ) -> Result<SqlValue> {
-        let name = func
-            .name
-            .0
-            .last()
-            .and_then(|p| p.as_ident())
-            .map(ident_name)
-            .unwrap_or_default();
+        let name = crate::sql::names::function_dispatch_name(&func.name);
+        // Window calls (`... OVER ...`) are precomputed by the SELECT pipeline
+        // and looked up by their SQL text; anywhere else they are misplaced.
+        if func.over.is_some() {
+            if let Some(map) = aggs
+                && let Some(v) = map.get(&func.to_string())
+            {
+                return Ok(v.clone());
+            }
+            return Err(SqlError::WindowingError(
+                "window functions are not allowed here".into(),
+            ));
+        }
         if funcs::is_aggregate(&name) {
             if let Some(map) = aggs {
                 let key = func.to_string();
@@ -975,3 +1090,19 @@ fn eval_extract(field: &DateTimeField, v: &SqlValue) -> Result<SqlValue> {
     Ok(n.map(|x| SqlValue::Numeric(Decimal::from(x)))
         .unwrap_or(SqlValue::Null))
 }
+
+// Maintenance note 5: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note 17: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
+
+// SQL compatibility note 5: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 21: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 5: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 21: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.

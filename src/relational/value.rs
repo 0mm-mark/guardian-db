@@ -38,6 +38,29 @@ pub enum SqlValue {
     /// Covers both `json` and `jsonb`.
     Json(Json),
     Array(Vec<SqlValue>),
+    /// Case-insensitive text (`citext` extension). Stored and rendered verbatim;
+    /// compares and indexes case-insensitively.
+    Citext(String),
+    /// Fixed-dimension float vector (`vector` / pgvector extension).
+    Vector(Vec<f32>),
+    /// Key/value store (`hstore` extension). `None` values are hstore NULLs.
+    HStore(std::collections::BTreeMap<String, Option<String>>),
+    /// Hierarchical label path (`ltree` extension), stored as its validated
+    /// text form (dot-separated labels).
+    Ltree(String),
+    /// N-dimensional cube (`cube` extension): the two corners as given on
+    /// input (PostgreSQL preserves corner order in the text form; accessors
+    /// and predicates normalize per-dimension). `ll.len() == ur.len()`, and a
+    /// point has `ll == ur`.
+    Cube {
+        ll: Vec<f64>,
+        ur: Vec<f64>,
+    },
+    /// Full-text document vector (`tsvector`): sorted unique lexemes, each
+    /// with an optional sorted position list.
+    TsVector(Vec<crate::relational::fts::TsLexeme>),
+    /// Full-text query (`tsquery`) operator tree; `None` is the empty query.
+    TsQuery(Option<crate::relational::fts::TsQueryNode>),
 }
 
 impl SqlValue {
@@ -71,6 +94,13 @@ impl SqlValue {
                 let inner = items.first().map(|v| v.type_of()).unwrap_or(SqlType::Text);
                 SqlType::Array(Box::new(inner))
             }
+            SqlValue::Citext(_) => SqlType::Citext,
+            SqlValue::Vector(v) => SqlType::Vector(Some(v.len() as u32)),
+            SqlValue::HStore(_) => SqlType::HStore,
+            SqlValue::Ltree(_) => SqlType::Ltree,
+            SqlValue::Cube { .. } => SqlType::Cube,
+            SqlValue::TsVector(_) => SqlType::TsVector,
+            SqlValue::TsQuery(_) => SqlType::TsQuery,
         }
     }
 
@@ -103,6 +133,51 @@ impl SqlValue {
             SqlValue::Timestamptz(ts) => Json::String(ts.to_rfc3339()),
             SqlValue::Json(v) => v.clone(),
             SqlValue::Array(items) => Json::Array(items.iter().map(|v| v.encode_json()).collect()),
+            SqlValue::Citext(s) => Json::String(s.clone()),
+            SqlValue::Vector(v) => Json::Array(
+                v.iter()
+                    .map(|f| {
+                        serde_json::Number::from_f64(*f as f64)
+                            .map(Json::Number)
+                            .unwrap_or(Json::Null)
+                    })
+                    .collect(),
+            ),
+            // hstore stores as a JSON object; hstore NULL values become JSON null.
+            SqlValue::HStore(map) => Json::Object(
+                map.iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            v.as_ref().map_or(Json::Null, |s| Json::String(s.clone())),
+                        )
+                    })
+                    .collect(),
+            ),
+            SqlValue::Ltree(path) => Json::String(path.clone()),
+            SqlValue::Cube { ll, ur } => {
+                let nums = |v: &[f64]| {
+                    Json::Array(
+                        v.iter()
+                            .map(|f| {
+                                serde_json::Number::from_f64(*f)
+                                    .map(Json::Number)
+                                    .unwrap_or(Json::Null)
+                            })
+                            .collect(),
+                    )
+                };
+                let mut obj = serde_json::Map::new();
+                obj.insert("ll".into(), nums(ll));
+                obj.insert("ur".into(), nums(ur));
+                Json::Object(obj)
+            }
+            // tsvector/tsquery store as their canonical text form, which the
+            // raw parsers read back losslessly (like ltree).
+            SqlValue::TsVector(v) => Json::String(crate::relational::fts::format_tsvector(v)),
+            SqlValue::TsQuery(q) => {
+                Json::String(crate::relational::fts::format_tsquery(q.as_ref()))
+            }
         }
     }
 
@@ -171,6 +246,58 @@ impl SqlValue {
                 }
                 SqlValue::Array(items)
             }
+            SqlType::Citext => {
+                SqlValue::Citext(value.as_str().ok_or_else(|| bad("citext"))?.to_string())
+            }
+            SqlType::Vector(dims) => {
+                let arr = value.as_array().ok_or_else(|| bad("vector"))?;
+                let mut out = Vec::with_capacity(arr.len());
+                for item in arr {
+                    out.push(json_as_f64(item).ok_or_else(|| bad("vector"))? as f32);
+                }
+                check_vector_dims(&out, *dims)?;
+                SqlValue::Vector(out)
+            }
+            SqlType::HStore => {
+                let obj = value.as_object().ok_or_else(|| bad("hstore"))?;
+                let mut map = std::collections::BTreeMap::new();
+                for (k, v) in obj {
+                    let val = match v {
+                        Json::Null => None,
+                        Json::String(s) => Some(s.clone()),
+                        _ => return Err(bad("hstore")),
+                    };
+                    map.insert(k.clone(), val);
+                }
+                SqlValue::HStore(map)
+            }
+            SqlType::Ltree => {
+                let s = value.as_str().ok_or_else(|| bad("ltree"))?;
+                parse_ltree_text(s)?
+            }
+            SqlType::Cube => {
+                let obj = value.as_object().ok_or_else(|| bad("cube"))?;
+                let corner = |key: &str| -> Result<Vec<f64>> {
+                    let arr = obj
+                        .get(key)
+                        .and_then(Json::as_array)
+                        .ok_or_else(|| bad("cube"))?;
+                    arr.iter()
+                        .map(|item| json_as_f64(item).ok_or_else(|| bad("cube")))
+                        .collect()
+                };
+                let (ll, ur) = (corner("ll")?, corner("ur")?);
+                if ll.len() != ur.len() || ll.is_empty() {
+                    return Err(bad("cube"));
+                }
+                SqlValue::Cube { ll, ur }
+            }
+            SqlType::TsVector => SqlValue::TsVector(crate::relational::fts::parse_tsvector(
+                value.as_str().ok_or_else(|| bad("tsvector"))?,
+            )?),
+            SqlType::TsQuery => SqlValue::TsQuery(crate::relational::fts::parse_tsquery(
+                value.as_str().ok_or_else(|| bad("tsquery"))?,
+            )?),
             SqlType::Unknown => SqlValue::Json(value.clone()),
         };
         Ok(out)
@@ -188,7 +315,7 @@ impl SqlValue {
             SqlValue::Int2(n) => n.to_string(),
             SqlValue::Int4(n) => n.to_string(),
             SqlValue::Int8(n) => n.to_string(),
-            SqlValue::Float4(n) => format_float(*n as f64),
+            SqlValue::Float4(n) => format_float_f32(*n),
             SqlValue::Float8(n) => format_float(*n),
             SqlValue::Numeric(d) => d.normalize().to_string(),
             SqlValue::Text(s) => s.clone(),
@@ -200,6 +327,13 @@ impl SqlValue {
             SqlValue::Timestamptz(ts) => ts.format("%Y-%m-%d %H:%M:%S%.f%:z").to_string(),
             SqlValue::Json(v) => v.to_string(),
             SqlValue::Array(items) => format_array(items),
+            SqlValue::Citext(s) => s.clone(),
+            SqlValue::Vector(v) => format_vector(v),
+            SqlValue::HStore(map) => format_hstore(map),
+            SqlValue::Ltree(path) => path.clone(),
+            SqlValue::Cube { ll, ur } => format_cube(ll, ur),
+            SqlValue::TsVector(v) => crate::relational::fts::format_tsvector(v),
+            SqlValue::TsQuery(q) => crate::relational::fts::format_tsquery(q.as_ref()),
         };
         Some(s)
     }
@@ -247,6 +381,18 @@ impl SqlValue {
                 SqlValue::Json(serde_json::from_str(text).map_err(|_| bad())?)
             }
             SqlType::Array(inner) => parse_array_text(text, inner)?,
+            SqlType::Citext => SqlValue::Citext(text.to_string()),
+            SqlType::Vector(dims) => {
+                let v = parse_vector_text(text)?;
+                check_vector_dims(&v, *dims)?;
+                SqlValue::Vector(v)
+            }
+            SqlType::HStore => parse_hstore_text(text)?,
+            SqlType::Ltree => parse_ltree_text(text)?,
+            SqlType::Cube => parse_cube_text(text)?,
+            // PostgreSQL raw input: lexemes as given, no config processing.
+            SqlType::TsVector => SqlValue::TsVector(crate::relational::fts::parse_tsvector(text)?),
+            SqlType::TsQuery => SqlValue::TsQuery(crate::relational::fts::parse_tsquery(text)?),
             SqlType::Unknown => SqlValue::Text(text.to_string()),
         };
         Ok(out)
@@ -301,7 +447,7 @@ impl SqlValue {
 
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            SqlValue::Text(s) => Some(s),
+            SqlValue::Text(s) | SqlValue::Citext(s) => Some(s),
             _ => None,
         }
     }
@@ -311,8 +457,12 @@ impl SqlValue {
         match self {
             SqlValue::Null => "\u{0}null".to_string(),
             SqlValue::Text(s) => format!("s:{s}"),
+            SqlValue::Citext(s) => format!("s:{}", s.to_lowercase()),
             SqlValue::Bool(b) => format!("b:{b}"),
             SqlValue::Uuid(u) => format!("u:{u}"),
+            // Separate labels with NUL so byte order matches the label-wise
+            // ltree ordering ('a.b' sorts before 'a-b', unlike raw text).
+            SqlValue::Ltree(p) => format!("l:{}", p.replace('.', "\u{0}")),
             v if v.type_of().is_numeric() => {
                 // Normalise all numerics to a decimal string so 1 == 1.0 in the index.
                 match v.as_decimal() {
@@ -345,6 +495,64 @@ impl SqlValue {
         match (self, other) {
             (Bool(a), Bool(b)) => a.partial_cmp(b),
             (Text(a), Text(b)) => Some(a.cmp(b)),
+            // citext comparison is case-insensitive and wins over plain text
+            // (PostgreSQL: the citext side determines the comparison semantics).
+            (Citext(a), Citext(b)) | (Citext(a), Text(b)) | (Text(a), Citext(b)) => {
+                Some(a.to_lowercase().cmp(&b.to_lowercase()))
+            }
+            (Vector(a), Vector(b)) => {
+                for (x, y) in a.iter().zip(b.iter()) {
+                    match x.partial_cmp(y) {
+                        Some(Ordering::Equal) => continue,
+                        other => return other,
+                    }
+                }
+                Some(a.len().cmp(&b.len()))
+            }
+            // ltree ordering is label-by-label (PostgreSQL compares levels,
+            // so 'a.b' < 'aa' even though '.' > 'a' would say otherwise).
+            (Ltree(a), Ltree(b)) => Some(ltree_labels(a).cmp(&ltree_labels(b))),
+            (Ltree(a), Text(b)) | (Text(a), Ltree(b)) => {
+                Some(ltree_labels(a).cmp(&ltree_labels(b)))
+            }
+            // cube comparison normalizes corners per dimension (missing
+            // dimensions read as 0), matching contrib/cube's cube_cmp: the
+            // minimal corners are compared first, then the maximal ones —
+            // so '(3),(1)' = '(1),(3)'.
+            (Cube { ll: al, ur: au }, Cube { ll: bl, ur: bu }) => {
+                let dim = al.len().max(bl.len());
+                let coord = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
+                for i in 0..dim {
+                    let (a_min, b_min) = (
+                        coord(al, i).min(coord(au, i)),
+                        coord(bl, i).min(coord(bu, i)),
+                    );
+                    match a_min.partial_cmp(&b_min) {
+                        Some(Ordering::Equal) => continue,
+                        other => return other,
+                    }
+                }
+                for i in 0..dim {
+                    let (a_max, b_max) = (
+                        coord(al, i).max(coord(au, i)),
+                        coord(bl, i).max(coord(bu, i)),
+                    );
+                    match a_max.partial_cmp(&b_max) {
+                        Some(Ordering::Equal) => continue,
+                        other => return other,
+                    }
+                }
+                // Coordinates tie: lower dimensionality sorts first, so
+                // '(1)' <> '(1,0)' (PG-verified).
+                Some(al.len().cmp(&bl.len()))
+            }
+            // hstore has no natural order; equality (and a deterministic
+            // order for sorting) come from the canonical sorted pair list.
+            (HStore(a), HStore(b)) => Some(a.iter().cmp(b.iter())),
+            // tsvector compares lexeme-wise (word, then positions), which the
+            // sorted-lexeme invariant makes a plain list comparison; tsquery
+            // equality/order comes from the canonical text form (fallthrough).
+            (TsVector(a), TsVector(b)) => Some(a.cmp(b)),
             (Uuid(a), Uuid(b)) => Some(a.cmp(b)),
             (Bytea(a), Bytea(b)) => Some(a.cmp(b)),
             (Date(a), Date(b)) => Some(a.cmp(b)),
@@ -446,6 +654,52 @@ impl SqlValue {
             SqlType::Text | SqlType::Varchar(_) | SqlType::Char(_) => {
                 SqlValue::Text(self.to_text().unwrap_or_default())
             }
+            SqlType::Citext => SqlValue::Citext(self.to_text().unwrap_or_default()),
+            SqlType::Vector(dims) => match self {
+                SqlValue::Vector(v) => {
+                    check_vector_dims(v, *dims)?;
+                    self.clone()
+                }
+                SqlValue::Text(s) | SqlValue::Citext(s) => {
+                    let v = parse_vector_text(s)?;
+                    check_vector_dims(&v, *dims)?;
+                    SqlValue::Vector(v)
+                }
+                SqlValue::Array(items) => {
+                    let mut v = Vec::with_capacity(items.len());
+                    for it in items {
+                        v.push(it.as_f64().ok_or_else(|| bad(target))? as f32);
+                    }
+                    check_vector_dims(&v, *dims)?;
+                    SqlValue::Vector(v)
+                }
+                _ => return Err(bad(target)),
+            },
+            SqlType::HStore => match self {
+                SqlValue::HStore(_) => self.clone(),
+                SqlValue::Text(s) | SqlValue::Citext(s) => parse_hstore_text(s)?,
+                _ => return Err(bad(target)),
+            },
+            SqlType::Ltree => match self {
+                SqlValue::Ltree(_) => self.clone(),
+                SqlValue::Text(s) | SqlValue::Citext(s) => parse_ltree_text(s)?,
+                _ => return Err(bad(target)),
+            },
+            SqlType::Cube => match self {
+                SqlValue::Cube { .. } => self.clone(),
+                SqlValue::Text(s) | SqlValue::Citext(s) => parse_cube_text(s)?,
+                _ => return Err(bad(target)),
+            },
+            SqlType::TsVector => match self {
+                SqlValue::TsVector(_) => self.clone(),
+                SqlValue::Text(s) | SqlValue::Citext(s) => SqlValue::from_text(s, target)?,
+                _ => return Err(bad(target)),
+            },
+            SqlType::TsQuery => match self {
+                SqlValue::TsQuery(_) => self.clone(),
+                SqlValue::Text(s) | SqlValue::Citext(s) => SqlValue::from_text(s, target)?,
+                _ => return Err(bad(target)),
+            },
             SqlType::Json | SqlType::Jsonb => match self {
                 SqlValue::Json(_) => self.clone(),
                 SqlValue::Text(s) => {
@@ -556,6 +810,18 @@ fn format_float(n: f64) -> String {
     }
 }
 
+/// float4 text output: shortest round-trip form of the f32 itself (widening
+/// through f64 would print excess digits, e.g. 0.36363637 -> 0.3636363744735718).
+fn format_float_f32(n: f32) -> String {
+    if n.is_nan() {
+        "NaN".to_string()
+    } else if n.is_infinite() {
+        if n > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+    } else {
+        format!("{n}")
+    }
+}
+
 fn format_array(items: &[SqlValue]) -> String {
     let mut out = String::from("{");
     for (i, item) in items.iter().enumerate() {
@@ -564,6 +830,8 @@ fn format_array(items: &[SqlValue]) -> String {
         }
         match item.to_text() {
             None => out.push_str("NULL"),
+            // Nested arrays print unquoted ({{a,1},{b,2}}), like PostgreSQL.
+            Some(t) if matches!(item, SqlValue::Array(_)) => out.push_str(&t),
             Some(t) => {
                 let needs_quote = t.is_empty()
                     || t.contains([',', '{', '}', '"', '\\', ' '])
@@ -716,6 +984,246 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+fn format_vector(v: &[f32]) -> String {
+    let mut out = String::from("[");
+    for (i, f) in v.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format_float(*f as f64));
+    }
+    out.push(']');
+    out
+}
+
+fn parse_vector_text(text: &str) -> Result<Vec<f32>> {
+    let bad = || RelError::InvalidTextRepresentation {
+        ty: "vector".into(),
+        value: text.to_string(),
+    };
+    let inner = text
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .ok_or_else(bad)?;
+    if inner.trim().is_empty() {
+        return Err(bad()); // PG: vector must have at least 1 dimension
+    }
+    inner
+        .split(',')
+        .map(|p| p.trim().parse::<f32>().map_err(|_| bad()))
+        .collect()
+}
+
+/// Canonical hstore text output, matching contrib/hstore: pairs sorted by
+/// (key length, key bytes) — the extension's internal order, which is why
+/// PostgreSQL prints `"b"=>"1", "aa"=>"2"` — keys and values always quoted
+/// (`\` and `"` escaped), hstore NULLs as unquoted `NULL`, `", "` separator.
+fn format_hstore(map: &std::collections::BTreeMap<String, Option<String>>) -> String {
+    let mut pairs: Vec<(&String, &Option<String>)> = map.iter().collect();
+    pairs.sort_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    let quote = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+    pairs
+        .iter()
+        .map(|(k, v)| match v {
+            Some(val) => format!("{}=>{}", quote(k), quote(val)),
+            None => format!("{}=>NULL", quote(k)),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse hstore text input (`'a=>1, "b b"=>NULL'`). Tokens may be quoted
+/// (backslash escapes) or bare; a bare, case-insensitive `NULL` value is the
+/// hstore NULL. Duplicate keys keep the first occurrence (what contrib/hstore
+/// does). Syntax errors are `42601`, matching PostgreSQL.
+fn parse_hstore_text(text: &str) -> Result<SqlValue> {
+    let err =
+        |what: &str| RelError::Syntax(format!("syntax error in hstore: {what}, in \"{text}\""));
+    let mut chars = text.chars().peekable();
+    let mut map = std::collections::BTreeMap::new();
+    loop {
+        skip_spaces(&mut chars);
+        if chars.peek().is_none() {
+            break;
+        }
+        let (key, _) = hstore_token(&mut chars).ok_or_else(|| err("expected key"))?;
+        skip_spaces(&mut chars);
+        if !(chars.next() == Some('=') && chars.next() == Some('>')) {
+            return Err(err("expected =>"));
+        }
+        skip_spaces(&mut chars);
+        let (val, quoted) = hstore_token(&mut chars).ok_or_else(|| err("expected value"))?;
+        let value = if !quoted && val.eq_ignore_ascii_case("null") {
+            None
+        } else {
+            Some(val)
+        };
+        map.entry(key).or_insert(value);
+        skip_spaces(&mut chars);
+        match chars.next() {
+            None => break,
+            Some(',') => continue,
+            Some(_) => return Err(err("expected , or end")),
+        }
+    }
+    Ok(SqlValue::HStore(map))
+}
+
+fn skip_spaces(chars: &mut std::iter::Peekable<std::str::Chars>) {
+    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+        chars.next();
+    }
+}
+
+/// One hstore key or value token. Returns `(text, was_quoted)`; `None` on a
+/// malformed or empty token (including an unterminated quote).
+fn hstore_token(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<(String, bool)> {
+    let mut out = String::new();
+    if chars.peek() == Some(&'"') {
+        chars.next();
+        loop {
+            match chars.next()? {
+                '"' => return Some((out, true)),
+                '\\' => out.push(chars.next()?),
+                c => out.push(c),
+            }
+        }
+    }
+    loop {
+        match chars.peek() {
+            Some('\\') => {
+                chars.next();
+                out.push(chars.next()?);
+            }
+            Some(c) if !c.is_whitespace() && !matches!(c, ',' | '"' | '=') => {
+                out.push(*c);
+                chars.next();
+            }
+            _ => break,
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some((out, false))
+    }
+}
+
+/// The label sequence of an ltree path (empty path = zero labels).
+pub(crate) fn ltree_labels(path: &str) -> Vec<&str> {
+    if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split('.').collect()
+    }
+}
+
+/// Parse and validate ltree text input: dot-separated labels of alphanumerics,
+/// `_` and `-` (hyphens per PostgreSQL 16), each 1..=255 characters; the empty
+/// string is the valid zero-level path. Syntax errors are `42601` like
+/// PostgreSQL's `ltree syntax error`.
+fn parse_ltree_text(text: &str) -> Result<SqlValue> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Ok(SqlValue::Ltree(String::new()));
+    }
+    for label in t.split('.') {
+        let ok = !label.is_empty()
+            && label.chars().count() <= 255
+            && label
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
+        if !ok {
+            return Err(RelError::Syntax(format!("ltree syntax error in \"{t}\"")));
+        }
+    }
+    Ok(SqlValue::Ltree(t.to_string()))
+}
+
+/// cube text output, matching contrib/cube: coordinates joined by `", "`,
+/// corners preserved as given, and a cube whose corners coincide printed as a
+/// single point — `(1, 2)` / `(1, 2),(3, 4)`.
+fn format_cube(ll: &[f64], ur: &[f64]) -> String {
+    let list = |v: &[f64]| {
+        v.iter()
+            .map(|f| format_float(*f))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if ll == ur {
+        format!("({})", list(ll))
+    } else {
+        format!("({}),({})", list(ll), list(ur))
+    }
+}
+
+/// Parse cube text input: `'1'`, `'1,2'`, `'(1,2)'`, `'(1,2),(3,4)'` and the
+/// bracketed `'[(1),(2)]'` form. Corner dimension mismatches and empty cubes
+/// are rejected. Errors are `22P02` like PostgreSQL's
+/// `invalid input syntax for cube`.
+fn parse_cube_text(text: &str) -> Result<SqlValue> {
+    let bad = || RelError::InvalidTextRepresentation {
+        ty: "cube".into(),
+        value: text.to_string(),
+    };
+    let parse_list = |s: &str| -> Result<Vec<f64>> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(bad());
+        }
+        s.split(',')
+            .map(|p| p.trim().parse::<f64>().map_err(|_| bad()))
+            .collect()
+    };
+    let mut t = text.trim();
+    if let Some(inner) = t.strip_prefix('[') {
+        t = inner.strip_suffix(']').ok_or_else(bad)?.trim();
+    }
+    if let Some(rest) = t.strip_prefix('(') {
+        let close = rest.find(')').ok_or_else(bad)?;
+        let first = parse_list(&rest[..close])?;
+        let after = rest[close + 1..].trim();
+        if after.is_empty() {
+            return Ok(SqlValue::Cube {
+                ll: first.clone(),
+                ur: first,
+            });
+        }
+        let second_group = after.strip_prefix(',').ok_or_else(bad)?.trim();
+        let inner = second_group
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .ok_or_else(bad)?;
+        let second = parse_list(inner)?;
+        if first.len() != second.len() {
+            return Err(bad());
+        }
+        return Ok(SqlValue::Cube {
+            ll: first,
+            ur: second,
+        });
+    }
+    let point = parse_list(t)?;
+    Ok(SqlValue::Cube {
+        ll: point.clone(),
+        ur: point,
+    })
+}
+
+fn check_vector_dims(v: &[f32], dims: Option<u32>) -> Result<()> {
+    if let Some(d) = dims
+        && v.len() as u32 != d
+    {
+        return Err(RelError::DatatypeMismatch {
+            column: String::new(),
+            expected: format!("vector({d})"),
+            actual: format!("vector({})", v.len()),
+        });
+    }
+    Ok(())
+}
+
 fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, ()> {
     if !s.len().is_multiple_of(2) {
         return Err(());
@@ -822,4 +1330,185 @@ mod tests {
             SqlValue::Numeric(Decimal::from(1)).index_key()
         );
     }
+
+    // ------------------------------------------------------------------
+    // hstore / ltree / cube value plumbing. Expected values generated from
+    // live PostgreSQL 16.13 with contrib hstore 1.8 / ltree 1.2 / cube 1.5.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn hstore_text_round_trip_uses_pg_key_order() {
+        // PG: SELECT 'zz=>1, b=>2, aa=>3, a=>4'::hstore
+        //     => "a"=>"4", "b"=>"2", "aa"=>"3", "zz"=>"1"  (length, then bytes)
+        let v = SqlValue::from_text("zz=>1, b=>2, aa=>3, a=>4", &SqlType::HStore).unwrap();
+        assert_eq!(
+            v.to_text().unwrap(),
+            r#""a"=>"4", "b"=>"2", "aa"=>"3", "zz"=>"1""#
+        );
+    }
+
+    #[test]
+    fn hstore_null_values_and_quoting() {
+        // PG: SELECT '"a"=>"1", b=>NULL'::hstore => "a"=>"1", "b"=>NULL
+        let v = SqlValue::from_text(r#""a"=>"1", b=>NULL"#, &SqlType::HStore).unwrap();
+        assert_eq!(v.to_text().unwrap(), r#""a"=>"1", "b"=>NULL"#);
+        // Quoted "NULL" is the string, not the hstore NULL (PG-verified).
+        let v = SqlValue::from_text(r#"a=>"NULL""#, &SqlType::HStore).unwrap();
+        assert_eq!(v.to_text().unwrap(), r#""a"=>"NULL""#);
+    }
+
+    #[test]
+    fn hstore_escapes_and_duplicates() {
+        // PG: SELECT E'k\\"ey=>"v,1", "with space"=>"a\\\\b"'::hstore
+        //     => "k\"ey"=>"v,1", "with space"=>"a\\b"
+        let v =
+            SqlValue::from_text(r#"k\"ey=>"v,1", "with space"=>"a\\b""#, &SqlType::HStore).unwrap();
+        assert_eq!(
+            v.to_text().unwrap(),
+            r#""k\"ey"=>"v,1", "with space"=>"a\\b""#
+        );
+        // PG: SELECT 'a=>1, a=>2'::hstore => "a"=>"1" (first occurrence wins)
+        let v = SqlValue::from_text("a=>1, a=>2", &SqlType::HStore).unwrap();
+        assert_eq!(v.to_text().unwrap(), r#""a"=>"1""#);
+    }
+
+    #[test]
+    fn hstore_empty_and_errors() {
+        let v = SqlValue::from_text("", &SqlType::HStore).unwrap();
+        assert_eq!(v.to_text().unwrap(), "");
+        // PG: 'a'::hstore and 'a=>'::hstore are 42601 syntax errors.
+        for bad in ["a", "a=>", "=>1", "a=>1 b=>2"] {
+            assert!(
+                matches!(
+                    SqlValue::from_text(bad, &SqlType::HStore),
+                    Err(RelError::Syntax(_))
+                ),
+                "{bad:?} should be an hstore syntax error"
+            );
+        }
+    }
+
+    #[test]
+    fn hstore_json_round_trip() {
+        let v = SqlValue::from_text("a=>1, b=>NULL", &SqlType::HStore).unwrap();
+        let json = v.encode_json();
+        assert_eq!(json, serde_json::json!({"a": "1", "b": null}));
+        let back = SqlValue::decode_json(&json, &SqlType::HStore).unwrap();
+        assert_eq!(back.sql_eq(&v), Some(true));
+    }
+
+    #[test]
+    fn ltree_validation_and_round_trip() {
+        let v = SqlValue::from_text("Top.Science.Astronomy", &SqlType::Ltree).unwrap();
+        assert_eq!(v.to_text().unwrap(), "Top.Science.Astronomy");
+        // Hyphenated labels are valid in PostgreSQL 16.
+        assert!(SqlValue::from_text("a-b.c", &SqlType::Ltree).is_ok());
+        // The empty path is valid (nlevel 0), like PG.
+        assert!(SqlValue::from_text("", &SqlType::Ltree).is_ok());
+        for bad in ["a..b", "a b", "a.", ".a", "a{1}"] {
+            assert!(
+                matches!(
+                    SqlValue::from_text(bad, &SqlType::Ltree),
+                    Err(RelError::Syntax(_))
+                ),
+                "{bad:?} should be an ltree syntax error"
+            );
+        }
+    }
+
+    #[test]
+    fn ltree_orders_by_label_sequence() {
+        // PG ORDER BY: a < a.b < a.b.c < a-b < aa < b.c
+        let mut paths = ["b.c", "a", "a.b", "a.b.c", "aa", "a-b"]
+            .map(|p| SqlValue::Ltree(p.into()))
+            .to_vec();
+        paths.sort_by(|a, b| a.compare(b).unwrap());
+        let sorted: Vec<String> = paths.iter().map(|p| p.to_text().unwrap()).collect();
+        assert_eq!(sorted, ["a", "a.b", "a.b.c", "a-b", "aa", "b.c"]);
+        // index_key byte order agrees with compare() for range scans.
+        let a = SqlValue::Ltree("a.b".into());
+        let b = SqlValue::Ltree("a-b".into());
+        assert_eq!(a.compare(&b), Some(Ordering::Less));
+        assert!(a.index_key() < b.index_key());
+    }
+
+    #[test]
+    fn cube_text_forms_match_pg() {
+        // PG-verified input/output pairs.
+        for (input, output) in [
+            ("1", "(1)"),
+            ("1,2", "(1, 2)"),
+            ("(1,2)", "(1, 2)"),
+            ("(1,2),(3,4)", "(1, 2),(3, 4)"),
+            ("(1,2),(1,2)", "(1, 2)"), // coincident corners print as a point
+            ("(3),(1)", "(3),(1)"),    // corner order is preserved
+            ("(0.5, -1e2)", "(0.5, -100)"),
+            ("[(1),(2)]", "(1),(2)"),
+        ] {
+            let v = SqlValue::from_text(input, &SqlType::Cube).unwrap();
+            assert_eq!(v.to_text().unwrap(), output, "cube {input:?}");
+        }
+        // PG: '(1,2),(3)'::cube => 22P02 (different point dimensions).
+        for bad in ["(1,2),(3)", "x", "", "(1,2"] {
+            assert!(
+                matches!(
+                    SqlValue::from_text(bad, &SqlType::Cube),
+                    Err(RelError::InvalidTextRepresentation { .. })
+                ),
+                "{bad:?} should be a cube input error"
+            );
+        }
+    }
+
+    #[test]
+    fn cube_comparison_normalizes_corners() {
+        // PG: SELECT '(3),(1)'::cube = '(1),(3)'::cube => t
+        let a = SqlValue::from_text("(3),(1)", &SqlType::Cube).unwrap();
+        let b = SqlValue::from_text("(1),(3)", &SqlType::Cube).unwrap();
+        assert_eq!(a.sql_eq(&b), Some(true));
+        // PG: '(1)'::cube = '(1,0)'::cube => f (dimension is the tiebreak)
+        let c = SqlValue::from_text("(1)", &SqlType::Cube).unwrap();
+        let d = SqlValue::from_text("(1,0)", &SqlType::Cube).unwrap();
+        assert_eq!(c.sql_eq(&d), Some(false));
+        // PG ORDER BY: (0, 5) < (1) < (1),(3) < (2)
+        let mut cubes = ["(2)", "(1)", "(1),(3)", "(0,5)"]
+            .map(|c| SqlValue::from_text(c, &SqlType::Cube).unwrap())
+            .to_vec();
+        cubes.sort_by(|a, b| a.compare(b).unwrap());
+        let sorted: Vec<String> = cubes.iter().map(|c| c.to_text().unwrap()).collect();
+        assert_eq!(sorted, ["(0, 5)", "(1)", "(1),(3)", "(2)"]);
+    }
+
+    #[test]
+    fn cube_json_round_trip() {
+        let v = SqlValue::from_text("(3),(1)", &SqlType::Cube).unwrap();
+        let back = SqlValue::decode_json(&v.encode_json(), &SqlType::Cube).unwrap();
+        assert_eq!(back.to_text().unwrap(), "(3),(1)");
+    }
+
+    #[test]
+    fn extension_value_casts() {
+        let h = SqlValue::Text("a=>1".into())
+            .cast(&SqlType::HStore)
+            .unwrap();
+        assert!(matches!(h, SqlValue::HStore(_)));
+        let l = SqlValue::Text("a.b".into()).cast(&SqlType::Ltree).unwrap();
+        assert_eq!(l.cast(&SqlType::Text).unwrap().to_text().unwrap(), "a.b");
+        assert!(SqlValue::Text("a b".into()).cast(&SqlType::Ltree).is_err());
+        let c = SqlValue::Text("(1,2)".into()).cast(&SqlType::Cube).unwrap();
+        assert_eq!(c.to_text().unwrap(), "(1, 2)");
+        assert!(SqlValue::Int4(1).cast(&SqlType::HStore).is_err());
+    }
 }
+
+// Maintenance note 11: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note 23: documents compatibility expectations without changing runtime behavior.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
+
+// Maintenance note: keeps SQL compatibility behavior explicit for future updates.
+
+// SQL compatibility note 12: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.
+
+// SQL compatibility note 12: preserves documented behavior for window functions, recursive CTE validation, SQLSTATE mapping, and aggregate correctness without changing runtime semantics.

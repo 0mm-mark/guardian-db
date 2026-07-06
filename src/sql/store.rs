@@ -162,7 +162,7 @@ impl LoadedTable {
                     return Some(Vec::new());
                 }
                 let key = ordered_key(std::slice::from_ref(value));
-                return Some(idx.data.get(&key).into_iter().collect());
+                return Some(idx.data.get(&key).iter().cloned().collect());
             }
         }
         None
