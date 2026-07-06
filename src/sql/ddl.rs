@@ -2,8 +2,8 @@
 
 use crate::relational::SqlType;
 use crate::relational::catalog::{
-    CheckConstraint, Column, ForeignKey, Index, PrimaryKey, QualifiedName, ReferentialAction,
-    Table, UniqueConstraint, View,
+    CheckConstraint, Column, Deferrable, ForeignKey, Index, MatchType, PrimaryKey, QualifiedName,
+    ReferentialAction, Table, UniqueConstraint, View,
 };
 use crate::sql::error::{Result, SqlError};
 use crate::sql::exec::Exec;
@@ -305,8 +305,8 @@ impl Exec {
         columns: Vec<String>,
         name: String,
     ) -> Result<ForeignKey> {
-        reject_unsupported_characteristics(&fk.characteristics)?;
-        reject_unsupported_match(&fk.match_kind)?;
+        let deferrable = fk_deferrable_mode(&fk.characteristics)?;
+        let match_type = fk_match_type(&fk.match_kind)?;
         let (fs, ft) = split_schema_table(&fk.foreign_table);
         let ref_schema = match &fs {
             Some(s) => s.clone(),
@@ -350,6 +350,8 @@ impl Exec {
             ref_columns,
             on_delete: map_action(fk.on_delete),
             on_update: map_action(fk.on_update),
+            match_type,
+            deferrable,
         })
     }
 
@@ -1046,11 +1048,16 @@ pub fn index_column_name(ic: &sqlparser::ast::IndexColumn) -> Result<String> {
     }
 }
 
-/// Truthfulness carve-out: deferred constraint checking is not implemented,
-/// so `DEFERRABLE` / `INITIALLY DEFERRED` (and `NOT ENFORCED`) must fail with
-/// a stable `0A000` instead of being accepted and checked immediately anyway.
-/// `NOT DEFERRABLE`, `INITIALLY IMMEDIATE` and `ENFORCED` are the defaults
-/// the engine implements, so they pass.
+/// Truthfulness carve-out: deferred constraint checking is only implemented
+/// for foreign keys (see [`fk_deferrable_mode`], used by `build_foreign_key`);
+/// `PRIMARY KEY`/`UNIQUE` constraints have no deferred-checking machinery at
+/// all here (PostgreSQL validates those against a live unique index, a
+/// different mechanism this engine does not run deferred), so `DEFERRABLE` /
+/// `INITIALLY DEFERRED` on *those* must still fail with a stable `0A000`
+/// instead of being accepted and checked immediately anyway. `NOT ENFORCED`
+/// is rejected for every constraint kind (not implemented at all). `NOT
+/// DEFERRABLE`, `INITIALLY IMMEDIATE` and `ENFORCED` are the defaults the
+/// engine implements, so they pass.
 fn reject_unsupported_characteristics(
     characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
 ) -> Result<()> {
@@ -1071,21 +1078,67 @@ fn reject_unsupported_characteristics(
     Ok(())
 }
 
-/// Foreign keys are enforced with MATCH SIMPLE semantics only; accepting
-/// `MATCH FULL`/`MATCH PARTIAL` and then enforcing SIMPLE would be silently
-/// wrong for partially-NULL keys.
-fn reject_unsupported_match(
-    kind: &Option<sqlparser::ast::ConstraintReferenceMatchKind>,
-) -> Result<()> {
+/// Parse a foreign key's `[NOT] DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}]`
+/// declaration into a [`Deferrable`] mode. `NOT ENFORCED` stays rejected
+/// (`0A000`), same as [`reject_unsupported_characteristics`] — this engine
+/// has no "declared but not checked" constraint mode.
+///
+/// PostgreSQL's own combining rule (`processCASbits` /
+/// `ConstraintAttributeSpec` in `src/backend/parser/gram.y`) is reproduced
+/// exactly rather than treating `deferrable`/`initially` independently:
+/// * `NOT DEFERRABLE` together with `INITIALLY DEFERRED` is *not* just "not
+///   deferrable" — PostgreSQL raises a specific syntax error for exactly this
+///   combination ("constraint declared INITIALLY DEFERRED must be
+///   DEFERRABLE", `42601`), reproduced here.
+/// * A *bare* `INITIALLY DEFERRED` with no explicit `DEFERRABLE`/`NOT
+///   DEFERRABLE` keyword at all is accepted and implies `DEFERRABLE` (the
+///   `CAS_INITIALLY_DEFERRED` bit alone sets PostgreSQL's internal
+///   `deferrable = true`, independent of the `CAS_DEFERRABLE` bit) — so it is
+///   equivalent to `DEFERRABLE INITIALLY DEFERRED`, not an error.
+fn fk_deferrable_mode(
+    characteristics: &Option<sqlparser::ast::ConstraintCharacteristics>,
+) -> Result<Deferrable> {
+    use sqlparser::ast::DeferrableInitial;
+    let Some(c) = characteristics else {
+        return Ok(Deferrable::NotDeferrable);
+    };
+    if c.enforced == Some(false) {
+        return Err(SqlError::FeatureNotSupported(
+            "NOT ENFORCED constraints are not supported".into(),
+        ));
+    }
+    let initially_deferred = c.initially == Some(DeferrableInitial::Deferred);
+    if c.deferrable == Some(false) && initially_deferred {
+        return Err(SqlError::Syntax(
+            "constraint declared INITIALLY DEFERRED must be DEFERRABLE".into(),
+        ));
+    }
+    let deferrable = c.deferrable == Some(true) || initially_deferred;
+    Ok(match (deferrable, initially_deferred) {
+        (true, true) => Deferrable::DeferrableDeferred,
+        (true, false) => Deferrable::DeferrableImmediate,
+        (false, _) => Deferrable::NotDeferrable,
+    })
+}
+
+/// Parse a foreign key's `MATCH { FULL | PARTIAL | SIMPLE }` clause.
+/// `MATCH SIMPLE` is PostgreSQL's default when the clause is omitted.
+///
+/// `MATCH PARTIAL` is rejected (`0A000`): PostgreSQL's own grammar accepts
+/// it, but PostgreSQL itself has never implemented it (`CREATE TABLE`'s
+/// "Key Match Types" section documents it as not yet implemented, and real
+/// PostgreSQL raises `MATCH PARTIAL not yet implemented` for it) — so
+/// rejecting it here *is* 1:1 parity with upstream PostgreSQL, not a gap.
+fn fk_match_type(kind: &Option<sqlparser::ast::ConstraintReferenceMatchKind>) -> Result<MatchType> {
     use sqlparser::ast::ConstraintReferenceMatchKind as M;
     match kind {
-        Some(M::Full) => Err(SqlError::FeatureNotSupported(
-            "MATCH FULL foreign keys are not supported (MATCH SIMPLE only)".into(),
-        )),
+        Some(M::Full) => Ok(MatchType::Full),
         Some(M::Partial) => Err(SqlError::FeatureNotSupported(
-            "MATCH PARTIAL foreign keys are not supported (MATCH SIMPLE only)".into(),
+            "MATCH PARTIAL is not implemented — PostgreSQL itself has never implemented it \
+             either (\"MATCH PARTIAL not yet implemented\"); this is parity, not a gap"
+                .into(),
         )),
-        Some(M::Simple) | None => Ok(()),
+        Some(M::Simple) | None => Ok(MatchType::Simple),
     }
 }
 

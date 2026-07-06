@@ -115,6 +115,73 @@ impl ReferentialAction {
     }
 }
 
+/// A composite foreign key's `MATCH` mode. `MATCH SIMPLE` is PostgreSQL's
+/// default when neither `MATCH FULL` nor `MATCH PARTIAL` is written.
+///
+/// There is deliberately no `Partial` variant: PostgreSQL's own grammar
+/// accepts `MATCH PARTIAL`, but PostgreSQL itself has never implemented it —
+/// `CREATE TABLE`'s own reference page (the `REFERENCES` clause, under
+/// "Key Match Types") documents it as not yet implemented, and real
+/// PostgreSQL raises `MATCH PARTIAL not yet implemented` for it. GuardianDB
+/// mirrors that exact non-implementation (typed `0A000`, see
+/// `crate::sql::ddl::reject_unsupported_match`) instead of building it out,
+/// which *is* 1:1 parity here — so this type only models the two match kinds
+/// that actually run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MatchType {
+    /// Any NULL FK column exempts the row from the check.
+    #[default]
+    Simple,
+    /// A composite key must be either all-NULL (exempt) or all-non-NULL and
+    /// matching a parent row; a mix of NULL and non-NULL components is
+    /// itself a violation — PostgreSQL's message (verified against
+    /// `src/backend/utils/adt/ri_triggers.c`): "MATCH FULL does not allow
+    /// mixing of null and nonnull key values." (`23503`).
+    Full,
+}
+
+/// A foreign key's `[NOT] DEFERRABLE [INITIALLY {DEFERRED|IMMEDIATE}]`
+/// declaration — whether, and when, `SET CONSTRAINTS` can postpone its `NO
+/// ACTION` check to `COMMIT` (see `crate::sql::exec::ConstraintModes` and
+/// `crate::sql::fk`). `NotDeferrable` is PostgreSQL's default and the only
+/// kind that existed before this field was added, so it is also this enum's
+/// `Default`/serde default (old catalog documents keep loading unchanged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Deferrable {
+    /// `NOT DEFERRABLE` (or no characteristics at all): always checked
+    /// immediately. `SET CONSTRAINTS` can never change that — PostgreSQL
+    /// raises `42809` ("constraint ... is not deferrable") if asked to defer
+    /// one (see `crate::sql::engine::Session::exec_set_constraints`).
+    #[default]
+    NotDeferrable,
+    /// `DEFERRABLE` (bare, or with an explicit `INITIALLY IMMEDIATE`): a
+    /// fresh transaction checks it immediately, but `SET CONSTRAINTS ...
+    /// DEFERRED` can defer it to `COMMIT` for the rest of the transaction.
+    DeferrableImmediate,
+    /// `DEFERRABLE INITIALLY DEFERRED` — or a *bare* `INITIALLY DEFERRED`
+    /// with no explicit `DEFERRABLE`/`NOT DEFERRABLE` keyword, which
+    /// PostgreSQL's grammar treats as implying `DEFERRABLE` too (see
+    /// `processCASbits` / `ConstraintAttributeSpec` in
+    /// `src/backend/parser/gram.y`: the `CAS_INITIALLY_DEFERRED` bit alone
+    /// sets `deferrable = true`). A fresh transaction checks it at `COMMIT`
+    /// by default, unless `SET CONSTRAINTS ... IMMEDIATE` overrides that for
+    /// the transaction.
+    DeferrableDeferred,
+}
+
+impl Deferrable {
+    /// Can `SET CONSTRAINTS` ever change this constraint's check timing?
+    pub fn is_deferrable(self) -> bool {
+        !matches!(self, Deferrable::NotDeferrable)
+    }
+
+    /// The mode a fresh transaction starts in, absent any `SET CONSTRAINTS`
+    /// naming this constraint (or `ALL`) earlier in the same transaction.
+    pub fn initially_deferred(self) -> bool {
+        matches!(self, Deferrable::DeferrableDeferred)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForeignKey {
     pub name: String,
@@ -124,6 +191,16 @@ pub struct ForeignKey {
     pub ref_columns: Vec<String>,
     pub on_delete: ReferentialAction,
     pub on_update: ReferentialAction,
+    /// `MATCH SIMPLE` (default) or `MATCH FULL`. `#[serde(default)]` so
+    /// catalogs written before this field existed keep loading as `MATCH
+    /// SIMPLE`, their only possible pre-existing meaning.
+    #[serde(default)]
+    pub match_type: MatchType,
+    /// `[NOT] DEFERRABLE [INITIALLY ...]`. Same backward-compatible serde
+    /// default as `match_type` — `NOT DEFERRABLE` is also the only meaning a
+    /// pre-existing catalog document could have had.
+    #[serde(default)]
+    pub deferrable: Deferrable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -726,6 +803,43 @@ impl Catalog {
             }
         }
         out
+    }
+
+    /// Foreign keys named `name`, for `SET CONSTRAINTS` (which — unlike
+    /// `ALTER TABLE ... DROP CONSTRAINT` — resolves a constraint by name
+    /// alone, with no owning table given). Mirrors PostgreSQL's own
+    /// resolution (`AfterTriggerSetState` in
+    /// `src/backend/commands/trigger.c`): an explicit schema restricts the
+    /// search to it; a bare name searches the schema search path and returns
+    /// every match in the *first* schema that has any. PostgreSQL allows more
+    /// than one constraint to share a name within a schema (e.g. on
+    /// different tables) and toggles them together — so does this.
+    pub fn foreign_keys_named(
+        &self,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Vec<(QualifiedName, ForeignKey)> {
+        let schemas: Vec<&str> = match schema {
+            Some(s) => vec![s],
+            None => self.search_path.iter().map(String::as_str).collect(),
+        };
+        for s in schemas {
+            let found: Vec<(QualifiedName, ForeignKey)> = self
+                .tables
+                .values()
+                .filter(|t| t.schema == s)
+                .flat_map(|t| {
+                    t.foreign_keys
+                        .iter()
+                        .filter(|fk| fk.name == name)
+                        .map(move |fk| (t.qualified(), fk.clone()))
+                })
+                .collect();
+            if !found.is_empty() {
+                return found;
+            }
+        }
+        Vec::new()
     }
 
     pub fn drop_table_qualified(&mut self, q: &QualifiedName) -> Result<Table> {

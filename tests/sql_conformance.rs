@@ -1181,25 +1181,52 @@ async fn composite_foreign_key_match_simple() {
 }
 
 #[tokio::test]
-async fn deferrable_and_match_full_foreign_keys_rejected() {
+async fn match_partial_rejected_deferrable_and_match_full_accepted() {
+    // FK `DEFERRABLE`/`INITIALLY DEFERRED` and `MATCH FULL` are implemented
+    // (see `tests/sql_fk_advanced.rs` for their behavioral tests); real
+    // PostgreSQL parity gaps that remain typed `0A000`:
+    //   * `MATCH PARTIAL` — PostgreSQL itself has never implemented it either
+    //     ("MATCH PARTIAL not yet implemented"), so this *is* parity.
+    //   * `DEFERRABLE` on `UNIQUE`/`PRIMARY KEY` — this engine only runs
+    //     deferred checking for foreign keys, not the unique-index-based
+    //     mechanism PostgreSQL uses for deferrable UNIQUE/PK.
     let mut s = session().await;
     ok(&mut s, "CREATE TABLE dp (id INT PRIMARY KEY)").await;
-    // Deferred checking is not implemented: accepting DEFERRABLE and then
-    // checking immediately anyway would be a lie — stable 0A000 instead.
     for sql in [
-        "CREATE TABLE dc (id INT PRIMARY KEY, pid INT REFERENCES dp(id) DEFERRABLE)",
-        "CREATE TABLE dc (id INT PRIMARY KEY, \
-         pid INT REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)",
-        "CREATE TABLE dc (id INT PRIMARY KEY, pid INT REFERENCES dp(id) INITIALLY DEFERRED)",
+        "CREATE TABLE dc (id INT PRIMARY KEY, pid INT REFERENCES dp(id) MATCH PARTIAL)",
         "CREATE TABLE dc (id INT PRIMARY KEY, pid INT, \
-         FOREIGN KEY (pid) REFERENCES dp(id) DEFERRABLE)",
+         FOREIGN KEY (pid) REFERENCES dp(id) MATCH PARTIAL)",
         "CREATE TABLE dc (id INT PRIMARY KEY, pid INT UNIQUE DEFERRABLE)",
-        // Only MATCH SIMPLE is enforced; other MATCH kinds must not be
-        // silently downgraded.
-        "CREATE TABLE dc (id INT PRIMARY KEY, pid INT REFERENCES dp(id) MATCH FULL)",
+        "CREATE TABLE dc (id INT PRIMARY KEY DEFERRABLE)",
     ] {
         assert_eq!(err_code(&mut s, sql).await, "0A000", "for `{sql}`");
     }
+    // DEFERRABLE / INITIALLY DEFERRED / MATCH FULL on a foreign key are all
+    // accepted now (typed, enforced — not silently downgraded).
+    for sql in [
+        "CREATE TABLE dc1 (id INT PRIMARY KEY, pid INT REFERENCES dp(id) DEFERRABLE)",
+        "CREATE TABLE dc2 (id INT PRIMARY KEY, \
+         pid INT REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)",
+        "CREATE TABLE dc3 (id INT PRIMARY KEY, pid INT REFERENCES dp(id) INITIALLY DEFERRED)",
+        "CREATE TABLE dc4 (id INT PRIMARY KEY, pid INT, \
+         FOREIGN KEY (pid) REFERENCES dp(id) DEFERRABLE)",
+        "CREATE TABLE dc5 (id INT PRIMARY KEY, pid INT REFERENCES dp(id) MATCH FULL)",
+        "CREATE TABLE dc6 (id INT PRIMARY KEY, pid INT REFERENCES dp(id) NOT DEFERRABLE)",
+        // `NOT DEFERRABLE` + `INITIALLY DEFERRED` is a specific PostgreSQL
+        // syntax error ("constraint declared INITIALLY DEFERRED must be
+        // DEFERRABLE"), distinct from the generic 0A000 rejections above.
+    ] {
+        ok(&mut s, sql).await;
+    }
+    assert_eq!(
+        err_code(
+            &mut s,
+            "CREATE TABLE dc_conflict (id INT PRIMARY KEY, \
+             pid INT REFERENCES dp(id) NOT DEFERRABLE INITIALLY DEFERRED)"
+        )
+        .await,
+        "42601"
+    );
     // The defaults the engine implements are accepted.
     ok(
         &mut s,

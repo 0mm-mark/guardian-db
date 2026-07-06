@@ -703,6 +703,11 @@ fn pg_constraint(catalog: &Catalog) -> RowSet {
         ("confkey", SqlType::Array(Box::new(SqlType::SmallInt))),
         ("confupdtype", SqlType::Char(Some(1))),
         ("confdeltype", SqlType::Char(Some(1))),
+        // Foreign key `MATCH` mode: 'f' (FULL), 's' (SIMPLE), 'p' (PARTIAL —
+        // never actually stored, since `MATCH PARTIAL` is rejected at DDL
+        // time). Blank (' ') on every non-foreign-key row, matching
+        // `confupdtype`/`confdeltype`'s existing convention above.
+        ("confmatchtype", SqlType::Char(Some(1))),
     ];
     let mut rows = Vec::new();
     let mut oid = 30000;
@@ -732,6 +737,7 @@ fn pg_constraint(catalog: &Catalog) -> RowSet {
                 SqlValue::Array(vec![]),
                 t(" "),
                 t(" "),
+                t(" "),
             ]);
             oid += 1;
         }
@@ -753,6 +759,7 @@ fn pg_constraint(catalog: &Catalog) -> RowSet {
                 i4(0),
                 colnums(&u.columns),
                 SqlValue::Array(vec![]),
+                t(" "),
                 t(" "),
                 t(" "),
             ]);
@@ -791,6 +798,7 @@ fn pg_constraint(catalog: &Catalog) -> RowSet {
                 confkey,
                 t(action_char(fk.on_update)),
                 t(action_char(fk.on_delete)),
+                t(match_type_char(fk.match_type)),
             ]);
             oid += 1;
         }
@@ -809,6 +817,7 @@ fn pg_constraint(catalog: &Catalog) -> RowSet {
                 SqlValue::Array(vec![]),
                 t(" "),
                 t(" "),
+                t(" "),
             ]);
             oid += 1;
         }
@@ -824,6 +833,20 @@ fn action_char(a: crate::relational::catalog::ReferentialAction) -> &'static str
         Cascade => "c",
         SetNull => "n",
         SetDefault => "d",
+    }
+}
+
+/// `pg_constraint.confmatchtype` for a foreign key's `MATCH` mode
+/// (PostgreSQL's `FKCONSTR_MATCH_*` constants in `pg_constraint.h`): `'f'`
+/// (FULL), `'s'` (SIMPLE). PostgreSQL also has `'p'` (PARTIAL), but
+/// [`MatchType`](crate::relational::catalog::MatchType) has no such variant
+/// to match on here — `MATCH PARTIAL` is rejected at DDL time (see
+/// `crate::sql::ddl::fk_match_type`) and can never reach this function.
+fn match_type_char(m: crate::relational::catalog::MatchType) -> &'static str {
+    use crate::relational::catalog::MatchType::*;
+    match m {
+        Simple => "s",
+        Full => "f",
     }
 }
 
