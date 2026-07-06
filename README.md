@@ -210,10 +210,10 @@ Supported derive attributes include `#[primary_key]`, `#[unique]`, `#[index]`, `
 
 ### JavaScript/TypeScript SDK shape
 
-The TypeScript ODM lives in its own package, [`guardiandb-odm`](packages/guardiandb-odm), and exposes the collection API requested in the ODM RFC. It targets regular GuardianDB (the document/collection store) — **not** the PostgreSQL compatibility layer; for SQL/TypeORM access via the `pgwire` server use [`guardiandb-postgres-typeorm`](packages/guardiandb-postgres-typeorm) instead. The included process-local transport is for SDK development and tests; production Node/WASM/mobile bindings should implement `GuardianTransport` against the Rust/Iroh backend.
+The TypeScript ODM lives in its own package, [`guardiandb-odm-typescript`](packages/guardiandb-odm-typescript), and exposes the collection API requested in the ODM RFC. It targets regular GuardianDB (the document/collection store) — **not** the PostgreSQL compatibility layer; for SQL/TypeORM access via the `pgwire` server use [`guardiandb-postgres-typeorm`](packages/guardiandb-postgres-typeorm) instead. The included process-local transport is for SDK development and tests; production Node/WASM/mobile bindings should implement `GuardianTransport` against the Rust/Iroh backend.
 
 ```javascript
-import GuardianDB from "guardiandb-odm";
+import GuardianDB from "guardiandb-odm-typescript";
 import Iroh from "iroh";
 
 const iroh = await Iroh.create();
@@ -654,7 +654,7 @@ cargo test --features odm --test odm_benchmark_reliability
 cargo bench --features odm --bench odm_benchmark
 
 # Check the TypeScript ODM SDK
-cd packages/guardiandb-odm
+cd packages/guardiandb-odm-typescript
 npm test
 cd ../..
 
@@ -662,7 +662,7 @@ cd ../..
 set GUARDIANDB_ODM_LARGE_DOC_MB 
 
 # Benchmark features with Typescript SSDK
-cd packages/guardiandb-odm
+cd packages/guardiandb-odm-typescript
 npm run bench -- --mode=runAll --docs=10000 --batch-size=1000 --queries=2500 --updates=2500
 npm run bench -- --mode=large --large-mb=17
 

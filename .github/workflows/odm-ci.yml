@@ -12,7 +12,7 @@ on:
       - tests/**
       - benches/**
       - guardian-db-derive/**
-      - packages/guardiandb-odm/**
+      - packages/guardiandb-odm-typescript/**
       - docs/ODM_BENCHMARKS.md
       - .github/workflows/odm-ci.yml
   pull_request:
@@ -26,7 +26,7 @@ on:
       - tests/**
       - benches/**
       - guardian-db-derive/**
-      - packages/guardiandb-odm/**
+      - packages/guardiandb-odm-typescript/**
       - docs/ODM_BENCHMARKS.md
       - .github/workflows/odm-ci.yml
   workflow_dispatch:
@@ -181,7 +181,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: packages/guardiandb-odm
+        working-directory: packages/guardiandb-odm-typescript
 
     steps:
       - name: Checkout repository
@@ -192,7 +192,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-          cache-dependency-path: packages/guardiandb-odm/package-lock.json
+          cache-dependency-path: packages/guardiandb-odm-typescript/package-lock.json
 
       - name: Install TypeScript SDK dependencies
         run: npm ci
@@ -232,8 +232,8 @@ jobs:
         with:
           name: typescript-smoke-benchmarks-node-${{ matrix.node }}
           path: |
-            packages/guardiandb-odm/benchmark-smoke-node-${{ matrix.node }}.json
-            packages/guardiandb-odm/benchmark-large-smoke-node-${{ matrix.node }}.json
+            packages/guardiandb-odm-typescript/benchmark-smoke-node-${{ matrix.node }}.json
+            packages/guardiandb-odm-typescript/benchmark-large-smoke-node-${{ matrix.node }}.json
           if-no-files-found: error
           retention-days: 14
 
@@ -292,7 +292,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: packages/guardiandb-odm
+        working-directory: packages/guardiandb-odm-typescript
 
     steps:
       - name: Checkout repository
@@ -303,7 +303,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: packages/guardiandb-odm/package-lock.json
+          cache-dependency-path: packages/guardiandb-odm-typescript/package-lock.json
 
       - name: Install TypeScript SDK dependencies
         run: npm ci
@@ -340,7 +340,7 @@ jobs:
         with:
           name: typescript-full-benchmarks
           path: |
-            packages/guardiandb-odm/benchmark-full.json
-            packages/guardiandb-odm/benchmark-large-document.json
+            packages/guardiandb-odm-typescript/benchmark-full.json
+            packages/guardiandb-odm-typescript/benchmark-large-document.json
           if-no-files-found: ignore
           retention-days: 14
