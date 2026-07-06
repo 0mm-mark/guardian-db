@@ -1345,9 +1345,7 @@ pub fn apply_thesaurus(
                         positions: vec![pos],
                     })
                     .collect();
-                for i in start..start + len {
-                    skip[i] = true;
-                }
+                skip[start..start + len].fill(true);
                 insertions.push((start, replacement));
                 continue 'outer;
             }
@@ -1362,11 +1360,11 @@ pub fn apply_thesaurus(
     let mut ins_iter = insertions.into_iter().peekable();
     for (i, lex) in lexemes.iter().enumerate() {
         if skip[i] {
-            if let Some((start, _)) = ins_iter.peek() {
-                if *start == i {
-                    let (_, repl) = ins_iter.next().unwrap();
-                    result.extend(repl);
-                }
+            if let Some((start, _)) = ins_iter.peek()
+                && *start == i
+            {
+                let (_, repl) = ins_iter.next().unwrap();
+                result.extend(repl);
             }
         } else {
             result.push(lex.clone());
