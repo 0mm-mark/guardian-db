@@ -71,6 +71,12 @@ pub struct Exec {
     /// is bounded regardless of how deep the Rust call stack for any single
     /// invocation goes.
     pub udf_depth: Arc<AtomicU32>,
+    /// Trigger-function invocation depth, shared like [`Exec::udf_depth`]
+    /// (a trigger whose body writes its own table recurses
+    /// `exec_insert → fire_* → body INSERT → exec_insert → ...` through
+    /// sub-[`Exec`]s), so trigger recursion is bounded regardless of Rust
+    /// stack shape. See [`crate::sql::udf::call_trigger_function`].
+    pub trigger_depth: Arc<AtomicU32>,
 }
 
 impl Exec {
@@ -102,6 +108,7 @@ impl Exec {
             vars: RefCell::new(HashMap::new()),
             rls: crate::sql::rls::RlsContext::default(),
             udf_depth: Arc::new(AtomicU32::new(0)),
+            trigger_depth: Arc::new(AtomicU32::new(0)),
         }
     }
 

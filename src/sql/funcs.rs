@@ -59,9 +59,18 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
         // --- string ---
         "upper" => nullable_unary(&|v| Ok(Text(text(v)?.to_uppercase())))?,
         "lower" => nullable_unary(&|v| Ok(Text(text(v)?.to_lowercase())))?,
-        "length" | "char_length" | "character_length" => {
-            nullable_unary(&|v| Ok(Int4(text(v)?.chars().count() as i32)))?
-        }
+        // length(tsvector) is the lexeme count; char_length has no tsvector
+        // form in PostgreSQL (42883).
+        "length" | "char_length" | "character_length" => match args.first() {
+            Some(TsVector(v)) if name == "length" && args.len() == 1 => Int4(v.len() as i32),
+            Some(TsVector(_)) => {
+                // Wrong name or extra arguments: no such function in PG.
+                return Err(SqlError::UndefinedFunction(format!(
+                    "{name}(tsvector, ...)"
+                )));
+            }
+            _ => nullable_unary(&|v| Ok(Int4(text(v)?.chars().count() as i32)))?,
+        },
         "octet_length" => nullable_unary(&|v| Ok(Int4(text(v)?.len() as i32)))?,
         "trim" | "btrim" => trim_fn(&args, true, true)?,
         "ltrim" => trim_fn(&args, true, false)?,
@@ -234,26 +243,42 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
             Text(value)
         }
         "pg_advisory_lock" | "pg_advisory_unlock" | "pg_notify" => Null,
-        // --- full-text search: named-unsupported (0A000), not unknown ---
-        // These are PostgreSQL core functions, so "does not exist" (42883)
-        // would be untruthful — and 42883 is sidecar-routable, which would
-        // silently change semantics per deployment. The whole family fails
-        // with one stable feature-not-supported error instead. This arm must
-        // stay ahead of the extension-dispatch fallthrough below.
-        "to_tsvector"
-        | "to_tsquery"
-        | "plainto_tsquery"
-        | "phraseto_tsquery"
+        // --- full-text search (PostgreSQL core; see docs/postgres-compat.md) ---
+        "to_tsvector" => crate::sql::fts::fn_to_tsvector(exec, &args)?,
+        "to_tsquery" => crate::sql::fts::fn_to_tsquery(exec, &args)?,
+        "plainto_tsquery" => crate::sql::fts::fn_plainto_tsquery(exec, &args)?,
+        "ts_rank" => crate::sql::fts::fn_ts_rank(&args)?,
+        "numnode" => crate::sql::fts::fn_numnode(&args)?,
+        "strip" => crate::sql::fts::fn_strip(&args)?,
+        // Out-of-subset FTS constructs stay *named*-unsupported: these are
+        // PostgreSQL core functions, so "does not exist" (42883) would be
+        // untruthful — and 42883 is sidecar-routable, which would silently
+        // change semantics per deployment. This arm must stay ahead of the
+        // extension-dispatch fallthrough below.
+        "phraseto_tsquery"
         | "websearch_to_tsquery"
-        | "ts_rank"
         | "ts_rank_cd"
         | "ts_headline"
         | "setweight"
         | "ts_delete"
-        | "tsvector_to_array" => {
-            return Err(SqlError::FeatureNotSupported(
-                "full-text search is not supported".into(),
-            ));
+        | "tsvector_to_array"
+        | "tsquery_phrase"
+        | "ts_rewrite"
+        | "ts_stat"
+        | "querytree"
+        | "ts_lexize"
+        | "get_current_ts_config"
+        | "array_to_tsvector"
+        | "ts_filter"
+        | "ts_parse"
+        | "ts_token_type"
+        | "ts_debug"
+        | "tsvector_update_trigger"
+        | "tsvector_update_trigger_column" => {
+            return Err(SqlError::FeatureNotSupported(format!(
+                "{name} is not supported (out of the full-text-search subset: to_tsvector, \
+                 to_tsquery, plainto_tsquery, ts_rank, length, numnode, strip, @@)"
+            )));
         }
         // --- Supabase auth helpers (used by row-security policies) ---
         // auth.uid(): the authenticated user's id — the JWT `sub` claim, as a
@@ -299,6 +324,12 @@ pub fn call_scalar(exec: &Exec, name: &str, args: Vec<SqlValue>) -> Result<SqlVa
             // PostgreSQL's full per-argument-type resolution; see
             // `Catalog::insert_function`).
             if let Some(def) = exec.catalog.find_function(None, other, args.len()) {
+                if def.returns_trigger {
+                    // PostgreSQL's message and SQLSTATE (0A000).
+                    return Err(SqlError::FeatureNotSupported(
+                        "trigger functions can only be called as triggers".into(),
+                    ));
+                }
                 return crate::sql::udf::call_function(exec, def, args);
             }
             // Unknown function: 42883, like PostgreSQL. This is also what
@@ -456,6 +487,8 @@ fn format_type(args: &[SqlValue]) -> SqlValue {
         1184 => "timestamp with time zone",
         1700 => "numeric",
         2950 => "uuid",
+        3614 => "tsvector",
+        3615 => "tsquery",
         3802 => "jsonb",
         _ => "-",
     };

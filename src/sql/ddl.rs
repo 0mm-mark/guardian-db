@@ -92,6 +92,7 @@ impl Exec {
             rls_enabled: false,
             rls_forced: false,
             policies: Vec::new(),
+            triggers: Vec::new(),
         };
         self.catalog.insert_table(table)?;
 
@@ -786,6 +787,25 @@ impl Exec {
                         method: "btree".into(),
                     });
                 }
+            }
+            // ENABLE/DISABLE TRIGGER (see `crate::sql::trigger`). The
+            // ALWAYS/REPLICA variants configure firing under replication
+            // roles, which this engine has no model for — named 0A000.
+            AlterTableOperation::EnableTrigger { name } => {
+                self.exec_set_trigger_enabled(q, name, true)?;
+            }
+            AlterTableOperation::DisableTrigger { name } => {
+                self.exec_set_trigger_enabled(q, name, false)?;
+            }
+            AlterTableOperation::EnableAlwaysTrigger { .. } => {
+                return Err(SqlError::FeatureNotSupported(
+                    "ENABLE ALWAYS TRIGGER".into(),
+                ));
+            }
+            AlterTableOperation::EnableReplicaTrigger { .. } => {
+                return Err(SqlError::FeatureNotSupported(
+                    "ENABLE REPLICA TRIGGER".into(),
+                ));
             }
             AlterTableOperation::EnableRowLevelSecurity => {
                 self.catalog.get_table_mut(q).unwrap().rls_enabled = true;

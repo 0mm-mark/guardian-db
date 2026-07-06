@@ -703,18 +703,25 @@ async fn create_function_basic_forms_now_supported() {
 }
 
 #[tokio::test]
-async fn create_function_trigger_return_type_unsupported() {
-    // Trigger functions (`RETURNS trigger`) are out of scope: `CREATE
-    // TRIGGER` itself is not implemented (see `create_trigger_unsupported`),
-    // and PL/pgSQL's `NEW`/`OLD` magic variables are not modeled.
+async fn create_function_trigger_return_type_supported() {
+    // Trigger functions (`RETURNS trigger`, PL/pgSQL) are implemented — see
+    // `tests/sql_triggers.rs` for the full behavioral suite. The SQL-language
+    // form stays rejected with PostgreSQL's own 42P13, and calling a trigger
+    // function as a scalar is PostgreSQL's 0A000.
     let mut s = session().await;
+    ok(
+        &mut s,
+        "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .await;
+    assert_eq!(err_code(&mut s, "SELECT f()").await, "0A000");
     assert_eq!(
         err_code(
             &mut s,
-            "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql"
+            "CREATE FUNCTION g() RETURNS trigger AS $$ SELECT 1 $$ LANGUAGE sql"
         )
         .await,
-        "0A000"
+        "42P13"
     );
 }
 
@@ -734,15 +741,32 @@ async fn create_procedure_unsupported() {
 }
 
 #[tokio::test]
-async fn create_trigger_unsupported() {
+async fn create_trigger_supported_with_typed_exclusions() {
+    // Triggers are implemented (see `tests/sql_triggers.rs` for the full
+    // behavioral suite); only the documented out-of-subset forms stay 0A000.
     let mut s = session().await;
     ok(&mut s, "CREATE TABLE t (id INT)").await;
-    for sql in [
+    ok(
+        &mut s,
+        "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql",
+    )
+    .await;
+    ok(
+        &mut s,
         "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-        "CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+    )
+    .await;
+    ok(
+        &mut s,
+        "CREATE OR REPLACE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW \
+         WHEN (NEW.id IS DISTINCT FROM OLD.id) EXECUTE PROCEDURE f()",
+    )
+    .await;
+    ok(&mut s, "DROP TRIGGER trg ON t").await;
+    for sql in [
         "CREATE CONSTRAINT TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-        "CREATE TRIGGER trg AFTER UPDATE ON t FOR EACH ROW WHEN (1 = 1) EXECUTE PROCEDURE f()",
-        "DROP TRIGGER trg ON t",
+        "CREATE TRIGGER trg INSTEAD OF INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+        "CREATE TRIGGER trg AFTER TRUNCATE ON t FOR EACH STATEMENT EXECUTE FUNCTION f()",
     ] {
         assert_eq!(err_code(&mut s, sql).await, "0A000", "for `{sql}`");
     }
@@ -759,38 +783,53 @@ async fn materialized_view_unsupported() {
 }
 
 #[tokio::test]
-async fn full_text_search_unsupported() {
+async fn full_text_search_subset_and_exclusions() {
     let mut s = session().await;
     ok(&mut s, "CREATE TABLE t (body TEXT)").await;
     ok(&mut s, "INSERT INTO t VALUES ('a cat sat')").await;
-    // The FTS function family is *named*-unsupported: stable 0A000. It must
-    // never be 42883/"does not exist" — these are PostgreSQL core functions,
-    // and 42883 is also what triggers sidecar fallback-routing, which would
-    // make FTS semantics differ per deployment.
+    // The core subset works (details in tests/sql_fts.rs): the constructor
+    // functions, @@ in every PostgreSQL argument order, ts_rank, and the
+    // tsvector/tsquery types with raw-parse casts.
+    assert_eq!(
+        scalar_i64(
+            &mut s,
+            "SELECT count(*) FROM t WHERE to_tsvector(body) @@ to_tsquery('cat')"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        rows_text(&mut s, "SELECT to_tsvector('a cat sat')").await,
+        vec![vec!["'cat':2 'sat':3".to_string()]]
+    );
+    assert_eq!(
+        rows_text(&mut s, "SELECT body @@ 'cat' FROM t").await,
+        vec![vec!["t".to_string()]]
+    );
+    ok(&mut s, "SELECT 'a'::tsvector").await;
+    ok(&mut s, "SELECT 'a'::tsquery").await;
+    // Out-of-subset FTS constructs are *named*-unsupported: stable 0A000. It
+    // must never be 42883/"does not exist" — these are PostgreSQL core
+    // functions, and 42883 is also what triggers sidecar fallback-routing,
+    // which would make FTS semantics differ per deployment.
     for sql in [
-        "SELECT * FROM t WHERE to_tsvector(body) @@ to_tsquery('cat')",
-        "SELECT to_tsvector('a cat sat')",
-        "SELECT to_tsquery('cat')",
-        "SELECT plainto_tsquery('cat')",
         "SELECT phraseto_tsquery('the cat')",
         "SELECT websearch_to_tsquery('cat -dog')",
-        "SELECT ts_rank('a', 'b')",
         "SELECT ts_rank_cd('a', 'b')",
         "SELECT ts_headline('doc', 'query')",
         "SELECT setweight('a', 'A')",
         "SELECT ts_delete('a', 'b')",
         "SELECT tsvector_to_array('a')",
-        // The @@ operator itself lands on the unsupported-binary-operator
-        // rejection when no FTS function is involved.
-        "SELECT body @@ 'cat' FROM t",
+        "SELECT to_tsvector('cat') || to_tsvector('dog')",
+        "SELECT to_tsquery('cat <-> dog')",
     ] {
         assert_eq!(err_code(&mut s, sql).await, "0A000", "for `{sql}`");
     }
-    // The tsvector/tsquery *types* do not exist in the engine: 42704
-    // (undefined_object), like any unknown type name — truthful, and
-    // deliberately distinct from the 0A000 feature rejection above.
-    assert_eq!(err_code(&mut s, "SELECT 'a'::tsvector").await, "42704");
-    assert_eq!(err_code(&mut s, "SELECT 'a'::tsquery").await, "42704");
+    // Unknown text search configurations are 42704, like PostgreSQL.
+    assert_eq!(
+        err_code(&mut s, "SELECT to_tsvector('german', 'Haus')").await,
+        "42704"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -69,6 +69,7 @@ pub fn view_rows(
         (true, "pg_available_extensions") => Some(pg_available_extensions(catalog)),
         (true, "pg_available_extension_versions") => Some(pg_available_extension_versions(catalog)),
         (true, "pg_proc") => Some(pg_proc(catalog)),
+        (true, "pg_trigger") => Some(pg_trigger(catalog)),
         (true, "pg_depend") => Some(pg_depend(catalog)),
         (true, "pg_am") => Some(pg_am()),
         (true, "pg_settings") => Some(empty(&[
@@ -599,6 +600,8 @@ fn pg_type(catalog: &Catalog) -> RowSet {
         (1184, "timestamptz", 8, "D"),
         (1700, "numeric", -1, "N"),
         (2950, "uuid", 16, "U"),
+        (3614, "tsvector", -1, "U"),
+        (3615, "tsquery", -1, "U"),
         (3802, "jsonb", -1, "U"),
     ];
     let rows = base
@@ -1006,7 +1009,12 @@ fn pg_proc(catalog: &Catalog) -> RowSet {
                 t(f.language.as_sql()),
                 t(&f.volatility.as_char().to_string()),
                 b(f.strict),
-                i4(f.return_type.oid() as i32),
+                // 2279 = PostgreSQL's `trigger` pseudo-type oid.
+                i4(if f.returns_trigger {
+                    2279
+                } else {
+                    f.return_type.oid() as i32
+                }),
                 i2(f.args.len() as i16),
                 t(&f.args
                     .iter()
@@ -1017,6 +1025,65 @@ fn pg_proc(catalog: &Catalog) -> RowSet {
             ]
         })
         .collect();
+    rs(cols, rows)
+}
+
+/// `pg_trigger`: user triggers (`CREATE TRIGGER`). `tgtype` carries the
+/// PostgreSQL bitmask (ROW=1, BEFORE=2, INSERT=4, DELETE=8, UPDATE=16;
+/// TRUNCATE/INSTEAD bits are never set — those forms are rejected at DDL),
+/// `tgattr` the 1-based column ordinals of an `UPDATE OF` list (int2vector
+/// analog, the `proargtypes` text convention), and `tgqual` the raw `WHEN`
+/// text (the `pg_policies.qual` convention).
+fn pg_trigger(catalog: &Catalog) -> RowSet {
+    let cols = &[
+        ("oid", SqlType::Integer),
+        ("tgrelid", SqlType::Integer),
+        ("tgname", SqlType::Text),
+        ("tgfoid", SqlType::Integer),
+        ("tgtype", SqlType::SmallInt),
+        ("tgenabled", SqlType::Char(Some(1))),
+        ("tgisinternal", SqlType::Boolean),
+        ("tgconstraint", SqlType::Integer),
+        ("tgdeferrable", SqlType::Boolean),
+        ("tginitdeferred", SqlType::Boolean),
+        ("tgnargs", SqlType::SmallInt),
+        ("tgattr", SqlType::Text),
+        ("tgqual", SqlType::Text),
+    ];
+    let mut rows = Vec::new();
+    for table in catalog.tables() {
+        for trg in &table.triggers {
+            let fnoid = catalog
+                .find_function(Some(&trg.function_schema), &trg.function_name, 0)
+                .map(|f| f.oid as i32)
+                .unwrap_or(0);
+            let update_of: Vec<String> = trg
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    crate::relational::TriggerEventDef::Update { columns } => Some(columns),
+                    _ => None,
+                })
+                .flatten()
+                .filter_map(|c| table.column_index(c).map(|i| (i + 1).to_string()))
+                .collect();
+            rows.push(vec![
+                i4(trg.oid as i32),
+                i4(table.oid as i32),
+                t(&trg.name),
+                i4(fnoid),
+                i2(crate::sql::trigger::tgtype(trg)),
+                t(if trg.enabled { "O" } else { "D" }),
+                b(false),
+                i4(0),
+                b(false),
+                b(false),
+                i2(0),
+                t(&update_of.join(" ")),
+                trg.when_expr.as_deref().map(t).unwrap_or_else(null),
+            ]);
+        }
+    }
     rs(cols, rows)
 }
 

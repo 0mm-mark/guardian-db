@@ -887,12 +887,8 @@ impl<S: RelationalStorage> Session<S> {
             Statement::CreateProcedure { .. } => Err(SqlError::FeatureNotSupported(
                 "CREATE PROCEDURE is not supported".into(),
             )),
-            Statement::CreateTrigger(_) => Err(SqlError::FeatureNotSupported(
-                "CREATE TRIGGER is not supported".into(),
-            )),
-            Statement::DropTrigger(_) => Err(SqlError::FeatureNotSupported(
-                "DROP TRIGGER is not supported".into(),
-            )),
+            Statement::CreateTrigger(ct) => exec.exec_create_trigger(ct),
+            Statement::DropTrigger(dt) => exec.exec_drop_trigger(dt),
             other => self.dispatch_fallback(other),
         }
     }
@@ -1166,18 +1162,12 @@ fn unsupported_by_prefix(segment: &str) -> Option<&'static str> {
     let words = leading_keywords(segment, 4);
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
     match (w(0), w(1)) {
-        // CREATE FUNCTION is implemented (see `crate::sql::udf`) and parses
-        // cleanly under sqlparser 0.62's PostgreSQL dialect, so it is not
+        // CREATE FUNCTION and CREATE/DROP TRIGGER are implemented (see
+        // `crate::sql::udf` and `crate::sql::trigger`) and parse cleanly
+        // under sqlparser 0.62's PostgreSQL dialect, so they are not
         // rejected by prefix here.
         ("CREATE", "PROCEDURE") => Some("CREATE PROCEDURE"),
-        ("CREATE", "TRIGGER") => Some("CREATE TRIGGER"),
-        ("CREATE", "CONSTRAINT") if w(2) == "TRIGGER" => Some("CREATE TRIGGER"),
-        ("CREATE", "OR") if w(2) == "REPLACE" => match w(3) {
-            "PROCEDURE" => Some("CREATE PROCEDURE"),
-            "TRIGGER" => Some("CREATE TRIGGER"),
-            _ => None,
-        },
-        ("DROP", "TRIGGER") => Some("DROP TRIGGER"),
+        ("CREATE", "OR") if w(2) == "REPLACE" && w(3) == "PROCEDURE" => Some("CREATE PROCEDURE"),
         _ => None,
     }
 }
@@ -1251,6 +1241,14 @@ fn with_sidecar_txn_hint(e: SqlError) -> SqlError {
 /// The implicit table-level locks a statement takes, deduplicated to the
 /// strongest mode per table (mirrors PostgreSQL's automatic locking).
 fn table_lock_plan(stmt: &Statement, catalog: &Catalog) -> Vec<(u32, LockMode)> {
+    stmt_lock_plan(stmt, catalog, true)
+}
+
+fn stmt_lock_plan(
+    stmt: &Statement,
+    catalog: &Catalog,
+    include_function_bodies: bool,
+) -> Vec<(u32, LockMode)> {
     use sqlparser::ast::{FromTable, ObjectType, TableFactor, TableObject};
     let resolve = |schema: Option<&str>, name: &str| -> Option<u32> {
         catalog
@@ -1353,6 +1351,24 @@ fn table_lock_plan(stmt: &Statement, catalog: &Catalog) -> Vec<(u32, LockMode)> 
                         plan.push((t.oid, mode));
                     }
                 }
+            }
+        }
+    }
+    // A DML statement can fire triggers whose bodies write tables the
+    // statement's own text never mentions (and PL/pgSQL function bodies can
+    // do the same when called mid-statement). Mirror the preload pass's
+    // coarseness (see `execute_inner`): fold in the lock plan of every
+    // catalog function body's embedded statements, without recursing into
+    // *their* function calls (the flat pass already covers every function).
+    if include_function_bodies
+        && matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        )
+    {
+        for f in catalog.functions() {
+            for body_stmt in crate::sql::udf::body_statements(f) {
+                plan.extend(stmt_lock_plan(&body_stmt, catalog, false));
             }
         }
     }

@@ -43,13 +43,15 @@
 //! (see [`crate::sql::rls`]).
 
 use crate::relational::catalog::{
-    DropFunctionByName, FunctionArgDef, FunctionDef, FunctionLanguage, FunctionVolatility,
+    DropFunctionByName, FunctionArgDef, FunctionDef, FunctionLanguage, FunctionVolatility, Table,
+    TriggerLevel, TriggerTiming,
 };
-use crate::relational::{SqlType, SqlValue};
+use crate::relational::{Catalog, SqlType, SqlValue};
 use crate::sql::error::{Result, SqlError, unsupported};
 use crate::sql::exec::Exec;
 use crate::sql::names::{ident_name, split_schema_table};
 use crate::sql::result::ExecResult;
+use crate::sql::store::RowValues;
 use sqlparser::ast::{
     ArgMode, CreateFunction, CreateFunctionBody, DataType, DropFunction, Expr, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, FunctionBehavior, FunctionCalledOnNull,
@@ -90,8 +92,21 @@ impl Exec {
         let (schema_opt, name) = split_schema_table(&cf.name);
         let schema = self.catalog.creation_schema(schema_opt.as_deref())?;
         let args = parse_function_args(cf.args.as_deref().unwrap_or(&[]))?;
-        let return_type = parse_return_type(&cf.return_type, &name)?;
+        let (return_type, returns_trigger) = parse_return_type(&cf.return_type, &name)?;
         let language = parse_language(cf.language.as_ref())?;
+        if returns_trigger {
+            // PostgreSQL's own rules (both are SQLSTATE 42P13 there too).
+            if language == FunctionLanguage::Sql {
+                return Err(SqlError::InvalidFunctionDefinition(
+                    "SQL functions cannot return type trigger".into(),
+                ));
+            }
+            if !args.is_empty() {
+                return Err(SqlError::InvalidFunctionDefinition(
+                    "trigger functions cannot have declared arguments".into(),
+                ));
+            }
+        }
         let volatility = match cf.behavior {
             Some(FunctionBehavior::Immutable) => FunctionVolatility::Immutable,
             Some(FunctionBehavior::Stable) => FunctionVolatility::Stable,
@@ -121,6 +136,24 @@ impl Exec {
             }
         }
 
+        // `CREATE OR REPLACE` may not turn a trigger function that live
+        // triggers depend on into a non-trigger function — the triggers would
+        // dangle (PostgreSQL rejects changing the return type similarly).
+        if cf.or_replace
+            && !returns_trigger
+            && let Some(existing) = self.catalog.find_function(Some(&schema), &name, args.len())
+            && existing.returns_trigger
+            && let Some((trg, tbl)) = trigger_dependent(&self.catalog, &schema, &name)
+        {
+            return Err(SqlError::DependentObjectsStillExist {
+                object: format!("function {name}"),
+                detail: format!(
+                    "trigger {trg} on table {tbl} depends on function {name}; the \
+                     replacement no longer returns type trigger"
+                ),
+            });
+        }
+
         let oid = self.catalog.allocate_oid();
         let def = FunctionDef {
             oid,
@@ -132,6 +165,7 @@ impl Exec {
             volatility,
             strict,
             body,
+            returns_trigger,
         };
         if cf.or_replace {
             self.catalog.replace_function(def);
@@ -147,6 +181,21 @@ impl Exec {
             let (schema_opt, name) = split_schema_table(&desc.name);
             match &desc.args {
                 Some(arg_list) => {
+                    // Dependency guard: a trigger function still wired to a
+                    // trigger cannot be dropped (PostgreSQL: 2BP01).
+                    let dependent = self
+                        .catalog
+                        .find_function(schema_opt.as_deref(), &name, arg_list.len())
+                        .filter(|def| def.returns_trigger)
+                        .and_then(|def| trigger_dependent(&self.catalog, &def.schema, &def.name));
+                    if let Some((trg, tbl)) = dependent {
+                        return Err(SqlError::DependentObjectsStillExist {
+                            object: format!("function {name}"),
+                            detail: format!(
+                                "trigger {trg} on table {tbl} depends on function {name}"
+                            ),
+                        });
+                    }
                     let removed =
                         self.catalog
                             .drop_function(schema_opt.as_deref(), &name, arg_list.len());
@@ -159,23 +208,46 @@ impl Exec {
                         return Err(SqlError::UndefinedFunction(format!("{name}({types})")));
                     }
                 }
-                None => match self
-                    .catalog
-                    .drop_function_by_name(schema_opt.as_deref(), &name)
-                {
-                    DropFunctionByName::Removed => {}
-                    DropFunctionByName::NotFound => {
-                        if !df.if_exists {
-                            return Err(SqlError::UndefinedFunction(name.clone()));
+                None => {
+                    // Same dependency guard for the unqualified form. Only an
+                    // unambiguous single match can be dropped anyway.
+                    let candidates: Vec<(String, String, bool)> = self
+                        .catalog
+                        .functions()
+                        .filter(|f| {
+                            f.name == name
+                                && schema_opt.as_deref().map(|s| f.schema == s).unwrap_or(true)
+                        })
+                        .map(|f| (f.schema.clone(), f.name.clone(), f.returns_trigger))
+                        .collect();
+                    if let [(fschema, fname, true)] = candidates.as_slice()
+                        && let Some((trg, tbl)) = trigger_dependent(&self.catalog, fschema, fname)
+                    {
+                        return Err(SqlError::DependentObjectsStillExist {
+                            object: format!("function {fname}"),
+                            detail: format!(
+                                "trigger {trg} on table {tbl} depends on function {fname}"
+                            ),
+                        });
+                    }
+                    match self
+                        .catalog
+                        .drop_function_by_name(schema_opt.as_deref(), &name)
+                    {
+                        DropFunctionByName::Removed => {}
+                        DropFunctionByName::NotFound => {
+                            if !df.if_exists {
+                                return Err(SqlError::UndefinedFunction(name.clone()));
+                            }
+                        }
+                        DropFunctionByName::Ambiguous => {
+                            return Err(SqlError::AmbiguousFunction(format!(
+                                "function name \"{name}\" is not unique; specify the argument \
+                                 list to select the function unambiguously"
+                            )));
                         }
                     }
-                    DropFunctionByName::Ambiguous => {
-                        return Err(SqlError::AmbiguousFunction(format!(
-                            "function name \"{name}\" is not unique; specify the argument \
-                             list to select the function unambiguously"
-                        )));
-                    }
-                },
+                }
             }
         }
         self.catalog_dirty = true;
@@ -204,7 +276,13 @@ fn parse_function_args(args: &[OperateFunctionArg]) -> Result<Vec<FunctionArgDef
         .collect()
 }
 
-fn parse_return_type(rt: &Option<FunctionReturnType>, fname: &str) -> Result<SqlType> {
+/// Parse the `RETURNS` clause into `(type, returns_trigger)`. `RETURNS
+/// trigger` deliberately maps to `(SqlType::Unknown, true)` instead of a new
+/// `SqlType` variant — `SqlType` is pervasive (`parse_data_type`, casts,
+/// `pg_type`), and a variant would make `CREATE TABLE t (x trigger)`
+/// representable. The caller enforces the trigger-function rules (PL/pgSQL
+/// only, zero arguments).
+fn parse_return_type(rt: &Option<FunctionReturnType>, fname: &str) -> Result<(SqlType, bool)> {
     match rt {
         None => Err(SqlError::InvalidFunctionDefinition(format!(
             "function \"{fname}\" has no RETURNS clause"
@@ -213,11 +291,26 @@ fn parse_return_type(rt: &Option<FunctionReturnType>, fname: &str) -> Result<Sql
         Some(FunctionReturnType::DataType(DataType::Table(_))) => Err(unsupported("RETURNS TABLE")),
         Some(FunctionReturnType::DataType(dt)) => {
             if dt.to_string().eq_ignore_ascii_case("trigger") {
-                return Err(unsupported("trigger functions (RETURNS trigger)"));
+                return Ok((SqlType::Unknown, true));
             }
-            crate::sql::eval::parse_data_type(dt)
+            Ok((crate::sql::eval::parse_data_type(dt)?, false))
         }
     }
+}
+
+/// The first trigger found in `catalog` whose function is `(schema, name)`,
+/// as `(trigger name, table name)` — the `DROP FUNCTION` / `CREATE OR
+/// REPLACE` dependency guard (trigger functions always have arity 0, so
+/// (schema, name) identifies the referenced signature).
+fn trigger_dependent(catalog: &Catalog, schema: &str, name: &str) -> Option<(String, String)> {
+    for table in catalog.tables() {
+        for trg in &table.triggers {
+            if trg.function_schema == schema && trg.function_name == name {
+                return Some((trg.name.clone(), table.name.clone()));
+            }
+        }
+    }
+    None
 }
 
 fn parse_language(lang: Option<&Ident>) -> Result<FunctionLanguage> {
@@ -323,9 +416,25 @@ struct PlpgsqlDecl {
     default: Option<Expr>,
 }
 
+/// The target of a PL/pgSQL `:=` assignment: a scalar variable, or a record
+/// field (`NEW.col := ...`, trigger functions only).
+enum AssignTarget {
+    Var(String),
+    RowField { row: String, column: String },
+}
+
+impl AssignTarget {
+    fn display(&self) -> String {
+        match self {
+            AssignTarget::Var(n) => n.clone(),
+            AssignTarget::RowField { row, column } => format!("{row}.{column}"),
+        }
+    }
+}
+
 enum PlpgsqlStmt {
     Assign {
-        name: String,
+        target: AssignTarget,
         value: Expr,
     },
     If {
@@ -531,15 +640,28 @@ fn parse_assign(p: &mut Parser) -> Result<PlpgsqlStmt> {
         .parse_identifier()
         .map_err(|_| SqlError::Syntax(format!("unexpected token in function body: \"{found}\"")))?;
     let name = ident_name(&ident);
+    // `NEW.col := ...` (record-field assignment, trigger functions).
+    let target = if p.consume_token(&Token::Period) {
+        let col = p
+            .parse_identifier()
+            .map_err(crate::sql::error::parse_error)?;
+        AssignTarget::RowField {
+            row: name,
+            column: ident_name(&col),
+        }
+    } else {
+        AssignTarget::Var(name)
+    };
     if p.peek_token_ref().token != Token::Assignment {
         return Err(SqlError::Syntax(format!(
-            "expected \":=\" after \"{name}\" in function body"
+            "expected \":=\" after \"{}\" in function body",
+            target.display()
         )));
     }
     p.next_token();
     let value = p.parse_expr().map_err(crate::sql::error::parse_error)?;
     expect_semi(p)?;
-    Ok(PlpgsqlStmt::Assign { name, value })
+    Ok(PlpgsqlStmt::Assign { target, value })
 }
 
 fn parse_if(p: &mut Parser) -> Result<PlpgsqlStmt> {
@@ -727,24 +849,27 @@ fn call_function_inner(exec: &Exec, def: &FunctionDef, args: Vec<SqlValue>) -> R
             // supported here — `$n` via `Exec::param` (the same mechanism a
             // prepared statement's placeholders use), names via the same
             // substitution PL/pgSQL bodies use.
-            let vars = bind_named_args(&def.args, args.clone());
+            let env = PlBindings::scalar(bind_named_args(&def.args, args.clone()));
             let mut sub = new_sub_exec(exec, args);
             let stmts = parse_body_statements(&def.body)?;
-            run_sql_body(&mut sub, &stmts, &vars)
+            run_sql_body(&mut sub, &stmts, &env)
         }
         FunctionLanguage::PlPgSql => {
             let mut sub = new_sub_exec(exec, Vec::new());
             let prog = parse_plpgsql(&def.body)?;
-            let mut vars = bind_named_args(&def.args, args);
+            let mut env = PlBindings::scalar(bind_named_args(&def.args, args));
             for decl in &prog.decls {
                 let value = match &decl.default {
-                    Some(expr) => eval_with_vars(&sub, expr, &vars)?,
+                    Some(expr) => eval_with_env(&sub, expr, &env)?,
                     None => SqlValue::Null,
                 };
-                vars.insert(decl.name.clone(), value);
+                env.vars.insert(decl.name.clone(), value);
             }
-            match run_plpgsql_body(&mut sub, &prog.body, &mut vars)? {
+            match run_plpgsql_body(&mut sub, &prog.body, &mut env)? {
                 Flow::Return(v) => Ok(v),
+                Flow::ReturnRow(_) => Err(SqlError::Internal(
+                    "trigger-record RETURN from a scalar function invocation".into(),
+                )),
                 Flow::Fallthrough => Err(SqlError::Internal(
                     "PL/pgSQL function fell through without RETURN (should have been \
                      rejected at CREATE FUNCTION time)"
@@ -752,6 +877,121 @@ fn call_function_inner(exec: &Exec, def: &FunctionDef, args: Vec<SqlValue>) -> R
                 )),
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Calling a trigger function (`RETURNS trigger`).
+// ---------------------------------------------------------------------------
+
+/// The bounded recursion budget for trigger firings, shared across an entire
+/// statement's chain of firings (see `Exec::trigger_depth`) — same design and
+/// SQLSTATE (54001) as [`MAX_CALL_DEPTH`]: a trigger whose body writes its
+/// own table recurses `exec_insert → fire → body INSERT → exec_insert → ...`
+/// through sub-`Exec`s that share the counter, so the guard bounds it
+/// regardless of Rust stack shape.
+const MAX_TRIGGER_DEPTH: u32 = 25;
+
+/// One trigger firing, handed from the firing engine
+/// (`crate::sql::trigger`) to the PL/pgSQL runtime.
+pub(crate) struct TriggerInvocation<'a> {
+    pub trigger_name: &'a str,
+    pub table: &'a Table,
+    /// `TG_OP`: `"INSERT"` / `"UPDATE"` / `"DELETE"`.
+    pub op: &'static str,
+    pub timing: TriggerTiming,
+    pub level: TriggerLevel,
+    /// The pre-image row (`OLD`): UPDATE/DELETE row firings.
+    pub old: Option<RowValues>,
+    /// The proposed row (`NEW`): INSERT/UPDATE row firings.
+    pub new: Option<RowValues>,
+}
+
+/// Run a `RETURNS trigger` PL/pgSQL function for one firing. `Ok(None)` means
+/// the function returned `NULL` (suppression for BEFORE ROW firings, ignored
+/// otherwise); `Ok(Some(row))` is the — possibly modified — row to proceed
+/// with (`RETURN NEW` reflects any `NEW.col := ...` mutations).
+///
+/// Unlike [`call_function`] this takes `&mut Exec`: the sub-context's loaded
+/// tables and catalog (sequence advancement) are folded back into the caller
+/// after the body runs, so trigger side effects are visible to the rest of
+/// the statement and to subsequent firings — PostgreSQL's command-counter
+/// semantics. Scalar UDF calls cannot do this (they run under `&Exec`, deep
+/// inside expression evaluation).
+pub(crate) fn call_trigger_function(
+    exec: &mut Exec,
+    def: &FunctionDef,
+    inv: TriggerInvocation<'_>,
+) -> Result<Option<RowValues>> {
+    let depth = exec.trigger_depth.fetch_add(1, Ordering::SeqCst) + 1;
+    if depth > MAX_TRIGGER_DEPTH {
+        exec.trigger_depth.fetch_sub(1, Ordering::SeqCst);
+        return Err(SqlError::StatementTooComplex(format!(
+            "trigger call depth limit exceeded (max {MAX_TRIGGER_DEPTH}) while firing \"{}\" \
+             on \"{}\"",
+            inv.trigger_name, inv.table.name
+        )));
+    }
+    let result = call_trigger_inner(exec, def, inv);
+    exec.trigger_depth.fetch_sub(1, Ordering::SeqCst);
+    result
+}
+
+fn call_trigger_inner(
+    exec: &mut Exec,
+    def: &FunctionDef,
+    inv: TriggerInvocation<'_>,
+) -> Result<Option<RowValues>> {
+    let mut sub = new_sub_exec(exec, Vec::new());
+    let prog = parse_plpgsql(&def.body)?;
+    let mut env = PlBindings {
+        vars: HashMap::new(),
+        rows: HashMap::new(),
+        table: Some(inv.table.clone()),
+        trigger: true,
+    };
+    for (name, value) in [
+        ("tg_op", inv.op.to_string()),
+        ("tg_name", inv.trigger_name.to_string()),
+        ("tg_table_name", inv.table.name.clone()),
+        ("tg_table_schema", inv.table.schema.clone()),
+        ("tg_when", inv.timing.as_sql().to_string()),
+        ("tg_level", inv.level.as_sql().to_string()),
+    ] {
+        env.vars.insert(name.to_string(), SqlValue::Text(value));
+    }
+    if let Some(old) = inv.old {
+        env.rows.insert("old".to_string(), old);
+    }
+    if let Some(new) = inv.new {
+        env.rows.insert("new".to_string(), new);
+    }
+    for decl in &prog.decls {
+        let value = match &decl.default {
+            Some(expr) => eval_with_env(&sub, expr, &env)?,
+            None => SqlValue::Null,
+        };
+        env.vars.insert(decl.name.clone(), value);
+    }
+    let flow = run_plpgsql_body(&mut sub, &prog.body, &mut env)?;
+    // Fold the sub-context's state back into the caller: rows the body wrote
+    // and sequences it advanced must be visible to the rest of the statement
+    // and to later firings (two AFTER INSERT firings appending to an audit
+    // table with a serial key must not both draw the same sequence value),
+    // and row locks the body queued must actually be acquired.
+    exec.tables = std::mem::take(&mut sub.tables);
+    exec.catalog_dirty |= sub.catalog_dirty;
+    exec.pending_locks
+        .borrow_mut()
+        .extend(sub.pending_locks.into_inner());
+    exec.catalog = sub.catalog;
+    match flow {
+        Flow::ReturnRow(row) => Ok(row),
+        Flow::Return(_) | Flow::Fallthrough => Err(SqlError::Internal(
+            "trigger function did not produce a trigger RETURN (should have been rejected \
+             at CREATE FUNCTION time)"
+                .into(),
+        )),
     }
 }
 
@@ -773,6 +1013,7 @@ fn new_sub_exec(exec: &Exec, params: Vec<SqlValue>) -> Exec {
     sub.vars = RefCell::new(exec.vars.borrow().clone());
     sub.mutations = exec.mutations.clone();
     sub.udf_depth = exec.udf_depth.clone();
+    sub.trigger_depth = exec.trigger_depth.clone();
     sub
 }
 
@@ -781,14 +1022,10 @@ fn bind_named_args(arg_defs: &[FunctionArgDef], args: Vec<SqlValue>) -> HashMap<
     arg_defs.iter().map(|a| a.name.clone()).zip(args).collect()
 }
 
-fn run_sql_body(
-    sub: &mut Exec,
-    stmts: &[Statement],
-    vars: &HashMap<String, SqlValue>,
-) -> Result<SqlValue> {
+fn run_sql_body(sub: &mut Exec, stmts: &[Statement], env: &PlBindings) -> Result<SqlValue> {
     let mut last = SqlValue::Null;
     for stmt in stmts {
-        let substituted = substitute_stmt(stmt, vars);
+        let substituted = substitute_stmt(stmt, env);
         last = exec_body_statement(sub, &substituted)?;
     }
     Ok(last)
@@ -836,40 +1073,72 @@ fn scalar_of_result(result: &ExecResult) -> SqlValue {
 // PL/pgSQL interpreter.
 // ---------------------------------------------------------------------------
 
+/// Variable and record bindings for one function invocation. Scalar function
+/// calls carry an empty `rows` map, `table: None` and `trigger: false` —
+/// every trigger-only code path below is gated on those, so plain-UDF
+/// behavior is identical to what it was before triggers existed.
+struct PlBindings {
+    /// Named scalars: parameters, `DECLARE`d locals, and — for trigger
+    /// invocations — the pre-seeded `TG_*` variables.
+    vars: HashMap<String, SqlValue>,
+    /// Trigger records (`"new"` / `"old"`), where bound for this invocation.
+    rows: HashMap<String, RowValues>,
+    /// The trigger's table, for coercing `NEW.col := ...` assignments.
+    table: Option<Table>,
+    /// Whether this is a trigger invocation (`RETURN` produces a record).
+    trigger: bool,
+}
+
+impl PlBindings {
+    fn scalar(vars: HashMap<String, SqlValue>) -> Self {
+        Self {
+            vars,
+            rows: HashMap::new(),
+            table: None,
+            trigger: false,
+        }
+    }
+}
+
 /// Control-flow outcome of running a PL/pgSQL statement list.
 enum Flow {
     Fallthrough,
+    /// `RETURN expr` of a scalar invocation.
     Return(SqlValue),
+    /// `RETURN [NEW | OLD | NULL]` of a trigger invocation: the row to
+    /// proceed with, or `None` (`RETURN NULL` / bare `RETURN`) — suppression
+    /// for BEFORE ROW firings.
+    ReturnRow(Option<RowValues>),
 }
 
-fn run_plpgsql_body(
-    sub: &mut Exec,
-    stmts: &[PlpgsqlStmt],
-    vars: &mut HashMap<String, SqlValue>,
-) -> Result<Flow> {
+fn run_plpgsql_body(sub: &mut Exec, stmts: &[PlpgsqlStmt], env: &mut PlBindings) -> Result<Flow> {
     for stmt in stmts {
-        match run_plpgsql_stmt(sub, stmt, vars)? {
+        match run_plpgsql_stmt(sub, stmt, env)? {
             Flow::Fallthrough => continue,
-            ret @ Flow::Return(_) => return Ok(ret),
+            ret => return Ok(ret),
         }
     }
     Ok(Flow::Fallthrough)
 }
 
-fn run_plpgsql_stmt(
-    sub: &mut Exec,
-    stmt: &PlpgsqlStmt,
-    vars: &mut HashMap<String, SqlValue>,
-) -> Result<Flow> {
+fn run_plpgsql_stmt(sub: &mut Exec, stmt: &PlpgsqlStmt, env: &mut PlBindings) -> Result<Flow> {
     match stmt {
-        PlpgsqlStmt::Assign { name, value } => {
-            let v = eval_with_vars(sub, value, vars)?;
-            vars.insert(name.clone(), v);
+        PlpgsqlStmt::Assign { target, value } => {
+            let v = eval_with_env(sub, value, env)?;
+            match target {
+                AssignTarget::Var(name) => {
+                    env.vars.insert(name.clone(), v);
+                }
+                AssignTarget::RowField { row, column } => assign_row_field(env, row, column, v)?,
+            }
             Ok(Flow::Fallthrough)
         }
         PlpgsqlStmt::Return(expr) => {
+            if env.trigger {
+                return trigger_return(expr.as_ref(), env);
+            }
             let v = match expr {
-                Some(e) => eval_with_vars(sub, e, vars)?,
+                Some(e) => eval_with_env(sub, e, env)?,
                 None => SqlValue::Null,
             };
             Ok(Flow::Return(v))
@@ -879,7 +1148,7 @@ fn run_plpgsql_stmt(
             message,
             args,
         } => {
-            let text = render_raise_message(sub, message, args, vars)?;
+            let text = render_raise_message(sub, message, args, env)?;
             match level {
                 // NOTICE/WARNING are accepted and are no-ops: GuardianDB has
                 // no client notice channel to surface them on (see
@@ -893,26 +1162,90 @@ fn run_plpgsql_stmt(
             else_branch,
         } => {
             for (cond, body) in branches {
-                let c = eval_with_vars(sub, cond, vars)?;
+                let c = eval_with_env(sub, cond, env)?;
                 if c.truthy() == Some(true) {
-                    return run_plpgsql_body(sub, body, vars);
+                    return run_plpgsql_body(sub, body, env);
                 }
             }
             match else_branch {
-                Some(body) => run_plpgsql_body(sub, body, vars),
+                Some(body) => run_plpgsql_body(sub, body, env),
                 None => Ok(Flow::Fallthrough),
             }
         }
         PlpgsqlStmt::Sql(stmt) => {
-            let substituted = substitute_stmt(stmt, vars);
+            let substituted = substitute_stmt(stmt, env);
             exec_body_statement(sub, &substituted)?;
             Ok(Flow::Fallthrough)
         }
     }
 }
 
-fn eval_with_vars(sub: &Exec, expr: &Expr, vars: &HashMap<String, SqlValue>) -> Result<SqlValue> {
-    let substituted = substitute_expr(expr, vars);
+/// `NEW.col := value` (trigger invocations only): coerce against the
+/// trigger's table and update the bound `NEW` record. Everything else fails
+/// typed — assigning `OLD` (or any other record) has no effect in this engine
+/// and silently accepting it would violate the truthfulness contract.
+fn assign_row_field(env: &mut PlBindings, row: &str, column: &str, v: SqlValue) -> Result<()> {
+    if !env.trigger {
+        return Err(unsupported(format!(
+            "assignment to record field \"{row}.{column}\" outside a trigger function"
+        )));
+    }
+    if row != "new" {
+        return Err(unsupported(
+            "assignment to OLD / non-NEW record fields in a trigger function",
+        ));
+    }
+    let table = env
+        .table
+        .as_ref()
+        .ok_or_else(|| SqlError::Internal("trigger invocation without a table".into()))?;
+    let coerced = crate::sql::dml::coerce_to_col(v, table, column)?;
+    match env.rows.get_mut("new") {
+        Some(new_row) => {
+            new_row.insert(column.to_string(), coerced);
+            Ok(())
+        }
+        // DELETE / statement-level firings have no NEW record (PostgreSQL's
+        // wording and SQLSTATE).
+        None => Err(SqlError::ObjectNotInPrerequisiteState(
+            "record \"new\" is not assigned yet".into(),
+        )),
+    }
+}
+
+/// `RETURN ...` inside a trigger invocation. Only `NEW`, `OLD`, `NULL` and
+/// bare `RETURN` are meaningful for triggers; the row-ness of `NEW`/`OLD`
+/// cannot round-trip through a scalar `SqlValue`, so the *expression* is
+/// interpreted here instead of being evaluated.
+fn trigger_return(expr: Option<&Expr>, env: &PlBindings) -> Result<Flow> {
+    let Some(expr) = expr else {
+        return Ok(Flow::ReturnRow(None));
+    };
+    match expr {
+        Expr::Value(vws) if matches!(vws.value, Value::Null) => Ok(Flow::ReturnRow(None)),
+        Expr::Identifier(ident) => {
+            let name = ident_name(ident);
+            match name.as_str() {
+                "new" | "old" => match env.rows.get(&name) {
+                    Some(row) => Ok(Flow::ReturnRow(Some(row.clone()))),
+                    None => Err(SqlError::ObjectNotInPrerequisiteState(format!(
+                        "record \"{name}\" is not assigned yet"
+                    ))),
+                },
+                _ => Err(unsupported(
+                    "returning arbitrary expressions from trigger functions \
+                     (only NEW, OLD or NULL)",
+                )),
+            }
+        }
+        _ => Err(unsupported(
+            "returning arbitrary expressions from trigger functions (only NEW, OLD or NULL)",
+        )),
+    }
+}
+
+fn eval_with_env(sub: &Exec, expr: &Expr, env: &PlBindings) -> Result<SqlValue> {
+    let substituted = substitute_expr(expr, env);
     sub.eval(&substituted, &[])
 }
 
@@ -924,7 +1257,7 @@ fn render_raise_message(
     sub: &Exec,
     message: &str,
     args: &[Expr],
-    vars: &HashMap<String, SqlValue>,
+    env: &PlBindings,
 ) -> Result<String> {
     if args.is_empty() {
         return Ok(message.to_string());
@@ -944,7 +1277,7 @@ fn render_raise_message(
         }
         match arg_iter.next() {
             Some(expr) => {
-                let v = eval_with_vars(sub, expr, vars)?;
+                let v = eval_with_env(sub, expr, env)?;
                 out.push_str(&v.to_text().unwrap_or_default());
             }
             None => out.push('%'),
@@ -985,19 +1318,37 @@ fn value_to_expr(v: &SqlValue) -> Expr {
     crate::sql::parser::parse_expr(&sql).unwrap_or(Expr::Value(Value::Null.into()))
 }
 
-fn substitute_expr(expr: &Expr, vars: &HashMap<String, SqlValue>) -> Expr {
+fn substitute_expr(expr: &Expr, env: &PlBindings) -> Expr {
     if let Expr::Identifier(ident) = expr {
         let name = ident_name(ident);
-        if let Some(v) = vars.get(&name) {
+        if let Some(v) = env.vars.get(&name) {
             return value_to_expr(v);
+        }
+        return expr.clone();
+    }
+    if let Expr::CompoundIdentifier(parts) = expr {
+        // `NEW.col` / `OLD.col` in a trigger invocation: substitute the bound
+        // record's field value as a literal, the same mechanism as scalar
+        // variables. A column that is not on the trigger's table is left
+        // unsubstituted, so the evaluator fails it with 42703 (`NEW` records
+        // always carry every table column). Outside trigger invocations
+        // `rows` is empty and every compound identifier passes through
+        // untouched, exactly as before.
+        if parts.len() == 2 {
+            let qualifier = ident_name(&parts[0]);
+            if let Some(row) = env.rows.get(&qualifier)
+                && let Some(v) = row.get(&ident_name(&parts[1]))
+            {
+                return value_to_expr(v);
+            }
         }
         return expr.clone();
     }
     let mut out = expr.clone();
     match &mut out {
         Expr::BinaryOp { left, right, .. } => {
-            **left = substitute_expr(left, vars);
-            **right = substitute_expr(right, vars);
+            **left = substitute_expr(left, env);
+            **right = substitute_expr(right, env);
         }
         Expr::UnaryOp { expr: inner, .. }
         | Expr::Nested(inner)
@@ -1009,10 +1360,10 @@ fn substitute_expr(expr: &Expr, vars: &HashMap<String, SqlValue>) -> Expr {
         | Expr::IsNotFalse(inner)
         | Expr::IsUnknown(inner)
         | Expr::IsNotUnknown(inner) => {
-            **inner = substitute_expr(inner, vars);
+            **inner = substitute_expr(inner, env);
         }
         Expr::Cast { expr: inner, .. } => {
-            **inner = substitute_expr(inner, vars);
+            **inner = substitute_expr(inner, env);
         }
         Expr::Between {
             expr: inner,
@@ -1020,16 +1371,16 @@ fn substitute_expr(expr: &Expr, vars: &HashMap<String, SqlValue>) -> Expr {
             high,
             ..
         } => {
-            **inner = substitute_expr(inner, vars);
-            **low = substitute_expr(low, vars);
-            **high = substitute_expr(high, vars);
+            **inner = substitute_expr(inner, env);
+            **low = substitute_expr(low, env);
+            **high = substitute_expr(high, env);
         }
         Expr::InList {
             expr: inner, list, ..
         } => {
-            **inner = substitute_expr(inner, vars);
+            **inner = substitute_expr(inner, env);
             for item in list.iter_mut() {
-                *item = substitute_expr(item, vars);
+                *item = substitute_expr(item, env);
             }
         }
         Expr::Like {
@@ -1042,8 +1393,8 @@ fn substitute_expr(expr: &Expr, vars: &HashMap<String, SqlValue>) -> Expr {
             pattern,
             ..
         } => {
-            **inner = substitute_expr(inner, vars);
-            **pattern = substitute_expr(pattern, vars);
+            **inner = substitute_expr(inner, env);
+            **pattern = substitute_expr(pattern, env);
         }
         Expr::Case {
             operand,
@@ -1052,26 +1403,26 @@ fn substitute_expr(expr: &Expr, vars: &HashMap<String, SqlValue>) -> Expr {
             ..
         } => {
             if let Some(o) = operand {
-                **o = substitute_expr(o, vars);
+                **o = substitute_expr(o, env);
             }
             for w in conditions.iter_mut() {
-                w.condition = substitute_expr(&w.condition, vars);
-                w.result = substitute_expr(&w.result, vars);
+                w.condition = substitute_expr(&w.condition, env);
+                w.result = substitute_expr(&w.result, env);
             }
             if let Some(e) = else_result {
-                **e = substitute_expr(e, vars);
+                **e = substitute_expr(e, env);
             }
         }
-        Expr::Function(func) => substitute_function(func, vars),
+        Expr::Function(func) => substitute_function(func, env),
         Expr::InSubquery { expr: inner, .. } => {
-            **inner = substitute_expr(inner, vars);
+            **inner = substitute_expr(inner, env);
         }
         _ => {}
     }
     out
 }
 
-fn substitute_function(func: &mut Function, vars: &HashMap<String, SqlValue>) {
+fn substitute_function(func: &mut Function, env: &PlBindings) {
     if let FunctionArguments::List(list) = &mut func.args {
         for arg in list.args.iter_mut() {
             let e = match arg {
@@ -1080,42 +1431,42 @@ fn substitute_function(func: &mut Function, vars: &HashMap<String, SqlValue>) {
                 | FunctionArg::Unnamed(arg) => arg,
             };
             if let FunctionArgExpr::Expr(e) = e {
-                *e = substitute_expr(e, vars);
+                *e = substitute_expr(e, env);
             }
         }
     }
 }
 
-fn substitute_stmt(stmt: &Statement, vars: &HashMap<String, SqlValue>) -> Statement {
+fn substitute_stmt(stmt: &Statement, env: &PlBindings) -> Statement {
     let mut out = stmt.clone();
     match &mut out {
-        Statement::Query(q) => substitute_query(q, vars),
+        Statement::Query(q) => substitute_query(q, env),
         Statement::Insert(insert) => {
             if let Some(src) = &mut insert.source {
-                substitute_query(src, vars);
+                substitute_query(src, env);
             }
             if let Some(OnInsert::OnConflict(oc)) = &mut insert.on
                 && let OnConflictAction::DoUpdate(du) = &mut oc.action
             {
                 for a in du.assignments.iter_mut() {
-                    a.value = substitute_expr(&a.value, vars);
+                    a.value = substitute_expr(&a.value, env);
                 }
                 if let Some(sel) = &mut du.selection {
-                    *sel = substitute_expr(sel, vars);
+                    *sel = substitute_expr(sel, env);
                 }
             }
         }
         Statement::Update(update) => {
             for a in update.assignments.iter_mut() {
-                a.value = substitute_expr(&a.value, vars);
+                a.value = substitute_expr(&a.value, env);
             }
             if let Some(sel) = &mut update.selection {
-                *sel = substitute_expr(sel, vars);
+                *sel = substitute_expr(sel, env);
             }
         }
         Statement::Delete(delete) => {
             if let Some(sel) = &mut delete.selection {
-                *sel = substitute_expr(sel, vars);
+                *sel = substitute_expr(sel, env);
             }
         }
         _ => {}
@@ -1123,27 +1474,27 @@ fn substitute_stmt(stmt: &Statement, vars: &HashMap<String, SqlValue>) -> Statem
     out
 }
 
-fn substitute_query(q: &mut Query, vars: &HashMap<String, SqlValue>) {
+fn substitute_query(q: &mut Query, env: &PlBindings) {
     if let Some(with) = &mut q.with {
         for cte in with.cte_tables.iter_mut() {
-            substitute_query(&mut cte.query, vars);
+            substitute_query(&mut cte.query, env);
         }
     }
-    substitute_setexpr(&mut q.body, vars);
+    substitute_setexpr(&mut q.body, env);
 }
 
-fn substitute_setexpr(s: &mut SetExpr, vars: &HashMap<String, SqlValue>) {
+fn substitute_setexpr(s: &mut SetExpr, env: &PlBindings) {
     match s {
-        SetExpr::Select(sel) => substitute_select(sel, vars),
-        SetExpr::Query(q) => substitute_query(q, vars),
+        SetExpr::Select(sel) => substitute_select(sel, env),
+        SetExpr::Query(q) => substitute_query(q, env),
         SetExpr::SetOperation { left, right, .. } => {
-            substitute_setexpr(left, vars);
-            substitute_setexpr(right, vars);
+            substitute_setexpr(left, env);
+            substitute_setexpr(right, env);
         }
         SetExpr::Values(v) => {
             for row in v.rows.iter_mut() {
                 for e in row.content.iter_mut() {
-                    *e = substitute_expr(e, vars);
+                    *e = substitute_expr(e, env);
                 }
             }
         }
@@ -1151,26 +1502,26 @@ fn substitute_setexpr(s: &mut SetExpr, vars: &HashMap<String, SqlValue>) {
     }
 }
 
-fn substitute_select(sel: &mut Select, vars: &HashMap<String, SqlValue>) {
+fn substitute_select(sel: &mut Select, env: &PlBindings) {
     if let Some(w) = &mut sel.selection {
-        *w = substitute_expr(w, vars);
+        *w = substitute_expr(w, env);
     }
     if let Some(h) = &mut sel.having {
-        *h = substitute_expr(h, vars);
+        *h = substitute_expr(h, env);
     }
     for item in sel.projection.iter_mut() {
         match item {
-            SelectItem::UnnamedExpr(e) => *e = substitute_expr(e, vars),
-            SelectItem::ExprWithAlias { expr, .. } => *expr = substitute_expr(expr, vars),
+            SelectItem::UnnamedExpr(e) => *e = substitute_expr(e, env),
+            SelectItem::ExprWithAlias { expr, .. } => *expr = substitute_expr(expr, env),
             _ => {}
         }
     }
     for twj in sel.from.iter_mut() {
-        substitute_twj(twj, vars);
+        substitute_twj(twj, env);
     }
 }
 
-fn substitute_twj(twj: &mut TableWithJoins, vars: &HashMap<String, SqlValue>) {
+fn substitute_twj(twj: &mut TableWithJoins, env: &PlBindings) {
     use sqlparser::ast::{JoinConstraint, JoinOperator};
     for j in twj.joins.iter_mut() {
         if let JoinOperator::Inner(JoinConstraint::On(e))
@@ -1178,7 +1529,7 @@ fn substitute_twj(twj: &mut TableWithJoins, vars: &HashMap<String, SqlValue>) {
         | JoinOperator::Right(JoinConstraint::On(e))
         | JoinOperator::FullOuter(JoinConstraint::On(e)) = &mut j.join_operator
         {
-            *e = substitute_expr(e, vars);
+            *e = substitute_expr(e, env);
         }
     }
 }

@@ -18,6 +18,7 @@
 
 pub mod catalog;
 pub mod error;
+pub mod fts;
 pub mod index;
 pub mod storage;
 pub mod types;
@@ -26,7 +27,8 @@ pub mod value;
 pub use catalog::{
     Catalog, CheckConstraint, Column, DropFunctionByName, FIRST_USER_OID, ForeignKey,
     FunctionArgDef, FunctionDef, FunctionLanguage, FunctionVolatility, Index, Policy, PolicyCmd,
-    PrimaryKey, QualifiedName, ReferentialAction, Schema, Sequence, Table, UniqueConstraint, View,
+    PrimaryKey, QualifiedName, ReferentialAction, Schema, Sequence, Table, TriggerDef,
+    TriggerEventDef, TriggerLevel, TriggerTiming, UniqueConstraint, View,
 };
 pub use error::{RelError, Result};
 pub use index::{SecondaryIndex, composite_key, ordered_key};
