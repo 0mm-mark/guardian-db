@@ -1918,7 +1918,7 @@ dependencies = [
 
 [[package]]
 name = "guardian-db"
-version = "0.17.1"
+version = "0.17.2"
 dependencies = [
  "async-stream",
  "async-trait",
