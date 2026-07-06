@@ -888,6 +888,7 @@ impl<S: RelationalStorage> Session<S> {
                 schema,
                 name,
                 synonyms,
+                thesaurus_entries,
                 if_not_exists,
             } => {
                 let schema = schema.unwrap_or_else(|| "public".into());
@@ -897,6 +898,7 @@ impl<S: RelationalStorage> Session<S> {
                     schema,
                     oid,
                     synonyms,
+                    thesaurus_entries,
                 };
                 catalog.insert_ts_dictionary(def, if_not_exists)?;
                 self.persist_catalog(catalog).await?;

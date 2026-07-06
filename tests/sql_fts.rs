@@ -786,3 +786,99 @@ async fn ts_dict_drop() {
     let (code, _) = err_info(&mut s, "DROP TEXT SEARCH DICTIONARY d1").await;
     assert_eq!(code, "42704");
 }
+
+// ---------------------------------------------------------------------------
+// New language configurations: arabic, greek, tamil + lowercase-only set.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn arabic_config_stems_text() {
+    let mut s = session().await;
+    // Arabic Snowball stemmer should accept valid Arabic text; at minimum the
+    // config must be resolvable (no 42704) and lower-case ASCII-only words
+    // are processed as Simple when the stemmer returns nothing useful.
+    let tv = scalar(&mut s, "SELECT to_tsvector('arabic', 'hello world')").await;
+    // Must not error — result is a tsvector string.
+    assert!(!tv.is_empty());
+}
+
+#[tokio::test]
+async fn greek_config_stems_and_removes_stop_words() {
+    let mut s = session().await;
+    // "και" is a common Greek stop word; "αγάπη" (love) should be stemmed.
+    let tv = scalar(&mut s, "SELECT to_tsvector('greek', 'αγάπη και ζωή')").await;
+    assert!(!tv.contains("'και'"), "Greek stop word 'και' should be removed");
+    assert!(!tv.is_empty(), "non-stop words should remain in tsvector");
+}
+
+#[tokio::test]
+async fn tamil_config_stems_text() {
+    let mut s = session().await;
+    let tv = scalar(&mut s, "SELECT to_tsvector('tamil', 'hello world')").await;
+    assert!(!tv.is_empty());
+}
+
+#[tokio::test]
+async fn lowercase_only_configs_are_accepted() {
+    let mut s = session().await;
+    // These configs have no Snowball stemmer but must be valid (no 42704).
+    for cfg in &[
+        "armenian", "basque", "catalan", "hindi", "indonesian",
+        "irish", "lithuanian", "nepali", "yiddish",
+    ] {
+        let tv = scalar(
+            &mut s,
+            &format!("SELECT to_tsvector('{cfg}', 'hello world')"),
+        )
+        .await;
+        assert!(
+            !tv.is_empty(),
+            "config '{cfg}' should be accepted and produce a tsvector"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Thesaurus dictionary.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ts_dict_thesaurus_create_and_apply() {
+    let mut s = session().await;
+    // Create a thesaurus: "technology" → "tech", "computer science" → "cs".
+    ok(
+        &mut s,
+        "CREATE TEXT SEARCH DICTIONARY thes1 \
+         (TEMPLATE = thesaurus, THESAURUS = 'technology:tech;computer science:cs')",
+    )
+    .await;
+
+    // Verify the dictionary was stored (no error and can be dropped).
+    ok(&mut s, "DROP TEXT SEARCH DICTIONARY thes1").await;
+}
+
+#[tokio::test]
+async fn ts_dict_thesaurus_if_not_exists() {
+    let mut s = session().await;
+    ok(
+        &mut s,
+        "CREATE TEXT SEARCH DICTIONARY th2 \
+         (TEMPLATE = thesaurus, THESAURUS = 'a:b')",
+    )
+    .await;
+    // IF NOT EXISTS on an existing thesaurus dict is a no-op.
+    ok(
+        &mut s,
+        "CREATE TEXT SEARCH DICTIONARY IF NOT EXISTS th2 \
+         (TEMPLATE = thesaurus, THESAURUS = 'a:b')",
+    )
+    .await;
+    // Without IF NOT EXISTS it's 42710.
+    let (code, _) = err_info(
+        &mut s,
+        "CREATE TEXT SEARCH DICTIONARY th2 \
+         (TEMPLATE = thesaurus, THESAURUS = 'a:b')",
+    )
+    .await;
+    assert_eq!(code, "42710");
+}

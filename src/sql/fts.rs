@@ -6,10 +6,14 @@
 //!   * `simple` — lowercase, compound tokenizer, no stemming, no stop words;
 //!   * `english` — `simple` plus the snowball English stop-word list and the
 //!     Porter stemmer;
-//!   * 14 additional language configurations powered by the `rust-stemmers`
-//!     crate: `danish`, `dutch`, `finnish`, `french`, `german`, `hungarian`,
-//!     `italian`, `norwegian`, `portuguese`, `romanian`, `russian`,
-//!     `spanish`, `swedish`, `turkish`.
+//!   * 17 language configurations powered by `rust-stemmers` (Snowball):
+//!     `arabic`, `danish`, `dutch`, `finnish`, `french`, `german`, `greek`,
+//!     `hungarian`, `italian`, `norwegian`, `portuguese`, `romanian`,
+//!     `russian`, `spanish`, `swedish`, `tamil`, `turkish`;
+//!   * 9 configs that PG ships without a Snowball stemmer — `armenian`,
+//!     `basque`, `catalan`, `hindi`, `indonesian`, `irish`, `lithuanian`,
+//!     `nepali`, `yiddish` — accepted as valid config names (no unknown-42704
+//!     error) and tokenized with lowercase-only normalization.
 //!
 //! Any other configuration name is `42704` with PostgreSQL's message shape.
 //! The value-level types and raw (`::tsvector` / `::tsquery`) parsers live in
@@ -29,11 +33,14 @@ use unicode_normalization::UnicodeNormalization;
 pub enum TsConfig {
     Simple,
     English,
+    // Snowball-backed configs (rust-stemmers)
+    Arabic,
     Danish,
     Dutch,
     Finnish,
     French,
     German,
+    Greek,
     Hungarian,
     Italian,
     Norwegian,
@@ -42,7 +49,18 @@ pub enum TsConfig {
     Russian,
     Spanish,
     Swedish,
+    Tamil,
     Turkish,
+    // Lowercase-only configs (no Snowball stemmer in rust-stemmers)
+    Armenian,
+    Basque,
+    Catalan,
+    Hindi,
+    Indonesian,
+    Irish,
+    Lithuanian,
+    Nepali,
+    Yiddish,
 }
 
 /// Resolve a configuration name (case-folded like PostgreSQL's `regconfig`;
@@ -53,11 +71,14 @@ pub fn resolve_config(name: &str) -> Result<TsConfig> {
     match base {
         "simple" => Ok(TsConfig::Simple),
         "english" => Ok(TsConfig::English),
+        // Snowball-backed
+        "arabic" => Ok(TsConfig::Arabic),
         "danish" => Ok(TsConfig::Danish),
         "dutch" => Ok(TsConfig::Dutch),
         "finnish" => Ok(TsConfig::Finnish),
         "french" => Ok(TsConfig::French),
         "german" => Ok(TsConfig::German),
+        "greek" => Ok(TsConfig::Greek),
         "hungarian" => Ok(TsConfig::Hungarian),
         "italian" => Ok(TsConfig::Italian),
         "norwegian" => Ok(TsConfig::Norwegian),
@@ -66,7 +87,18 @@ pub fn resolve_config(name: &str) -> Result<TsConfig> {
         "russian" => Ok(TsConfig::Russian),
         "spanish" => Ok(TsConfig::Spanish),
         "swedish" => Ok(TsConfig::Swedish),
+        "tamil" => Ok(TsConfig::Tamil),
         "turkish" => Ok(TsConfig::Turkish),
+        // Lowercase-only (accepted but no Snowball stemmer available)
+        "armenian" => Ok(TsConfig::Armenian),
+        "basque" => Ok(TsConfig::Basque),
+        "catalan" => Ok(TsConfig::Catalan),
+        "hindi" => Ok(TsConfig::Hindi),
+        "indonesian" => Ok(TsConfig::Indonesian),
+        "irish" => Ok(TsConfig::Irish),
+        "lithuanian" => Ok(TsConfig::Lithuanian),
+        "nepali" => Ok(TsConfig::Nepali),
+        "yiddish" => Ok(TsConfig::Yiddish),
         _ => Err(SqlError::UndefinedTsConfig(base.to_string())),
     }
 }
@@ -497,6 +529,31 @@ fn normalize_token(config: TsConfig, token: &str, kind: TokenKind) -> Option<Str
                     let stem = stem_with_algo(&lower, rust_stemmers::Algorithm::Turkish);
                     if stem.is_empty() { None } else { Some(stem) }
                 }
+                TsConfig::Arabic => {
+                    let stem = stem_with_algo(&lower, rust_stemmers::Algorithm::Arabic);
+                    if stem.is_empty() { None } else { Some(stem) }
+                }
+                TsConfig::Greek => {
+                    if STOPWORDS_EL.contains(&lower.as_str()) {
+                        return None;
+                    }
+                    let stem = stem_with_algo(&lower, rust_stemmers::Algorithm::Greek);
+                    if stem.is_empty() { None } else { Some(stem) }
+                }
+                TsConfig::Tamil => {
+                    let stem = stem_with_algo(&lower, rust_stemmers::Algorithm::Tamil);
+                    if stem.is_empty() { None } else { Some(stem) }
+                }
+                // Lowercase-only configs: tokenize but do not stem.
+                TsConfig::Armenian
+                | TsConfig::Basque
+                | TsConfig::Catalan
+                | TsConfig::Hindi
+                | TsConfig::Indonesian
+                | TsConfig::Irish
+                | TsConfig::Lithuanian
+                | TsConfig::Nepali
+                | TsConfig::Yiddish => Some(lower),
             }
         }
     }
@@ -517,7 +574,9 @@ pub fn to_tsvector(config: TsConfig, text: &str) -> Vec<TsLexeme> {
     fts::normalize_lexemes(raw)
 }
 
-/// Expand the tsvector with synonyms from registered dictionaries.
+/// Expand the tsvector with synonyms and thesaurus entries from registered
+/// dictionaries.  Thesaurus phrase matching runs first (phrase → canonical),
+/// then per-lexeme synonym expansion.
 fn apply_synonyms(
     dicts: &[&TsDictionaryDef],
     config: TsConfig,
@@ -526,6 +585,19 @@ fn apply_synonyms(
     if dicts.is_empty() {
         return lexemes;
     }
+
+    // Apply thesaurus dicts first (phrase-level substitution).
+    let lexemes = {
+        let mut v = lexemes;
+        for dict in dicts {
+            if !dict.thesaurus_entries.is_empty() {
+                v = apply_thesaurus(&v, &dict.thesaurus_entries);
+            }
+        }
+        v
+    };
+
+    // Apply synonym dicts (word-level expansion).
     let mut extra: Vec<(String, Vec<u16>)> = Vec::new();
     for lex in &lexemes {
         for dict in dicts {
@@ -986,6 +1058,8 @@ pub enum TsDictCmd {
         schema: Option<String>,
         name: String,
         synonyms: BTreeMap<String, Vec<String>>,
+        /// Thesaurus entries (non-empty iff TEMPLATE = thesaurus).
+        thesaurus_entries: BTreeMap<String, Vec<String>>,
         if_not_exists: bool,
     },
     Drop {
@@ -1049,11 +1123,32 @@ pub fn parse_ts_dict_ddl(sql: &str) -> Result<TsDictCmd> {
             .unwrap_or(options_str)
             .trim();
 
+        let up_opts = options_str.to_ascii_uppercase();
+        let is_thesaurus = up_opts.contains("TEMPLATE")
+            && up_opts
+                .split_whitespace()
+                .skip_while(|t| *t != "TEMPLATE")
+                .nth(2) // TEMPLATE = <value>
+                .map(|v| v.trim_matches(',').eq_ignore_ascii_case("thesaurus"))
+                .unwrap_or(false);
+
+        if is_thesaurus {
+            let thesaurus_entries = parse_thesaurus_options(options_str)?;
+            return Ok(TsDictCmd::Create {
+                schema,
+                name,
+                synonyms: BTreeMap::new(),
+                thesaurus_entries,
+                if_not_exists,
+            });
+        }
+
         let synonyms = parse_dict_options(options_str)?;
         return Ok(TsDictCmd::Create {
             schema,
             name,
             synonyms,
+            thesaurus_entries: BTreeMap::new(),
             if_not_exists,
         });
     }
@@ -1139,6 +1234,138 @@ pub fn parse_synonyms(s: &str) -> BTreeMap<String, Vec<String>> {
         }
     }
     map
+}
+
+/// Parse the THESAURUS option from a CREATE TEXT SEARCH DICTIONARY statement.
+///
+/// Accepted inline format (passed via `THESAURUS = '...'`):
+///   `phrase1:canon1,canon2;multi word phrase:canonical`
+///
+/// Each entry maps a phrase (words separated by spaces, lowercased) to one or
+/// more canonical replacement terms.  Entries are separated by `;`.
+fn parse_thesaurus_options(opts: &str) -> Result<BTreeMap<String, Vec<String>>> {
+    let up = opts.to_ascii_uppercase();
+    // The options string contains "TEMPLATE = thesaurus" so a bare search for
+    // "THESAURUS" would match the template value.  Look for "THESAURUS" that is
+    // followed (after optional whitespace) by "=" — that is the key, not the value.
+    let ths_pos = {
+        let mut found = None;
+        let mut search = &up[..];
+        let mut base = 0usize;
+        while let Some(pos) = search.find("THESAURUS") {
+            let after_kw = search[pos + "THESAURUS".len()..].trim_start();
+            if after_kw.starts_with('=') {
+                found = Some(base + pos);
+                break;
+            }
+            base += pos + "THESAURUS".len();
+            search = &search[pos + "THESAURUS".len()..];
+        }
+        found.ok_or_else(|| {
+            SqlError::InvalidParameter(
+                "CREATE TEXT SEARCH DICTIONARY with TEMPLATE = thesaurus requires THESAURUS option"
+                    .to_string(),
+            )
+        })?
+    };
+    let after = opts[ths_pos + "THESAURUS".len()..].trim_start();
+    let after = after
+        .strip_prefix('=')
+        .ok_or_else(|| SqlError::Syntax("expected '=' after THESAURUS".to_string()))?
+        .trim_start();
+    let ths_str = if let Some(stripped) = after.strip_prefix('\'') {
+        let end = stripped
+            .find('\'')
+            .ok_or_else(|| SqlError::Syntax("unclosed string in THESAURUS value".to_string()))?;
+        &stripped[..end]
+    } else {
+        after.split_whitespace().next().unwrap_or("").trim()
+    };
+    Ok(parse_thesaurus(ths_str))
+}
+
+/// Parse the inline thesaurus format: `phrase:canon1,canon2;phrase2:canon3`.
+pub fn parse_thesaurus(s: &str) -> BTreeMap<String, Vec<String>> {
+    let mut map = BTreeMap::new();
+    for entry in s.split(';') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some((phrase, canons_str)) = entry.split_once(':') {
+            let phrase = phrase.trim().to_ascii_lowercase();
+            let canons: Vec<String> = canons_str
+                .split(',')
+                .map(|c| c.trim().to_ascii_lowercase())
+                .filter(|c| !c.is_empty())
+                .collect();
+            if !phrase.is_empty() && !canons.is_empty() {
+                map.insert(phrase, canons);
+            }
+        }
+    }
+    map
+}
+
+/// Apply thesaurus entries to an already-normalized tsvector.
+///
+/// The algorithm scans the sorted lexemes and looks for contiguous runs whose
+/// words (joined with a space) match a thesaurus phrase.  Matching runs are
+/// replaced by the canonical term(s) at the position of the first lexeme.
+pub fn apply_thesaurus(lexemes: &[TsLexeme], entries: &BTreeMap<String, Vec<String>>) -> Vec<TsLexeme> {
+    if entries.is_empty() {
+        return lexemes.to_vec();
+    }
+    let words: Vec<&str> = lexemes.iter().map(|l| l.word.as_str()).collect();
+    let n = words.len();
+    let mut skip = vec![false; n];
+    let mut insertions: Vec<(usize, Vec<TsLexeme>)> = Vec::new();
+
+    // Check all subslices from longest to shortest to prefer longer matches.
+    let max_phrase_words = entries.keys().map(|p| p.split_whitespace().count()).max().unwrap_or(1);
+    'outer: for start in 0..n {
+        if skip[start] {
+            continue;
+        }
+        for len in (1..=max_phrase_words.min(n - start)).rev() {
+            let phrase = words[start..start + len].join(" ");
+            if let Some(canons) = entries.get(&phrase) {
+                let pos = lexemes[start].positions.first().copied().unwrap_or(1);
+                let replacement: Vec<TsLexeme> = canons
+                    .iter()
+                    .map(|c| TsLexeme {
+                        word: c.clone(),
+                        positions: vec![pos],
+                    })
+                    .collect();
+                for i in start..start + len {
+                    skip[i] = true;
+                }
+                insertions.push((start, replacement));
+                continue 'outer;
+            }
+        }
+    }
+
+    if insertions.is_empty() {
+        return lexemes.to_vec();
+    }
+
+    let mut result: Vec<TsLexeme> = Vec::with_capacity(n);
+    let mut ins_iter = insertions.into_iter().peekable();
+    for (i, lex) in lexemes.iter().enumerate() {
+        if skip[i] {
+            if let Some((start, _)) = ins_iter.peek() {
+                if *start == i {
+                    let (_, repl) = ins_iter.next().unwrap();
+                    result.extend(repl);
+                }
+            }
+        } else {
+            result.push(lex.clone());
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -3320,6 +3547,212 @@ static STOPWORDS_TR: &[&str] = &[
     "zaten",
     "bir",
     "ben",
+];
+
+/// Greek stop words matching PostgreSQL's `greek.stop`.
+static STOPWORDS_EL: &[&str] = &[
+    "αι",
+    "αλλα",
+    "αν",
+    "αντι",
+    "απο",
+    "αρα",
+    "αυτα",
+    "αυτες",
+    "αυτη",
+    "αυτο",
+    "αυτοι",
+    "αυτος",
+    "αυτους",
+    "αφου",
+    "γι",
+    "για",
+    "γιατι",
+    "γιατί",
+    "γιοτι",
+    "γιωτι",
+    "γοτι",
+    "διοτι",
+    "διότι",
+    "εαν",
+    "ειμαι",
+    "ειναι",
+    "ειστε",
+    "εκει",
+    "εκεινα",
+    "εκεινες",
+    "εκεινη",
+    "εκεινο",
+    "εκεινοι",
+    "εκεινος",
+    "εκεινους",
+    "εν",
+    "ενω",
+    "εντος",
+    "εξ",
+    "εξω",
+    "επι",
+    "εως",
+    "η",
+    "ηταν",
+    "θα",
+    "ι",
+    "ιδια",
+    "ιδιο",
+    "ιδιοι",
+    "ιδιος",
+    "ιδιους",
+    "ιδιων",
+    "ιδιες",
+    "ιδια",
+    "ιι",
+    "ιν",
+    "ινα",
+    "κ",
+    "κι",
+    "κα",
+    "καθε",
+    "και",
+    "κακ",
+    "καλα",
+    "καν",
+    "κατα",
+    "κατι",
+    "κατω",
+    "κε",
+    "κει",
+    "κεν",
+    "κι",
+    "κιολας",
+    "κοντα",
+    "κτλ",
+    "μα",
+    "μαζι",
+    "μακρια",
+    "μαλιστα",
+    "μαλλον",
+    "με",
+    "μεν",
+    "μεσα",
+    "μετα",
+    "μη",
+    "μην",
+    "μια",
+    "μολονοτι",
+    "μου",
+    "μπρος",
+    "ναι",
+    "νε",
+    "ντε",
+    "ξανα",
+    "ο",
+    "οι",
+    "ολα",
+    "ολες",
+    "ολη",
+    "ολο",
+    "ολοι",
+    "ολος",
+    "ολους",
+    "ολων",
+    "οπου",
+    "οπωσδηποτε",
+    "οπως",
+    "οσα",
+    "οσο",
+    "οταν",
+    "οτι",
+    "ου",
+    "παντοτε",
+    "παντα",
+    "παρα",
+    "περι",
+    "πια",
+    "πιο",
+    "πλαι",
+    "ποια",
+    "ποιες",
+    "ποιοι",
+    "ποιον",
+    "ποιος",
+    "ποιους",
+    "ποιων",
+    "που",
+    "πρεπει",
+    "πριν",
+    "προ",
+    "προς",
+    "πως",
+    "σαν",
+    "σας",
+    "σε",
+    "στα",
+    "στη",
+    "στην",
+    "στης",
+    "στο",
+    "στον",
+    "στους",
+    "στων",
+    "συ",
+    "συγκεκριμενα",
+    "συν",
+    "συνεπως",
+    "τα",
+    "ταδε",
+    "τελικα",
+    "τελικως",
+    "τες",
+    "τι",
+    "τιποτα",
+    "τιποτε",
+    "τιποτ",
+    "τοι",
+    "τοιουτος",
+    "τοιουτοτροπως",
+    "τοιουτωτροπως",
+    "τοιουτωτροπων",
+    "τοιουτωτροπωσ",
+    "τοιουτωτρόπως",
+    "τοιουτωτρόπον",
+    "τοιουτωτρόπoν",
+    "τοιουτοτρόπως",
+    "τοιουτοτρόπoς",
+    "τοιουτοτρόπoν",
+    "τοιουτοτρόπον",
+    "τοτε",
+    "του",
+    "τουλαχιστον",
+    "τους",
+    "τουτα",
+    "τουτεστιν",
+    "τουτες",
+    "τουτη",
+    "τουτο",
+    "τουτοι",
+    "τουτοις",
+    "τουτον",
+    "τουτος",
+    "τουτους",
+    "τουτων",
+    "τρεις",
+    "τρια",
+    "τριγυρω",
+    "τριγύρω",
+    "τωρα",
+    "υπ",
+    "υπαρχει",
+    "υπαρχουν",
+    "υπο",
+    "υποψιν",
+    "ωσοτου",
+    "ωσπου",
+    "ωσοτου",
+    "ωστε",
+    "ωστοσο",
+    "αλλ",
+    "αλλος",
+    "αλλοιως",
 ];
 
 // ---------------------------------------------------------------------------

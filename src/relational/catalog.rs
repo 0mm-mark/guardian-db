@@ -631,6 +631,10 @@ pub struct TsDictionaryDef {
     /// Built from the `SYNONYMS = 'word:syn1,syn2;word2:syn3'` option at
     /// CREATE TIME.
     pub synonyms: BTreeMap<String, Vec<String>>,
+    /// Thesaurus entries: phrase (space-separated, lowercased) → canonical terms.
+    /// Populated when `TEMPLATE = thesaurus`. Empty for synonym dicts.
+    #[serde(default)]
+    pub thesaurus_entries: BTreeMap<String, Vec<String>>,
 }
 
 /// The authoritative, serializable relational catalog.
