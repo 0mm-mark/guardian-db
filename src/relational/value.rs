@@ -324,6 +324,38 @@ impl SqlValue {
         }
     }
 
+    /// Appends the index key representation to `out`, avoiding a per-value String allocation.
+    /// Produces identical output to [`index_key`] but writes into a caller-owned buffer.
+    pub fn write_index_key(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        match self {
+            SqlValue::Null => out.push_str("\u{0}null"),
+            SqlValue::Text(s) => {
+                out.push_str("s:");
+                out.push_str(s);
+            }
+            SqlValue::Bool(b) => {
+                out.push_str("b:");
+                out.push_str(if *b { "true" } else { "false" });
+            }
+            SqlValue::Uuid(u) => {
+                out.push_str("u:");
+                let _ = write!(out, "{u}");
+            }
+            v if v.type_of().is_numeric() => {
+                out.push_str("n:");
+                match v.as_decimal() {
+                    Some(d) => { let _ = write!(out, "{}", d.normalize()); }
+                    None => { let _ = write!(out, "{}", v.as_f64().unwrap_or(f64::NAN)); }
+                }
+            }
+            other => {
+                out.push_str("x:");
+                out.push_str(&other.to_text().unwrap_or_default());
+            }
+        }
+    }
+
     // ----------------------------------------------------------------------
     // Comparison with SQL three-valued logic.
     // ----------------------------------------------------------------------
