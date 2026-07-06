@@ -74,20 +74,12 @@ impl LoadedTable {
         for idx in &mut self.indexes {
             idx.data.clear();
         }
-        // Collect keys first to avoid borrow conflicts.
-        let entries: Vec<(usize, String, String)> = self
-            .indexes
-            .iter()
-            .enumerate()
-            .flat_map(|(i, idx)| {
-                self.rows.iter().map(move |(rid, values)| {
-                    let key = ordered_key(&index_values(&idx.meta, values));
-                    (i, key, rid.clone())
-                })
-            })
-            .collect();
-        for (i, key, rid) in entries {
-            self.indexes[i].data.insert(key, rid);
+        // Single pass over rows: update all indexes per row, no intermediate Vec.
+        for (rid, values) in &self.rows {
+            for idx in self.indexes.iter_mut() {
+                let key = ordered_key(&index_values(&idx.meta, values));
+                idx.data.insert(key, rid.clone());
+            }
         }
     }
 
