@@ -673,6 +673,11 @@ impl GuardianDB {
         self.stores.read().get(address).cloned()
     }
 
+    /// Returns a snapshot of all managed stores keyed by their address.
+    pub fn list_stores(&self) -> HashMap<String, Arc<GuardianStore>> {
+        self.stores.read().clone()
+    }
+
     /// Conecta e sincroniza com um peer específico
     ///
     /// Este método facilita a conexão manual com peers quando a descoberta

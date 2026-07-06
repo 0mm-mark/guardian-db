@@ -9,6 +9,7 @@ use crate::traits::{
 use parking_lot::RwLock;
 #[cfg(feature = "odm")]
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod core;
@@ -268,6 +269,13 @@ impl GuardianDB {
     #[cfg(feature = "odm")]
     pub fn list_collections(&self) -> Vec<String> {
         self.collection_names.read().iter().cloned().collect()
+    }
+
+    pub fn list_stores(&self) -> HashMap<String, Arc<dyn Store<Error = GuardianError> + Send + Sync>> {
+        self.base.list_stores()
+            .into_iter()
+            .map(|(k, v)| (k, v as Arc<dyn Store<Error = GuardianError> + Send + Sync>))
+            .collect()
     }
 
     /// Acesso direto ao BaseGuardianDB para funcionalidades avançadas
