@@ -9,7 +9,7 @@ use crate::relational::error::{RelError, Result};
 use crate::relational::types::SqlType;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// First OID handed out to user objects (mirrors PostgreSQL's `FirstNormalObjectId`).
 pub const FIRST_USER_OID: u32 = 16384;
@@ -195,16 +195,84 @@ pub struct View {
 }
 
 /// The authoritative, serializable relational catalog.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Tables and views are stored in flat `Vec`s. Three `HashMap` indexes provide
+/// O(1) name-based lookup so that every `get_table` / `get_view` / `find_*`
+/// call avoids a linear scan.
+///
+/// Index fields are skipped during serialization and rebuilt transparently on
+/// deserialization via the custom `Deserialize` impl.
+#[derive(Debug, Clone, Serialize)]
 pub struct Catalog {
     pub database: String,
     schemas: BTreeMap<String, Schema>,
-    tables: BTreeMap<QualifiedName, Table>,
+    /// Backing store for tables — append-only with swap-remove for deletion.
+    tables: Vec<Table>,
+    /// O(1) lookup: `"schema.name"` → index into `tables`.
+    #[serde(skip)]
+    table_idx: HashMap<String, usize>,
     indexes: BTreeMap<QualifiedName, Index>,
     sequences: BTreeMap<QualifiedName, Sequence>,
-    views: BTreeMap<QualifiedName, View>,
+    /// Backing store for views — append-only with swap-remove for deletion.
+    views: Vec<View>,
+    /// O(1) lookup: `"schema.name"` → index into `views`.
+    #[serde(skip)]
+    view_idx: HashMap<String, usize>,
+    /// O(1) lookup: `(schema, name, arity)` → index into a future functions vec.
+    #[serde(skip)]
+    func_idx: HashMap<(String, String, u8), usize>,
     next_oid: u32,
     pub search_path: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Custom Deserialize: reconstruct the catalog from its serialized form and
+// immediately rebuild all HashMap indexes so the catalog is ready to use.
+// ---------------------------------------------------------------------------
+
+/// A plain, derived-Deserialize mirror of `Catalog` used as a deserialization
+/// intermediary so that the index HashMaps can be populated after loading.
+#[derive(Deserialize)]
+struct CatalogHelper {
+    database: String,
+    schemas: BTreeMap<String, Schema>,
+    tables: Vec<Table>,
+    indexes: BTreeMap<QualifiedName, Index>,
+    sequences: BTreeMap<QualifiedName, Sequence>,
+    views: Vec<View>,
+    next_oid: u32,
+    search_path: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for Catalog {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let h = CatalogHelper::deserialize(deserializer)?;
+        let mut catalog = Catalog {
+            database: h.database,
+            schemas: h.schemas,
+            tables: h.tables,
+            table_idx: HashMap::new(),
+            indexes: h.indexes,
+            sequences: h.sequences,
+            views: h.views,
+            view_idx: HashMap::new(),
+            func_idx: HashMap::new(),
+            next_oid: h.next_oid,
+            search_path: h.search_path,
+        };
+        catalog.rebuild_indexes();
+        Ok(catalog)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Inline key format used by all three HashMap indexes.
+#[inline]
+fn table_key(schema: &str, name: &str) -> String {
+    format!("{schema}.{name}")
 }
 
 impl Catalog {
@@ -213,10 +281,13 @@ impl Catalog {
         let mut catalog = Self {
             database: database.into(),
             schemas: BTreeMap::new(),
-            tables: BTreeMap::new(),
+            tables: Vec::new(),
+            table_idx: HashMap::new(),
             indexes: BTreeMap::new(),
             sequences: BTreeMap::new(),
-            views: BTreeMap::new(),
+            views: Vec::new(),
+            view_idx: HashMap::new(),
+            func_idx: HashMap::new(),
             next_oid: FIRST_USER_OID,
             search_path: vec!["public".to_string()],
         };
@@ -242,6 +313,25 @@ impl Catalog {
             },
         );
         catalog
+    }
+
+    /// Rebuild all three HashMap indexes from the backing `Vec`s.
+    ///
+    /// Call this after any bulk mutation (e.g. deserialization). Individual
+    /// mutation methods (`insert_table`, `drop_table_qualified`, …) keep the
+    /// indexes in sync incrementally so a full rebuild is rarely needed outside
+    /// of construction.
+    pub fn rebuild_indexes(&mut self) {
+        self.table_idx.clear();
+        for (i, t) in self.tables.iter().enumerate() {
+            self.table_idx.insert(table_key(&t.schema, &t.name), i);
+        }
+        self.view_idx.clear();
+        for (i, v) in self.views.iter().enumerate() {
+            self.view_idx.insert(table_key(&v.schema, &v.name), i);
+        }
+        self.func_idx.clear();
+        // No functions are stored in the catalog at this time.
     }
 
     pub fn allocate_oid(&mut self) -> u32 {
@@ -288,9 +378,9 @@ impl Catalog {
         }
         let table_names: Vec<QualifiedName> = self
             .tables
-            .keys()
-            .filter(|k| k.schema == name)
-            .cloned()
+            .iter()
+            .filter(|t| t.schema == name)
+            .map(|t| t.qualified())
             .collect();
         if !table_names.is_empty() && !cascade {
             return Err(RelError::FeatureNotSupported(format!(
@@ -309,16 +399,16 @@ impl Catalog {
     /// Resolve a possibly-unqualified table name using the search path.
     pub fn resolve_table_name(&self, schema: Option<&str>, name: &str) -> Option<QualifiedName> {
         if let Some(schema) = schema {
-            let q = QualifiedName::new(schema, name);
-            if self.tables.contains_key(&q) || self.views.contains_key(&q) {
-                return Some(q);
+            let key = table_key(schema, name);
+            if self.table_idx.contains_key(&key) || self.view_idx.contains_key(&key) {
+                return Some(QualifiedName::new(schema, name));
             }
             return None;
         }
         for schema in &self.search_path {
-            let q = QualifiedName::new(schema.clone(), name);
-            if self.tables.contains_key(&q) || self.views.contains_key(&q) {
-                return Some(q);
+            let key = table_key(schema, name);
+            if self.table_idx.contains_key(&key) || self.view_idx.contains_key(&key) {
+                return Some(QualifiedName::new(schema.clone(), name));
             }
         }
         None
@@ -344,31 +434,39 @@ impl Catalog {
     // ---- tables --------------------------------------------------------
 
     pub fn tables(&self) -> impl Iterator<Item = &Table> {
-        self.tables.values()
+        self.tables.iter()
     }
 
+    /// O(1) table lookup via the `table_idx` HashMap.
     pub fn get_table(&self, q: &QualifiedName) -> Option<&Table> {
-        self.tables.get(q)
+        let key = table_key(&q.schema, &q.name);
+        self.table_idx.get(&key).map(|&i| &self.tables[i])
     }
 
+    /// O(1) mutable table lookup via the `table_idx` HashMap.
     pub fn get_table_mut(&mut self, q: &QualifiedName) -> Option<&mut Table> {
-        self.tables.get_mut(q)
+        let key = table_key(&q.schema, &q.name);
+        let i = *self.table_idx.get(&key)?;
+        Some(&mut self.tables[i])
     }
 
+    /// O(1) table lookup; returns an error if the table is absent.
     pub fn require_table(&self, q: &QualifiedName) -> Result<&Table> {
-        self.tables
-            .get(q)
+        self.get_table(q)
             .ok_or_else(|| RelError::UndefinedTable(q.to_string_qualified()))
     }
 
+    /// O(1) existence check via `table_idx`.
     pub fn has_table(&self, q: &QualifiedName) -> bool {
-        self.tables.contains_key(q)
+        let key = table_key(&q.schema, &q.name);
+        self.table_idx.contains_key(&key)
     }
 
     /// Register a new table. The storage collection name is derived from the oid.
     pub fn insert_table(&mut self, mut table: Table) -> Result<()> {
         let q = table.qualified();
-        if self.tables.contains_key(&q) || self.views.contains_key(&q) {
+        let key = table_key(&q.schema, &q.name);
+        if self.table_idx.contains_key(&key) || self.view_idx.contains_key(&key) {
             return Err(RelError::DuplicateTable(q.to_string_qualified()));
         }
         if !self.schemas.contains_key(&table.schema) {
@@ -377,15 +475,29 @@ impl Catalog {
         if table.storage_collection.is_empty() {
             table.storage_collection = format!("__gdb_sql_rows_{}", table.oid);
         }
-        self.tables.insert(q, table);
+        let idx = self.tables.len();
+        self.tables.push(table);
+        self.table_idx.insert(key, idx);
         Ok(())
     }
 
     pub fn drop_table_qualified(&mut self, q: &QualifiedName) -> Result<Table> {
-        let table = self
-            .tables
-            .remove(q)
+        let key = table_key(&q.schema, &q.name);
+        let idx = self
+            .table_idx
+            .remove(&key)
             .ok_or_else(|| RelError::UndefinedTable(q.to_string_qualified()))?;
+
+        // O(1) removal: swap the target with the last element, pop, then fix up
+        // the index entry for the element that moved into position `idx`.
+        let last_idx = self.tables.len() - 1;
+        if idx != last_idx {
+            self.tables.swap(idx, last_idx);
+            let swapped_key = table_key(&self.tables[idx].schema, &self.tables[idx].name);
+            self.table_idx.insert(swapped_key, idx);
+        }
+        let table = self.tables.pop().unwrap();
+
         // Drop dependent indexes and sequences.
         let idx_keys: Vec<QualifiedName> = self
             .indexes
@@ -505,25 +617,42 @@ impl Catalog {
     // ---- views ---------------------------------------------------------
 
     pub fn views(&self) -> impl Iterator<Item = &View> {
-        self.views.values()
+        self.views.iter()
     }
 
+    /// O(1) view lookup via the `view_idx` HashMap.
     pub fn get_view(&self, q: &QualifiedName) -> Option<&View> {
-        self.views.get(q)
+        let key = table_key(&q.schema, &q.name);
+        self.view_idx.get(&key).map(|&i| &self.views[i])
     }
 
     pub fn insert_view(&mut self, view: View) -> Result<()> {
         let q = QualifiedName::new(view.schema.clone(), view.name.clone());
-        if self.tables.contains_key(&q) || self.views.contains_key(&q) {
+        let key = table_key(&q.schema, &q.name);
+        if self.table_idx.contains_key(&key) || self.view_idx.contains_key(&key) {
             return Err(RelError::DuplicateTable(q.to_string_qualified()));
         }
-        self.views.insert(q, view);
+        let idx = self.views.len();
+        self.views.push(view);
+        self.view_idx.insert(key, idx);
         Ok(())
     }
 
     pub fn drop_view(&mut self, q: &QualifiedName, if_exists: bool) -> Result<()> {
-        if self.views.remove(q).is_none() && !if_exists {
-            return Err(RelError::UndefinedTable(q.to_string_qualified()));
+        let key = table_key(&q.schema, &q.name);
+        match self.view_idx.remove(&key) {
+            None if !if_exists => return Err(RelError::UndefinedTable(q.to_string_qualified())),
+            None => return Ok(()),
+            Some(idx) => {
+                let last_idx = self.views.len() - 1;
+                if idx != last_idx {
+                    self.views.swap(idx, last_idx);
+                    let swapped_key =
+                        table_key(&self.views[idx].schema, &self.views[idx].name);
+                    self.view_idx.insert(swapped_key, idx);
+                }
+                self.views.pop();
+            }
         }
         Ok(())
     }
