@@ -11,6 +11,7 @@
 use crate::relational::catalog::{Index, Table};
 use crate::relational::{SecondaryIndex, SqlValue, composite_key, ordered_key};
 use crate::sql::error::{Result, SqlError};
+use indexmap::IndexMap;
 use serde_json::{Map, Value as Json};
 use std::collections::BTreeMap;
 
@@ -21,7 +22,7 @@ pub const F_VERSION: &str = "__version";
 pub const F_DELETED: &str = "__deleted";
 
 /// A decoded row: column name -> value (internal/system columns excluded).
-pub type RowValues = BTreeMap<String, SqlValue>;
+pub type RowValues = IndexMap<String, SqlValue>;
 
 /// A loaded, materialized table view with live indexes.
 #[derive(Clone)]
@@ -206,7 +207,7 @@ pub fn decode_row(table: &Table, doc: &Json) -> Result<Option<(String, RowValues
         .ok_or_else(|| SqlError::Storage("row document missing _id".into()))?
         .to_string();
     let version = obj.get(F_VERSION).and_then(Json::as_i64).unwrap_or(1);
-    let mut values = BTreeMap::new();
+    let mut values = IndexMap::new();
     for col in &table.columns {
         let raw = obj.get(&col.name).cloned().unwrap_or(Json::Null);
         let value = SqlValue::decode_json(&raw, &col.ty)?;

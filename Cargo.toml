@@ -66,6 +66,7 @@ guardian-db-derive = { version = "0.17.0", path = "guardian-db-derive", optional
 sqlparser = { version = "0.62", optional = true }
 rust_decimal = { version = "1.37", features = ["serde"], optional = true }
 pgwire = { version = "0.40", optional = true }
+indexmap = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -110,10 +111,6 @@ required-features = ["sql"]
 name = "pgwire_wire"
 path = "tests/pgwire_wire.rs"
 required-features = ["pgwire"]
-
-[[bin]]
-name = "guardian-admin"
-path = "src/bin/guardian_administration_panel.rs"
 
 [[bench]]
 name = "iroh_gossipsub_performance"

@@ -12,7 +12,7 @@ use sqlparser::ast::{
     AssignmentTarget, Delete, FromTable, Insert, OnConflictAction, OnInsert, SelectItem, Statement,
     TableFactor,
 };
-use std::collections::BTreeMap;
+use indexmap::IndexMap;
 
 impl Exec {
     // ---- INSERT --------------------------------------------------------
@@ -52,8 +52,8 @@ impl Exec {
         // Build the per-row provided column maps. Handles VALUES (including the
         // `DEFAULT` keyword per cell), `DEFAULT VALUES` (no source), and SELECT
         // sources.
-        let provided_rows: Vec<BTreeMap<String, SqlValue>> = match &insert.source {
-            None => vec![BTreeMap::new()],
+        let provided_rows: Vec<RowValues> = match &insert.source {
+            None => vec![IndexMap::new()],
             Some(src) => match src.body.as_ref() {
                 sqlparser::ast::SetExpr::Values(values) => {
                     let mut out = Vec::with_capacity(values.rows.len());
@@ -66,7 +66,7 @@ impl Exec {
                                 content.len()
                             )));
                         }
-                        let mut map = BTreeMap::new();
+                        let mut map = IndexMap::new();
                         for (col, expr) in target_cols.iter().zip(content) {
                             if is_default_expr(expr) {
                                 continue; // leave absent so the column default applies
@@ -179,9 +179,9 @@ impl Exec {
     fn prepare_row(
         &mut self,
         table: &Table,
-        provided: BTreeMap<String, SqlValue>,
+        provided: RowValues,
     ) -> Result<RowValues> {
-        let mut values = BTreeMap::new();
+        let mut values = IndexMap::new();
         for col in &table.columns {
             let value = if let Some(p) = provided.get(&col.name) {
                 if p.is_null() {
