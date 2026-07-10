@@ -486,7 +486,7 @@ impl GuardianDBKeyValue {
     /// public key (no write secret); the write ticket carries the namespace secret. These are
     /// registered with the ticket exchange so each requester receives the capability matching
     /// its authenticated role.
-    async fn share_tickets(&self) -> Result<(String, String)> {
+    pub async fn share_tickets(&self) -> Result<(String, String)> {
         let read_ticket = self.docs.share_doc(&self.doc_handle, false).await?;
         let write_ticket = self.docs.share_doc(&self.doc_handle, true).await?;
         Ok((read_ticket.to_string(), write_ticket.to_string()))
