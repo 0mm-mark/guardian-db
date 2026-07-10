@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-10
+
 ### Added
 - **Guardian Sentinel. A terminal UI (TUI) for inspecting, managing, and monitoring GuardianDB**, behind the `sentinel` Cargo feature (default builds are unaffected). GuardianDB was a library operable only from Rust code; Sentinel turns it into a database a non-Rust operator can drive visually, and everything created through it survives a restart.
   - **Admin RPC seam (`AdminSource`).** Inspection/management no longer touches the storage directly. A small JSON-lines RPC (mirroring the `pgwire` gateway model) exposes every operation through an `AdminSource` trait with two backends: `EmbeddedSource` (owns the `data-dir`) and `AdminClient` (socket). The `guardian-sentinel` panel consumes both uniformly — `--data-dir` (embedded) or `--connect <addr>` (attach to a live instance served by `guardian-sentinel-server` **without contending for the redb lock**). Loopback TCP by default; destructive/action ops are gated by a shared token (`--token`) per connection after an `auth` handshake.
