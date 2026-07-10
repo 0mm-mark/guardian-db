@@ -329,7 +329,7 @@ impl ChatMessage {
                 "[{}] {}: {}",
                 time_str,
                 console::style(&self.from_username).cyan().bold(),
-                &self.content
+                self.content
             )
         }
     }
@@ -610,7 +610,7 @@ fn save_received_file_with_progress(
         print!(
             "  {} {}\r\n",
             console::style("📥 Receiving file:").yellow().bold(),
-            console::style(format!("{} ({})", &attachment.file_name, size_str)).cyan(),
+            console::style(format!("{} ({})", attachment.file_name, size_str)).cyan(),
         );
         std::io::stdout().flush().ok();
         print_progress_bar(0, 4, "Preparing...");
@@ -619,7 +619,7 @@ fn save_received_file_with_progress(
         println!(
             "  {} {}",
             console::style("📥 Receiving file:").yellow().bold(),
-            console::style(format!("{} ({})", &attachment.file_name, size_str)).cyan(),
+            console::style(format!("{} ({})", attachment.file_name, size_str)).cyan(),
         );
     }
 
@@ -1921,12 +1921,12 @@ async fn group_chat_mode(state: &mut ChatState, group_idx: usize, _theme: &Color
         if !prompt_shown {
             print!(
                 "  {} ",
-                console::style(format!("{}:", &state.profile.username))
+                console::style(format!("{}:", state.profile.username))
                     .cyan()
                     .bold()
             );
             if !input_buf.is_empty() {
-                print!("{}", &input_buf);
+                print!("{}", input_buf);
             }
             std::io::stdout().flush().ok();
             prompt_shown = true;
@@ -2275,12 +2275,12 @@ async fn chat_mode(state: &mut ChatState, contact_idx: usize, _theme: &ColorfulT
         if !prompt_shown {
             print!(
                 "  {} ",
-                console::style(format!("{}:", &state.profile.username))
+                console::style(format!("{}:", state.profile.username))
                     .cyan()
                     .bold()
             );
             if !input_buf.is_empty() {
-                print!("{}", &input_buf);
+                print!("{}", input_buf);
             }
             std::io::stdout().flush().ok();
             prompt_shown = true;
