@@ -60,7 +60,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
-  NODE_VERSION: '22'
+  NODE_VERSION: '24'
 
 jobs:
   rust-odm:
@@ -70,7 +70,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -128,7 +128,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -160,7 +160,7 @@ jobs:
           cargo test --features odm --test integration_replication -- --test-threads=1 2>&1 | tee target/ci-logs/integration-replication-attempt-2.log
 
       - name: Upload replication integration logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: rust-replication-integration-logs
@@ -176,8 +176,8 @@ jobs:
       fail-fast: false
       matrix:
         node:
-          - '20'
           - '22'
+          - '24'
 
     defaults:
       run:
@@ -185,10 +185,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -228,7 +228,7 @@ jobs:
           cat benchmark-large-smoke-node-${{ matrix.node }}.json
 
       - name: Upload TypeScript smoke benchmark artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: typescript-smoke-benchmarks-node-${{ matrix.node }}
           path: |
@@ -246,7 +246,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -275,7 +275,7 @@ jobs:
         run: cargo test --features odm --test odm_benchmark_reliability explicit_large_document_limit_probe -- --ignored --test-threads=1
 
       - name: Upload Criterion reports
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: rust-criterion-odm-reports
@@ -296,10 +296,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -335,7 +335,7 @@ jobs:
           cat benchmark-large-document.json
 
       - name: Upload TypeScript full benchmark artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: typescript-full-benchmarks
