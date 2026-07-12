@@ -1,0 +1,55 @@
+[package]
+name = "guardian-compute-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.0"
+license = "MIT OR Apache-2.0"
+description = "Guest-side SDK for writing Guardian Compute WASM tasks (guardian-db)"
+repository = "https://github.com/wmaslonek/guardian-db/"
+publish = true
+
+[features]
+default = []
+# Typed task signatures via #[guardian_task(cbor)]: parameters and results are
+# CBOR-encoded (the SDK-level convention of guardian-db RFC 0002 §8.2 — the
+# protocol itself stays opaque bytes).
+cbor = ["dep:ciborium", "dep:serde"]
+# Bindings for the opt-in executor host capabilities (`gdb.log`,
+# `gdb.store_get`). A module built with this feature *and calling them*
+# imports the functions, so it only instantiates on executors whose owner
+# granted them (HostGrants).
+host = []
+
+[dependencies]
+guardian-compute-sdk-macros = { version = "0.1.0", path = "../guardian-compute-sdk-macros" }
+# CBOR codec for the typed layer. `serde_cbor` is unmaintained upstream;
+# ciborium is the serde-ecosystem replacement and builds cleanly for
+# wasm32-unknown-unknown.
+ciborium = { version = "0.2", optional = true }
+serde = { version = "1", optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+
+# Sample tasks compiled to `wasm32-unknown-unknown` by the golden e2e test in
+# the main crate (tests/compute_sdk.rs). `crate-type = ["cdylib"]` makes the
+# artifact a loadable .wasm module instead of a host binary.
+[[example]]
+name = "echo_task"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "shout_task"
+crate-type = ["cdylib"]
+
+# Typed CBOR task (SDK-3).
+[[example]]
+name = "word_count_task"
+crate-type = ["cdylib"]
+required-features = ["cbor"]
+
+# Host-capability task (SDK-3): reads the executor's local store.
+[[example]]
+name = "lookup_task"
+crate-type = ["cdylib"]
+required-features = ["host"]

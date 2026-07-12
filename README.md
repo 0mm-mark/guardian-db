@@ -21,10 +21,6 @@ synchronization, offline-first operation, and high performance. Every node keeps
 local replica: reads and writes are local (no server round-trip), and changes converge
 across peers automatically over [Iroh](https://www.iroh.computer/).
 
-It began as a Rust port of OrbitDB but is no longer "OrbitDB in Rust". The legacy
-IPFS/CID/libp2p stack has been removed in favor of Iroh's QUIC transport, BLAKE3 hashing,
-and Willow range-based set reconciliation.
-
 ## Powered by Iroh
 
 - **Direct, encrypted connections:** Iroh's Magicsock handles NAT traversal, hole
@@ -36,17 +32,6 @@ and Willow range-based set reconciliation.
   full record lists, syncing millions of records in milliseconds.
 - **Gossip for real-time signals:** iroh-gossip's epidemic broadcast trees fan out
   ephemeral messages with low latency and redundancy.
-
-### Coming from IPFS/OrbitDB
-
-| Concept | Legacy (IPFS / OrbitDB) | GuardianDB (Iroh) |
-|---------|-------------------------|-------------------|
-| Identity | PeerID (Multihash) | EndpointID (Ed25519, 32 bytes) |
-| Content ID | CID (SHA-256 + codecs) | Hash (BLAKE3) |
-| Network | libp2p swarm (TCP/WS) | Iroh Endpoint (QUIC) |
-| Discovery | Kademlia DHT (global) | Pkarr/DNS + mDNS, direct |
-| Data format | IPLD DAG (JSON) | Binary (Postcard) |
-| Sync | Bitswap (block-by-block) | Willow (range-based) |
 
 ## How the stores map to Iroh
 
@@ -79,7 +64,7 @@ guardian-db/
 
 ```toml
 [dependencies]
-guardian-db = "0.18"
+guardian-db = "0.19"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -173,7 +158,7 @@ Enable the Rust ODM explicitly:
 
 ```toml
 [dependencies]
-guardian-db = { version = " 0.18", features = ["odm"] }
+guardian-db = { version = " 0.19", features = ["odm"] }
 ```
 
 ### Rust model definitions
@@ -364,6 +349,70 @@ mode.
 Private key material is **never** displayed; destructive actions require
 confirmation. Full guide: [`docs/SENTINEL_TUI.md`](docs/SENTINEL_TUI.md).
 
+## Guardian Compute (Decentralized Edge Computing)
+
+GuardianDB can also run work, not just store it. Guardian Compute lets a
+node delegate the execution of business logic, compiled to WebAssembly, to
+other nodes on the network, and a capability-aware scheduler routes each
+task to the peer with the most spare capacity. Results flow back through the same
+Iroh replication the database already uses. It turns GuardianDB into a lightweight
+decentralized edge-computing platform, without a central scheduler.
+
+It ships behind the `compute` feature (default builds are unaffected) and reuses
+the existing stack: QUIC + public-key identity, the `Router`'s ALPN multiplexing,
+`iroh-blobs` for content-addressed code distribution, `iroh-gossip` for capability
+telemetry, the store `EventBus` for triggers, and the `AccessController` for
+permissioning.
+
+```toml
+[dependencies]
+guardian-db = { version = "0.19", features = ["compute"] }         # runtime + scheduler
+# or, for Edge AI (wasi-nn / ONNX Runtime on CPU):
+guardian-db = { version = "0.19", features = ["compute-nn"] }
+# or, to add GPU inference via the CUDA execution provider:
+guardian-db = { version = "0.19", features = ["compute-nn-cuda"] }
+```
+
+Write a task as an ordinary Rust function with the SDK, compile it to
+`wasm32-unknown-unknown`, and publish the `.wasm` as a blob:
+
+```rust
+use guardian_compute_sdk::{guardian_task, TaskFailure};
+
+#[guardian_task]
+fn thumbnail(input: &[u8]) -> Result<Vec<u8>, TaskFailure> {
+    let img = image::load_from_memory(input).map_err(|e| TaskFailure::new(e.to_string()))?;
+    Ok(img.thumbnail(128, 128).into_bytes())
+}
+```
+
+Then let the network decide where it runs:
+
+```rust
+let scheduler = backend.compute_scheduler().await?;   // capability-aware
+let delegated = scheduler.execute(request).await?;    // best node, automatic failover
+// or: execute_on (a specific node), execute_with_auction, map (MapReduce), execute_redundant (k-of-n)
+```
+
+Highlights:
+
+- **Sandboxed WASM runtime** (`wasmtime`, no WASI by default): every task runs
+  under hard limits,  memory ceiling, CPU budget (fuel), and wall-clock deadline, with no filesystem, network, clock, or randomness unless the executor's owner
+  opts in.
+- **Capability-aware scheduling** with automatic failover, a Contract-Net auction
+  for fresh bids, MapReduce fan-out, and k-of-n redundant execution with a
+  reputation system for untrusted networks.
+- **Reactive triggers**: run a task automatically when data lands
+  (`on_replicated`), deduplicated across replicas via a task ledger.
+- **Edge AI** (`compute-nn`): serve ONNX models to inference tasks over `wasi-nn`,
+  with models distributed as blobs, model-affinity routing, and optional GPU
+  (`compute-nn-cuda`).
+- **Trust model**: the sandbox protects the executor; result trust comes from
+  running in permissioned networks or via redundant execution. Participation is
+  reciprocal, never paid, and local policy stays sovereign.
+
+Full guide: [`docs/compute.md`](docs/compute.md).
+
 ## Store Types
 
 <details>
@@ -446,7 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // CRUD operations - all operations are automatically replicated
     kv.put("app_name", "GuardianDB".as_bytes().to_vec()).await?;
-    kv.put("version", " 0.18.0".as_bytes().to_vec()).await?;
+    kv.put("version", " 0.19.0".as_bytes().to_vec()).await?;
     kv.put("language", "Rust".as_bytes().to_vec()).await?;
 
     // Get values - queries the local CRDT index
@@ -516,7 +565,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "_id": "guardian-db",
         "name": "GuardianDB", 
         "type": "database",
-        "version": " 0.18.0",
+        "version": " 0.19.0",
         "language": "Rust",
         "features": ["decentralized", "peer-to-peer", "CRDT", "Iroh"]
     });
@@ -767,8 +816,8 @@ follow updates on [Twitter](https://x.com/willsearch_) and
 ## Contributors
 
 <div align="left">
-  <img src="https://www.willsearch.com.br/wp-content/uploads/2026/07/dylan.wong_.png" alt="Dylan Wong" title="Dylan Wong" width="65"/>
-  <img src="https://www.willsearch.com.br/wp-content/uploads/2026/07/william.oldenburg.png" alt="William Maslonek" title="William Maslonek" width="65"/>
+  <picture><img src="https://www.willsearch.com.br/wp-content/uploads/2026/07/dylan.wong_.png" alt="Dylan Wong" title="Dylan Wong" width="65"/></picture>
+  <picture><img src="https://www.willsearch.com.br/wp-content/uploads/2026/07/william.oldenburg.png" alt="William Maslonek" title="William Maslonek" width="65"/></picture>
 </div>
 
 ## Status

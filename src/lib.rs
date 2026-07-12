@@ -4,6 +4,11 @@ extern crate self as guardian_db;
 pub mod access_control;
 pub mod address;
 pub mod cache;
+/// Guardian Compute: delegation of business-logic execution (WASM) between
+/// peers, with capability-aware routing. Enabled by the `compute` feature.
+/// Currently Phase 0 (public types only) of `docs/rfcs/0002-guardian-compute.md`.
+#[cfg(feature = "compute")]
+pub mod compute;
 pub mod data_store;
 pub mod db_manifest;
 pub mod events;

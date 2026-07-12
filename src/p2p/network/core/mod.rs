@@ -184,6 +184,19 @@ pub struct IrohBackend {
     /// Per-peer latency sample history (bounded ring), for per-peer p95/p99 (C1).
     /// Fed by `update_connection_latency`; independent of the EMA `avg_latency_ms`.
     peer_latency_history: Arc<RwLock<HashMap<NodeId, std::collections::VecDeque<f64>>>>,
+    /// Guardian Compute executor handler (registered on the Router under the
+    /// compute ALPN); kept here so the owner can adjust the admission policy.
+    #[cfg(feature = "compute")]
+    compute_handler: Arc<RwLock<Option<crate::compute::ComputeProtocolHandler>>>,
+    /// Guardian Compute capability telemetry service: gossips this node's
+    /// capacity and collects peers' vectors into the scheduler directory.
+    #[cfg(feature = "compute")]
+    compute_gossip: Arc<RwLock<Option<Arc<crate::compute::CapabilityGossip>>>>,
+    /// Guardian Compute reputation book, persisted across the ephemeral
+    /// schedulers returned by `compute_scheduler()` so redundant-run penalties
+    /// (RFC §6.5) accumulate instead of resetting each call.
+    #[cfg(feature = "compute")]
+    compute_reputation: Arc<crate::compute::ReputationBook>,
 }
 
 /// Max latency samples kept per peer for percentile estimation (C1).
@@ -472,6 +485,12 @@ impl IrohBackend {
             ticket_registry: crate::p2p::network::core::ticket_exchange::new_registry(),
             known_peers: Arc::new(RwLock::new(std::collections::HashSet::new())),
             peer_latency_history: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(feature = "compute")]
+            compute_handler: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "compute")]
+            compute_gossip: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "compute")]
+            compute_reputation: Arc::new(crate::compute::ReputationBook::new()),
         };
         // Initialize the Iroh node asynchronously.
         backend.initialize_node().await?;
@@ -633,21 +652,76 @@ impl IrohBackend {
         let ticket_handler = crate::p2p::network::core::ticket_exchange::TicketProtocolHandler::new(
             self.ticket_registry.clone(),
         );
-        let router = Router::builder(endpoint.clone())
-            .accept(iroh_gossip::ALPN, gossip)
+        let router_builder = Router::builder(endpoint.clone())
+            .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_blobs::ALPN, blobs)
             .accept(iroh_docs::ALPN, docs)
             .accept(
                 crate::p2p::network::core::ticket_exchange::TICKET_ALPN,
                 ticket_handler,
+            );
+
+        // Guardian Compute executor: serves delegated WASM tasks over the
+        // compute ALPN, fetching task blobs from the requester via iroh-blobs.
+        // Reciprocity-by-default (RFC 0002 §8.3) with the owner's policy in
+        // control — adjustable at runtime through `compute_handler()`.
+        #[cfg(feature = "compute")]
+        let router_builder = {
+            let store = self.get_store_for_blobs().await?;
+            let blob_store = crate::p2p::network::core::blobs::BlobStore::new_with_endpoint(
+                store,
+                endpoint.clone(),
+            );
+            let handler = crate::compute::ComputeProtocolHandler::new(
+                Arc::new(blob_store),
+                crate::compute::ExecutorPolicy::default(),
             )
-            .spawn();
+            .map_err(|e| {
+                GuardianError::Other(format!("Error initializing Guardian Compute: {e}"))
+            })?;
+            *self.compute_handler.write().await = Some(handler.clone());
+            info!("Guardian Compute executor registered on the compute ALPN");
+            router_builder.accept(crate::compute::COMPUTE_ALPN, handler)
+        };
+
+        let router = router_builder.spawn();
 
         {
             let mut router_lock = self.router.write().await;
             *router_lock = Some(router);
         }
         info!("Router configured with ALPN multiplexing: Gossip + Blobs + Docs active");
+
+        // Guardian Compute capability telemetry (Phase 3): sample this node's
+        // capacity and gossip it with hysteresis; collect peers' vectors into
+        // the scheduler directory. Peers join the mesh as connections are made
+        // (see `compute_join_capability_mesh`).
+        //
+        // Failure here is fatal, matching the handler init above: a node that
+        // serves inbound tasks (handler registered) but cannot announce its
+        // capacity or schedule (no telemetry) is a silent free-rider. The
+        // compute subsystem is all-or-nothing — surface the error rather than
+        // leaving it half-initialized.
+        #[cfg(feature = "compute")]
+        if let Some(handler) = self.compute_handler.read().await.clone() {
+            let directory = Arc::new(crate::compute::CapabilityDirectory::new());
+            let capability_gossip = crate::compute::CapabilityGossip::spawn(
+                gossip.clone(),
+                endpoint.id(),
+                handler,
+                directory,
+                Vec::new(),
+                crate::compute::TelemetryConfig::default(),
+            )
+            .await
+            .map_err(|e| {
+                GuardianError::Other(format!(
+                    "Error starting Guardian Compute capability telemetry: {e}"
+                ))
+            })?;
+            *self.compute_gossip.write().await = Some(Arc::new(capability_gossip));
+            info!("Guardian Compute capability telemetry active");
+        }
 
         // Update the status to online.
         {
@@ -732,6 +806,68 @@ impl IrohBackend {
                 Err(GuardianError::Other("Store not initialized".to_string()))
             }
         }
+    }
+
+    /// Returns the Guardian Compute executor handler, if initialized — the
+    /// hook for the node owner to inspect and adjust the admission policy
+    /// (`set_policy`), which always overrides the reciprocity default.
+    #[cfg(feature = "compute")]
+    pub async fn compute_handler(&self) -> Option<crate::compute::ComputeProtocolHandler> {
+        self.compute_handler.read().await.clone()
+    }
+
+    /// Returns a requester-side client for delegating tasks to other nodes
+    /// over the compute ALPN (Phase 2: the caller picks the executor).
+    #[cfg(feature = "compute")]
+    pub async fn compute_client(&self) -> Result<crate::compute::ComputeClient> {
+        let endpoint_arc = self.get_endpoint().await?;
+        let endpoint = endpoint_arc
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| GuardianError::Other("Endpoint not initialized".to_string()))?;
+        Ok(crate::compute::ComputeClient::new(endpoint))
+    }
+
+    /// Returns the capability telemetry service, if running.
+    #[cfg(feature = "compute")]
+    pub async fn compute_capability_gossip(&self) -> Option<Arc<crate::compute::CapabilityGossip>> {
+        self.compute_gossip.read().await.clone()
+    }
+
+    /// Adds peers to the capability gossip mesh — call after connecting to
+    /// peers so their capacity vectors start flowing both ways.
+    #[cfg(feature = "compute")]
+    pub async fn compute_join_capability_mesh(&self, peers: Vec<NodeId>) -> Result<()> {
+        let gossip = self.compute_gossip.read().await.clone().ok_or_else(|| {
+            GuardianError::Other("Guardian Compute capability gossip not running".to_string())
+        })?;
+        gossip.join_peers(peers).await.map_err(GuardianError::Other)
+    }
+
+    /// Returns the capability-aware scheduler (Phase 3): `execute` with no
+    /// explicit destination — the network decides where the task runs.
+    #[cfg(feature = "compute")]
+    pub async fn compute_scheduler(&self) -> Result<crate::compute::ComputeScheduler> {
+        let gossip = self.compute_gossip.read().await.clone().ok_or_else(|| {
+            GuardianError::Other("Guardian Compute capability gossip not running".to_string())
+        })?;
+        let client = self.compute_client().await?;
+        let endpoint_arc = self.get_endpoint().await?;
+        let local = endpoint_arc
+            .read()
+            .await
+            .as_ref()
+            .map(|ep| ep.id())
+            .ok_or_else(|| GuardianError::Other("Endpoint not initialized".to_string()))?;
+        Ok(crate::compute::ComputeScheduler::with_reputation(
+            client,
+            gossip.directory(),
+            self.compute_reputation.clone(),
+            local,
+            crate::compute::SchedulerConfig::default(),
+        ))
     }
 
     /// Returns a reference to the endpoint if available.

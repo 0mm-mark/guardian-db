@@ -31,6 +31,25 @@ pgwire = ["sql", "dep:pgwire"]
 # `graphql-parser` (pure Rust, tiny dep tree) parses GraphQL documents for the
 # pg_graphql-compatible `/graphql/v1` endpoint.
 supabase = ["sql", "dep:axum", "dep:tower", "dep:graphql-parser"]
+# Guardian Compute: delegation of business-logic execution (WASM) between peers,
+# with capability-aware routing (the `compute` module). Phases 0-5 of
+# docs/rfcs/0002-guardian-compute.md: public types, sandboxed wasmtime runtime
+# with opt-in host capabilities, the delegation protocol (COMPUTE_ALPN on the
+# Router, execute + Contract-Net probe), capability telemetry over gossip, the
+# scoring scheduler (failover, auction, MapReduce fan-out, k-of-n redundancy
+# with reputation), and the reactive layer (task ledger + triggers).
+compute = ["dep:wasmtime", "dep:sysinfo", "uuid/v4"]
+# Edge AI for Guardian Compute: links the
+# wasi-nn API into the task sandbox as an opt-in host capability
+# (HostGrants::nn), backed by ONNX Runtime (the only backend portable across
+# Windows/Linux/macOS without a manual runtime install; `onnx-download`
+# fetches its binaries at build time). Heavy build, kept out of `compute`.
+compute-nn = ["compute", "dep:wasmtime-wasi-nn", "dep:ort"]
+# GPU execution for Guardian Compute NN models: loads
+# models with the CUDA execution provider when `NnTarget::Gpu` is selected,
+# and verifies advertised `Accel::Gpu` against the real CUDA availability.
+# Pulls the CUDA-enabled ONNX Runtime binaries (large download at build).
+compute-nn-cuda = ["compute-nn", "wasmtime-wasi-nn/onnx-cuda"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -62,7 +81,7 @@ iroh-docs = "0.101.0"
 iroh-mdns-address-lookup = "0.4.0"
 bytes = "1.12.1"
 ed25519-dalek = { version = "3.0.0-rc.0", features = ["serde"] }
-uuid = { version = "1.23.4", features = ["serde"] }
+uuid = { version = "1.23.5", features = ["serde"] }
 blake3 = "1.8.2"
 zeroize = "1.8"
 lru = "0.18.1"
@@ -74,8 +93,6 @@ redb = "4.1.0"
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 ratatui-image = { version = "11", optional = true, default-features = false, features = ["crossterm"] }
 guardian-db-derive = { version = "0.17.0", path = "guardian-db-derive", optional = true }
-# PostgreSQL compatibility layer (the `relational` + `sql` + `pgwire` modules);
-# pulled in only by the `sql` / `pgwire` features.
 sqlparser = { version = "0.62", optional = true }
 sha1 = { version = "0.11.0", optional = true }
 sha2 = { version = "0.11.0", optional = true }
@@ -86,14 +103,13 @@ unicode-normalization = { version = "0.1", optional = true }
 rust-stemmers = { version = "1", optional = true }
 rust_decimal = { version = "1.37", features = ["serde"], optional = true }
 pgwire = { version = "0.40", optional = true }
-# Supabase-compatible HTTP gateway (the `supabase` feature). axum brings the
-# http/hyper/tower stack already present transitively; `tower`'s `util` feature
-# powers the in-process `oneshot` integration tests.
 axum = { version = "0.8", optional = true, features = ["ws"] }
 tower = { version = "0.5", optional = true, features = ["util"] }
-# Spec-compliant GraphQL document parser for the pg_graphql-compatible endpoint
-# (fragments, variables, directives — what GraphiQL's introspection query uses).
 graphql-parser = { version = "0.4", optional = true }
+wasmtime = { version = "46.0.1", default-features = false, features = ["runtime", "cranelift"], optional = true }
+sysinfo = { version = "0.39.6", optional = true }
+wasmtime-wasi-nn = { version = "46.0.1", default-features = false, features = ["onnx-download"], optional = true }
+ort = { version = "=2.0.0-rc.10", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -103,44 +119,36 @@ console = "0.16.4"
 chrono = "0.4"
 crossterm = "0.29.0"
 base64 = "0.22.1"
-# Real PostgreSQL client used by the `pgwire` wire-protocol tests.
 tokio-postgres = "0.7"
-# Real WebSocket client used by the Supabase realtime tests (same version
-# axum's `ws` feature builds on).
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite = "0.30.0"
+wat = "1.253.0"
+ciborium = "0.2"
 
-# Administration TUI panel. Requires the `sentinel` feature: it can either open a
-# data-dir directly (embedded mode) or attach to a live instance over the sentinel
-# RPC (`--connect`), and the latter uses the `sentinel` module's client.
 [[bin]]
 name = "guardian-sentinel"
 path = "src/bin/guardian-sentinel.rs"
 required-features = ["sentinel"]
 
-# PostgreSQL gateway binary; only built when the `pgwire` feature is enabled.
 [[bin]]
 name = "guardian-pgwire"
 path = "src/bin/guardian-pgwire.rs"
 required-features = ["pgwire"]
 
-# Supabase-compatible HTTP gateway binary; only built with the `supabase` feature.
 [[bin]]
 name = "guardian-supabase"
 path = "src/bin/guardian-supabase.rs"
 required-features = ["supabase"]
-# Administration RPC server; only built when the `sentinel` feature is enabled.
+
 [[bin]]
 name = "guardian-sentinel-server"
 path = "src/bin/guardian-sentinel-server.rs"
 required-features = ["sentinel"]
 
-# Iroh-backed PostgreSQL gateway example (replicated, local-first).
 [[example]]
 name = "postgres_iroh_gateway"
 path = "examples/postgres_iroh_gateway.rs"
 required-features = ["pgwire"]
 
-# Integration tests for the PostgreSQL compatibility layer, gated by feature.
 [[test]]
 name = "sql_conformance"
 path = "tests/sql_conformance.rs"
@@ -211,6 +219,16 @@ name = "supabase_graphql"
 path = "tests/supabase_graphql.rs"
 required-features = ["supabase"]
 
+[[test]]
+name = "compute_delegation"
+path = "tests/compute_delegation.rs"
+required-features = ["compute"]
+
+[[test]]
+name = "compute_sdk"
+path = "tests/compute_sdk.rs"
+required-features = ["compute"]
+
 [[bench]]
 name = "iroh_gossipsub_performance"
 harness = false
@@ -221,5 +239,9 @@ harness = false
 required-features = ["odm"]
 
 [workspace]
-members = ["guardian-db-derive"]
+members = [
+    "guardian-db-derive",
+    "guardian-compute-sdk",
+    "guardian-compute-sdk-macros",
+]
 resolver = "2"

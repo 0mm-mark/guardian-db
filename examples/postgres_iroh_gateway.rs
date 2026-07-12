@@ -44,7 +44,6 @@
 //! observes rows a peer wrote.
 
 use std::time::Duration;
-
 use guardian_db::guardian::GuardianDB;
 use guardian_db::guardian::core::NewGuardianDBOptions;
 use guardian_db::p2p::network::client::IrohClient;
