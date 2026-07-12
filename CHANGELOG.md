@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-12
+
 ### Added
 - **Guardian Compute. Decentralized edge computing over the P2P fabric**, behind the `compute` feature (default builds are unaffected). Nodes delegate the execution of business logic (compiled to WebAssembly) to other nodes, and a capability-aware scheduler routes each task to the peer with the most spare capacity; results flow back through ordinary GuardianDB replication. Reuses the existing Iroh stack — QUIC + public-key identity, the `Router`'s ALPN multiplexing, `iroh-blobs` for content-addressed code distribution, `iroh-gossip` for telemetry, the store `EventBus` for triggers, and the `AccessController` for permissioning. Design in `docs/rfcs/0002-guardian-compute.md` and `docs/rfcs/0003-guardian-compute-followups.md`; user guide in `docs/compute.md`.
   - **Sandboxed WASM runtime** (`wasmtime`, no WASI by default): every task runs in a fresh store under three hard limits, linear-memory ceiling, CPU budget (fuel), and wall-clock deadline (epoch interruption). No filesystem, network, clock, or randomness unless the executor's owner opts in. Guest-controlled lengths (output size, host-function buffers) are bounds-checked against the guest's own memory before the host allocates, so a hostile module cannot OOM the executor.
