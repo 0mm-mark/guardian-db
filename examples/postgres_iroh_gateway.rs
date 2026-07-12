@@ -43,13 +43,13 @@
 //! background refresh loop below re-syncs the local relational view so a `SELECT`
 //! observes rows a peer wrote.
 
-use std::time::Duration;
 use guardian_db::guardian::GuardianDB;
 use guardian_db::guardian::core::NewGuardianDBOptions;
 use guardian_db::p2p::network::client::IrohClient;
 use guardian_db::p2p::network::config::ClientConfig;
 use guardian_db::pgwire::{DEFAULT_ADDR, serve};
 use guardian_db::sql::open_sql;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
